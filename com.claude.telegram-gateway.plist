@@ -1,0 +1,49 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  launchd service for the Claude Code Telegram gateway.
+  Placeholders __NODE__, __DIR__, __PATH__ are filled in by install-service.sh.
+  Do not edit the installed copy at ~/Library/LaunchAgents directly — re-run the installer.
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.claude.telegram-gateway</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>__NODE__</string>
+        <string>__DIR__/gateway.js</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>__DIR__</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>__PATH__</string>
+        <key>HOME</key>
+        <string>__HOME__</string>
+    </dict>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>KeepAlive</key>
+    <dict>
+        <key>SuccessfulExit</key>
+        <false/>
+        <key>Crashed</key>
+        <true/>
+    </dict>
+
+    <key>ThrottleInterval</key>
+    <integer>10</integer>
+
+    <key>StandardOutPath</key>
+    <string>__DIR__/gateway.log</string>
+    <key>StandardErrorPath</key>
+    <string>__DIR__/gateway.log</string>
+</dict>
+</plist>

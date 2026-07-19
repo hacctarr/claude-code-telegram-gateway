@@ -1,0 +1,20 @@
+{
+  "BOT_TOKEN": "123456789:AAHfiqksKZ8...",
+  "ALLOWED_USER_IDS": ["412587349"],
+  "REPO_MAPPINGS": {
+    "-1001654782309": "/Users/you/projects/auth-service",
+    "-1001987654321": "/Users/you/projects/frontend-ui"
+  },
+  "CLAUDE_PATH": "/Users/you/.nvm/versions/node/v26.2.0/bin/claude",
+  "PERMISSION_MODE": "bypassPermissions",
+  "MODEL": "opus",
+  "MIRROR": true,
+  "AUTO_CREATE_TOPICS": true,
+  "SHOW_TOOL_ACTIVITY": true,
+  "IDLE_INJECT_SECONDS": 15,
+  "ACTIVE_WINDOW_MIN": 30,
+  "PRUNE_AFTER_DAYS": 7,
+  "PRUNE_MODE": "close",
+  "POLL_MS": 2000,
+  "MIRROR_FLUSH_MS": 4000
+}

@@ -1,0 +1,13 @@
+# Secrets & machine-local state — NEVER commit these
+config.json
+links.json
+ignored.json
+sessions.json
+gateway.log
+*.log
+
+# Dependencies (none required, but just in case)
+node_modules/
+
+# macOS
+.DS_Store
