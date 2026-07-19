@@ -39,6 +39,10 @@ const PRUNE_AFTER_MS = (config.PRUNE_AFTER_DAYS || 7) * 86_400_000;
 const PRUNE_MODE = config.PRUNE_MODE || 'close';   // "close" | "delete"
 const POLL_MS = config.POLL_MS || 2000;
 const MIRROR_FLUSH_MS = config.MIRROR_FLUSH_MS || 4000;  // min gap between mirror posts per topic
+// /desk opens a topic's session in the desktop editor. Template's {session} is the session id.
+// Default targets the Claude Code VS Code extension; Cursor/Windsurf users can swap the scheme.
+const DESK_URL_TEMPLATE = config.DESK_URL_TEMPLATE || 'vscode://anthropic.claude-code/open?session={session}';
+const DESK_OPEN_CMD = config.DESK_OPEN_CMD || 'open';   // macOS `open`; Linux users: "xdg-open"
 
 // repoDir (resolved) -> chatId, so a session's cwd tells us which supergroup owns it.
 function invertRepoMappings(mappings) {
@@ -568,6 +572,14 @@ function persisted(sizeBefore, sizeAfter) { return sizeAfter > sizeBefore; }
 function sizeCurrent(sessionId) { try { return fs.statSync(sessionFileById(sessionId)).size; } catch (e) { return 0; } }
 
 // Drive one turn in `threadId` on behalf of `knownSessionId` (or a fresh session if null).
+// Build the desktop deep-link that opens a session in the editor (pure — tested).
+function deskUrl(sessionId) { return DESK_URL_TEMPLATE.replace('{session}', encodeURIComponent(sessionId)); }
+// Open a session in the desktop editor on the Mac (the gateway runs there).
+function openOnDesk(sessionId) {
+  try { execFileSync(DESK_OPEN_CMD, [deskUrl(sessionId)], { stdio: 'ignore' }); return true; }
+  catch (e) { console.error('openOnDesk failed:', e.message); return false; }
+}
+
 // Is the transcript currently held open by another process (the desk TUI)? Verified: a live TUI
 // keeps its .jsonl open even when idle, so lsof detects it — letting us decide fork-vs-resume BEFORE
 // running, so the prompt (and its side effects) never runs twice.
@@ -813,7 +825,18 @@ async function pollUpdates() {
         const key = `${chatId}_${threadId}`;
 
         if (text === '/start') {
-          sendPlain(chatId, threadId, "👋 Claude Code gateway ready. Active desk sessions auto-appear as topics and mirror live. Reply in a topic to steer that session; /new <msg> starts a fresh one.");
+          sendPlain(chatId, threadId, "👋 Claude Code gateway ready. Active desk sessions auto-appear as topics and mirror live.\n\n" +
+            "• reply in a topic to steer that session\n• /new <msg> — fresh session in its own topic\n• /desk — open this session in the editor on your Mac\n• /sessions, /resume <id|text>");
+          continue;
+        }
+
+        // /desk (or /open) — open this topic's session in the desktop editor on the Mac.
+        if (text === '/desk' || text === '/open') {
+          const sid = sessionByThread.get(key);
+          if (!sid) { sendPlain(chatId, threadId, "No session is linked to this topic yet — send a message first."); continue; }
+          sendPlain(chatId, threadId, openOnDesk(sid)
+            ? "🖥️ Opening this session in the editor on your Mac."
+            : "⚠️ Couldn't open it on the Mac (is the editor installed and the URL scheme registered?).");
           continue;
         }
 
@@ -934,5 +957,5 @@ module.exports = {
   LiveMessage, summarizeToolInput, createFeed, renderTranscriptLine, readNewLines,
   listSessions, matchSessions, readSessionInfo, relTime, formatSessionList,
   isActive, shouldPrune, isDeskBusy, invertRepoMappings, splitThreadKey, buildThreadIndex,
-  migrateLegacy, topicName, openerText, shouldAutoCreate, loadIgnored, persistIgnored, persisted,
+  migrateLegacy, topicName, openerText, shouldAutoCreate, loadIgnored, persistIgnored, persisted, deskUrl,
 };

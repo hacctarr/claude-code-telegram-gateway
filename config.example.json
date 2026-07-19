@@ -16,5 +16,7 @@
   "PRUNE_AFTER_DAYS": 7,
   "PRUNE_MODE": "close",
   "POLL_MS": 2000,
-  "MIRROR_FLUSH_MS": 4000
+  "MIRROR_FLUSH_MS": 4000,
+  "DESK_URL_TEMPLATE": "vscode://anthropic.claude-code/open?session={session}",
+  "DESK_OPEN_CMD": "open"
 }

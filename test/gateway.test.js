@@ -408,3 +408,14 @@ test('renderTranscriptLine: tool error content as text blocks', () => {
   const o = { type: 'user', message: { content: [{ type: 'tool_result', is_error: true, content: [{ type: 'text', text: 'boom happened' }] }] } };
   assert.deepEqual(g.renderTranscriptLine(o), ['⚠️ tool error: boom happened']);
 });
+
+// ---------------------------------------------------------------------------
+// deskUrl — editor deep link
+// ---------------------------------------------------------------------------
+test('deskUrl: builds the VS Code deep link with the session id', () => {
+  const u = g.deskUrl('abc-123-def');
+  assert.match(u, /^vscode:\/\/anthropic\.claude-code\/open\?session=abc-123-def$/);
+});
+test('deskUrl: url-encodes the session id', () => {
+  assert.match(g.deskUrl('a b/c'), /session=a%20b%2Fc$/);
+});

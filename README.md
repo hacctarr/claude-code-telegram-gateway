@@ -106,11 +106,15 @@ tail -f gateway.log       # watch it live
   - Reply in a topic to steer that session (runs when the desk session is idle).
   - `/new <message>` — start a brand-new, independent session in its own topic.
   - `/new` (bare) — detach the current topic so your next message starts a fresh session there.
+  - **`/desk`** — open this topic's session in the editor on your Mac (VS Code by default). The
+    clean "hand it back to the desk" move: it opens the exact session so you continue there.
   - `/sessions` — list recent sessions in the repo.
   - `/resume <uuid | text>` — link this topic to an existing session (searches first message + content).
-- **Back at the desk:** just **open a terminal** — if you drove a session from your phone, an
-  auto-resume hook (installed into `~/.zshrc`) drops you straight into that exact branch, multi-repo
-  aware, and clears itself so ordinary terminals stay ordinary. `cr` remains as a manual resume.
+- **Back at the desk:** two ways, pick per moment —
+  - **VS Code / editor:** tap **`/desk`** in the topic; the exact session opens in your editor on the
+    Mac via a `vscode://` deep link (configurable for Cursor/Windsurf via `DESK_URL_TEMPLATE`).
+  - **Terminal:** just open one — an auto-resume hook (installed into `~/.zshrc`) drops you into that
+    branch, multi-repo aware, then clears itself. `cr` remains as a manual resume.
 
 ### Phone continuation — works whether or not the desk session is closed
 - **Desk session closed:** your phone reply continues the *same* session and is saved — seamless,
