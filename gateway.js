@@ -43,10 +43,11 @@ const MIRROR_FLUSH_MS = config.MIRROR_FLUSH_MS || 4000;  // min gap between mirr
 // "session-name" = Claude's derived name (documents-14); "first-message" = the opening prompt.
 const TITLE_MODE = config.TITLE_MODE || 'generated';
 const TITLE_MODEL = config.TITLE_MODEL || 'haiku';
-// Auto-fork a held-open desk session into a phone branch (experimental — off by default; it can
-// shuffle topic↔session bindings). When off, a reply into a held session resumes it with full
-// context but isn't saved to disk (the desk owns the file); the user is told so.
-const AUTO_FORK = config.AUTO_FORK === true;
+// Auto-fork a held-open desk session into a persistent phone branch (on by default). The fork id is
+// pre-minted and reserved before the turn spawns, the topic is atomically rebound to the branch, and
+// held-detection ignores the gateway's own pid — the three fixes that make this safe. Set
+// AUTO_FORK:false to disable; replies into a held session then run with full context but don't persist.
+const AUTO_FORK = config.AUTO_FORK !== false;
 // /desk opens a topic's session in the desktop editor. Template's {session} is the session id.
 // Default targets the Claude Code VS Code extension; Cursor/Windsurf users can swap the scheme.
 const DESK_URL_TEMPLATE = config.DESK_URL_TEMPLATE || 'vscode://anthropic.claude-code/open?session={session}';
@@ -553,13 +554,17 @@ function readNewLines(filePath, offset) {
 // ---------------------------------------------------------------------------
 // Running a Claude turn (streaming headless) — used for phone injections.
 // ---------------------------------------------------------------------------
-function runClaudeTurn(prompt, cwd, sessionId, live, createId, fork) {
+function runClaudeTurn(prompt, cwd, sessionId, live, createId, forkId) {
   return new Promise((resolve) => {
     const args = ['-p', '--output-format', 'stream-json', '--include-partial-messages', '--verbose',
                   '--permission-mode', PERM_MODE];
     if (MODEL) args.push('--model', MODEL);
-    if (sessionId) { args.push('--resume', sessionId); if (fork) args.push('--fork-session'); }
-    else if (createId) args.push('--session-id', createId);  // deterministic id for a fresh session
+    if (sessionId) {
+      args.push('--resume', sessionId);
+      // Fork with a PRE-MINTED id (verified supported) so the fork is reserved in `injecting`
+      // before it ever appears on disk — the poller can never race it into a duplicate topic.
+      if (forkId) args.push('--fork-session', '--session-id', forkId);
+    } else if (createId) args.push('--session-id', createId);  // deterministic id for a fresh session
     args.push(...EXTRA);
 
     console.log(`[Claude] ${sessionId ? 'resume ' + sessionId : 'new session'} in ${cwd}`);
@@ -625,34 +630,48 @@ function openOnDesk(sessionId) {
   catch (e) { console.error('openOnDesk failed:', e.message); return false; }
 }
 
-// Is the transcript currently held open by another process (the desk TUI)? Verified: a live TUI
-// keeps its .jsonl open even when idle, so lsof detects it — letting us decide fork-vs-resume BEFORE
-// running, so the prompt (and its side effects) never runs twice.
+// Is the transcript currently held open by ANOTHER process (the desk TUI / VS Code extension)?
+// Verified: a live TUI keeps its .jsonl open even when idle, so lsof detects it — letting us decide
+// fork-vs-resume BEFORE running, so the prompt (and its side effects) never runs twice.
+// CRITICAL: exclude our own pid — the gateway's own transient read streams (mirror/label scans)
+// otherwise register as "held" and caused spurious chained forks.
+function heldByOtherPids(lsofOutput, selfPid) {
+  return lsofOutput.split('\n').map((s) => parseInt(s.trim(), 10)).filter(Boolean).filter((pid) => pid !== selfPid);
+}
 function isSessionHeld(file) {
   if (!file) return false;
-  try { return execFileSync('lsof', ['-t', file], { stdio: ['ignore', 'pipe', 'ignore'] }).toString().trim().length > 0; }
-  catch (e) { return false; }   // lsof exits non-zero when nothing holds the file
+  try {
+    const out = execFileSync('lsof', ['-t', file], { stdio: ['ignore', 'pipe', 'ignore'] }).toString();
+    return heldByOtherPids(out, process.pid).length > 0;
+  } catch (e) { return false; }   // lsof exits non-zero when nothing holds the file
 }
 
-async function driveTurn(chatId, threadId, prompt, knownSessionId) {
+// `resolveSession` is a FUNCTION evaluated when the turn actually runs — not when the message was
+// enqueued. Two rapid replies previously both captured the pre-fork session id and forked it twice;
+// resolving at run time means the second reply sees the first reply's fork and continues it.
+async function driveTurn(chatId, threadId, prompt, resolveSession) {
   const repoDir = resolveHome(REPO_MAPPINGS[chatId]);
   const typing = startTyping(chatId, threadId);
   const live = new LiveMessage(chatId, threadId);
-  const sessionId = knownSessionId || null;
-  // Always resume the SAME session so the reply keeps full context and the topic↔session binding
-  // stays stable (no duplicates/rebinds). Auto-fork is opt-in; without it a reply into a held-open
-  // desk session still runs with full context but isn't persisted (the desk owns the file).
+  const sessionId = (typeof resolveSession === 'function' ? resolveSession() : resolveSession) || null;
+
+  // Decide the mode ONCE, before spawning (single run — side effects never execute twice):
+  //   held by another process + AUTO_FORK → fork with a PRE-MINTED id (reserved below)
+  //   held, no AUTO_FORK                  → resume; reply has full context but won't persist
+  //   free existing session               → resume in place
+  //   no session                          → fresh session with a pre-minted id
   const held = !!(sessionId && isSessionHeld(sessionFileById(sessionId)));
-  const forkHeld = AUTO_FORK && held;
+  const forkId = (AUTO_FORK && held) ? crypto.randomUUID() : null;
   const createId = sessionId ? null : crypto.randomUUID();
   const sizeBefore = sessionId ? sizeCurrent(sessionId) : 0;
-  let activeSid = sessionId || createId;
-  if (activeSid) injecting.add(activeSid);
+  // Reserve every id this turn may touch BEFORE spawning, so the poller can't topic any of them.
+  const reserved = [sessionId, createId, forkId].filter(Boolean);
+  reserved.forEach((id) => injecting.add(id));
   try {
-    const result = await runClaudeTurn(prompt, repoDir, sessionId, live, createId, forkHeld);
+    const result = await runClaudeTurn(prompt, repoDir, sessionId, live, createId, forkId);
     clearInterval(typing);
 
-    if (!result.ok && sessionId && !result.sawContent && !forkHeld) {
+    if (!result.ok && sessionId && !result.sawContent && !forkId) {
       await live.finalize(`⚠️ Couldn't reach session ${sessionId.slice(0, 8)} — it may have been cleared. ` +
         `Send /sessions to pick another, or /new to start fresh here.`);
       return;
@@ -661,26 +680,31 @@ async function driveTurn(chatId, threadId, prompt, knownSessionId) {
     const body = result.ok ? result.body
       : `${result.body && result.body !== '⚙️ Working…' ? result.body + '\n\n' : ''}⚠️ ${result.error}`;
 
-    if (forkHeld) {
-      const forkSid = result.sessionId;
-      if (result.ok && forkSid && forkSid !== sessionId) {
-        injecting.add(forkSid); injecting.delete(sessionId); activeSid = forkSid;
-        supersededAt[sessionId] = sizeCurrent(sessionId); persistSuperseded();  // desk branch re-topics only if it grows past here
-        delete linkBySession[sessionId];                                        // move this topic onto the fork
-        await upsertLink(forkSid, chatId, threadId, prompt);
-        try { linkBySession[forkSid].offset = sizeCurrent(forkSid); } catch (e) { /* */ }
+    if (forkId) {
+      const forked = result.ok && result.sessionId === forkId && fs.existsSync(sessionFileById(forkId) || '');
+      if (forked) {
+        // Atomic rebind: topic keeps its identity, now follows the phone branch. The desk copy is
+        // marked superseded at its current size — if the desk keeps working it re-topics on its own.
+        supersededAt[sessionId] = sizeCurrent(sessionId); persistSuperseded();
+        delete linkBySession[sessionId];
+        await upsertLink(forkId, chatId, threadId, prompt);          // overwrites thread→session mapping
+        try { linkBySession[forkId].offset = sizeCurrent(forkId); } catch (e) { /* */ }
         persistLinks();
-        writeResumeMarker(repoDir, forkSid);
-        await live.finalize(`${body}\n\n↪️ Desk session was open, so I continued in a phone branch ` +
-          `(your desk copy is untouched). Opening a terminal on your Mac resumes this branch automatically.`);
-        console.log(`[Drive → thread ${threadId}] forked ${sessionId.slice(0, 8)} → ${forkSid.slice(0, 8)} (desk held open)`);
+        if (queues.has(sessionId)) { queues.set(forkId, queues.get(sessionId)); queues.delete(sessionId); }  // queued replies follow the fork
+        writeResumeMarker(repoDir, forkId);
+        await live.finalize(`${body}\n\n↪️ Desk session was open, so this continued in a saved phone branch. ` +
+          `This topic now follows the branch; your desk copy is untouched (it gets its own topic if you keep working it there).`);
+        console.log(`[Drive → thread ${threadId}] forked ${sessionId.slice(0, 8)} → ${forkId.slice(0, 8)} (desk held open)`);
       } else {
-        await live.finalize(`${body}\n\n⚠️ The desk session is open and I couldn't fork it — try again in a moment.`);
+        // Fork didn't take — DON'T touch the binding; the reply above still had full context.
+        await live.finalize(`${body}\n\n⚠️ The desk session is open and the branch didn't persist — ` +
+          `this reply used full context but wasn't saved. Close the desk session and resend to persist.`);
+        console.log(`[Drive → thread ${threadId}] fork failed for ${sessionId.slice(0, 8)}; binding unchanged`);
       }
       return;
     }
 
-    // Held-open but not forking: the reply had full context but won't be saved to the desk copy.
+    // Held-open without AUTO_FORK: full context, but nothing was saved to the desk copy.
     const ephemeral = held && result.ok && !persisted(sizeBefore, sizeCurrent(sessionId));
     await live.finalize(ephemeral
       ? `${body}\n\n⚠️ The desk session is open, so this reply isn't saved to it (close the desk ` +
@@ -690,12 +714,11 @@ async function driveTurn(chatId, threadId, prompt, knownSessionId) {
     const finalSid = result.sessionId || sessionId || createId;
     if (finalSid) {
       injecting.add(finalSid);
-      if (createId && finalSid !== createId) injecting.delete(createId);
-      activeSid = finalSid;
       await upsertLink(finalSid, chatId, threadId, prompt);
       if (!ephemeral) { try { linkBySession[finalSid].offset = sizeCurrent(finalSid); } catch (e) { /* */ } }
       persistLinks();
       if (result.ok && !ephemeral) writeResumeMarker(repoDir, finalSid);
+      if (!reserved.includes(finalSid)) reserved.push(finalSid);
     }
     console.log(`[Drive → thread ${threadId}] ok=${result.ok} session=${finalSid || '—'}${ephemeral ? ' (held/ephemeral)' : ''}`);
   } catch (err) {
@@ -703,14 +726,14 @@ async function driveTurn(chatId, threadId, prompt, knownSessionId) {
     console.error('driveTurn error:', err);
     await sendPlain(chatId, threadId, `⚠️ Gateway error: ${err.message}`);
   } finally {
-    if (activeSid) injecting.delete(activeSid);
+    reserved.forEach((id) => injecting.delete(id));
   }
 }
 
-function scheduleDrive(chatId, threadId, prompt, sessionId) {
+function scheduleDrive(chatId, threadId, prompt, resolveSession) {
   const key = `${chatId}_${threadId}`;
   const prev = threadChains.get(key) || Promise.resolve();
-  const next = prev.then(() => driveTurn(chatId, threadId, prompt, sessionId)).catch((e) => console.error(e));
+  const next = prev.then(() => driveTurn(chatId, threadId, prompt, resolveSession)).catch((e) => console.error(e));
   threadChains.set(key, next);
   return next;
 }
@@ -1004,15 +1027,17 @@ async function pollUpdates() {
           continue;
         }
 
-        // Normal message: route to the session this topic is bound to.
+        // Normal message: route to the session this topic is bound to. The session is re-resolved
+        // when the turn RUNS (not now) so back-to-back replies follow a fork instead of re-forking.
         const sessionId = sessionByThread.get(key);
         if (sessionId) {
           let mtime = 0; try { mtime = fs.statSync(sessionFileById(sessionId)).mtimeMs; } catch (e) { /* */ }
           if (isDeskBusy(mtime)) {
+            // Desk is actively writing this transcript right now — a fork would branch mid-turn.
             queueForSession(sessionId, text);
-            sendPlain(chatId, threadId, "⏳ Desk session looks busy — I'll send this when it goes idle.");
+            sendPlain(chatId, threadId, "⏳ Desk session is mid-turn — I'll send this when it settles.");
           } else {
-            scheduleDrive(chatId, threadId, text, sessionId);
+            scheduleDrive(chatId, threadId, text, () => sessionByThread.get(key) || null);
           }
         } else {
           scheduleDrive(chatId, threadId, text, null); // fresh session bound to this topic
@@ -1079,5 +1104,5 @@ module.exports = {
   listSessions, matchSessions, readSessionInfo, relTime, formatSessionList,
   isActive, shouldPrune, isDeskBusy, invertRepoMappings, splitThreadKey, buildThreadIndex,
   migrateLegacy, topicName, openerText, shouldAutoCreate, loadIgnored, persistIgnored, persisted, deskUrl,
-  lastExchange, sessionNameById,
+  lastExchange, sessionNameById, heldByOtherPids,
 };

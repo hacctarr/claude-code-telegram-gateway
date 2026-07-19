@@ -119,14 +119,19 @@ tail -f gateway.log       # watch it live
 ### Phone continuation — works whether or not the desk session is closed
 - **Desk session closed:** your phone reply continues the *same* session and is saved — seamless,
   and `cr` at the Mac picks it right up.
-- **Desk session left open:** a plain resume into a held session runs but wouldn't persist (the desk
-  owns the file). The gateway detects this (the transcript didn't grow) and **automatically forks a
-  phone-owned branch** that *does* persist, continuing there — you get a one-line "continued in a
-  phone branch" notice. Your desk copy is untouched; from that point the phone and desk branches
-  diverge — but you never have to remember to close the TUI, and opening a terminal auto-resumes the
-  phone branch. If you *do* keep working the desk branch afterward, it automatically gets its own
-  topic again (no manual `/branches` command needed). Held-open is detected with `lsof` **before**
-  the turn runs, so the prompt (and any tool side effects) never executes twice.
+- **Desk session left open:** the desk process owns the transcript, so a plain resume wouldn't
+  persist. With `AUTO_FORK` (default on) the gateway instead **forks a saved phone branch** and the
+  topic follows it — full context kept, one-line notice posted, desk copy untouched. If you later
+  keep working the desk copy, it earns its own topic automatically. Three safeguards make this
+  race-free (each was a real bug once):
+  - held-detection runs **before** the turn (`lsof`, excluding the gateway's own pid) — the prompt
+    and its tool side effects execute exactly once, and idle-but-open sessions aren't re-forked;
+  - the fork's session id is **pre-minted and reserved**, so the poller can never create a
+    duplicate topic for the branch mid-turn;
+  - a reply resolves its target session **when it runs**, so back-to-back messages follow the
+    first one's fork instead of forking the original twice.
+  Set `AUTO_FORK: false` to disable; held-session replies then run with full context but aren't
+  persisted (and say so).
 
 ### Other notes
 - Mirror latency ≈ `POLL_MS` (~2s); it posts completed turns, not token-by-token (phone-injected

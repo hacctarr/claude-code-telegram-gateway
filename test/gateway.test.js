@@ -442,3 +442,14 @@ test('lastExchange: returns the final user prompt + assistant response', () => {
 test('lastExchange: missing file is safe', () => {
   assert.deepEqual(g.lastExchange('/nope/missing.jsonl'), { lastText: null, lastUser: null });
 });
+
+// ---------------------------------------------------------------------------
+// heldByOtherPids — self-pid filtering (the spurious-fork fix)
+// ---------------------------------------------------------------------------
+test('heldByOtherPids: filters the gateway\'s own pid out of lsof output', () => {
+  assert.deepEqual(g.heldByOtherPids('123\n456\n', 456), [123]);      // other holder remains
+  assert.deepEqual(g.heldByOtherPids('456\n', 456), []);              // only self → not held
+  assert.deepEqual(g.heldByOtherPids('', 456), []);                   // nobody → not held
+  assert.deepEqual(g.heldByOtherPids('123\n789\n', 456), [123, 789]); // multiple others
+  assert.deepEqual(g.heldByOtherPids('garbage\n123\n', 456), [123]);  // non-numeric lines ignored
+});
