@@ -1,0 +1,27 @@
+# Publishes to npm via Trusted Publishing (OIDC) — no tokens stored anywhere.
+# Configure once on npmjs.com: package Settings → Trusted Publisher → GitHub Actions →
+#   user: hacctarr · repo: claude-code-telegram-gateway · workflow: publish.yml
+# Then every release is:  git tag v1.x.y && git push --tags
+name: Publish to npm
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write   # OIDC token for npm Trusted Publishing
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          registry-url: 'https://registry.npmjs.org'
+      - run: npm install -g npm@latest   # Trusted Publishing needs npm >= 11.5.1
+      - run: npm test
+      - run: npm publish --access public
