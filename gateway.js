@@ -729,17 +729,24 @@ function slugify(s) {
 }
 
 // Ask a small/fast model for a short kebab-case slug (VS Code-tab style) from the session's content.
+// Runs in HOME (never a mapped repo) with a throwaway session id that we delete afterward, so title
+// generation never leaves a stray session file that could itself spawn a topic.
 function generateTitle(firstMsg, recentMsg) {
   return new Promise((resolve) => {
     if (!firstMsg && !recentMsg) return resolve(null);
     const prompt = `Give a 1-3 word kebab-case slug titling this work session. Reply ONLY the slug, no quotes or extra text.\n` +
       `First message: "${(firstMsg || '').slice(0, 300)}"` + (recentMsg ? `\nRecent: "${recentMsg.slice(0, 200)}"` : '');
-    let out = '';
-    let child; try { child = spawn(CLAUDE_BINARY, ['-p', '--model', TITLE_MODEL, '--permission-mode', 'bypassPermissions'], { cwd: process.env.HOME, env: process.env }); }
+    const home = process.env.HOME;
+    const tmpId = crypto.randomUUID();
+    const cleanup = () => { try { const enc = '-' + home.replace(/^\//, '').replace(/[/.]/g, '-'); fs.unlinkSync(path.join(home, '.claude', 'projects', enc, tmpId + '.jsonl')); } catch (e) { /* */ } };
+    let out = '', done = false;
+    const finish = (v) => { if (done) return; done = true; cleanup(); resolve(v); };
+    let child; try { child = spawn(CLAUDE_BINARY, ['-p', '--session-id', tmpId, '--model', TITLE_MODEL, '--permission-mode', 'bypassPermissions'], { cwd: home, env: process.env }); }
     catch (e) { return resolve(null); }
+    const timer = setTimeout(() => { try { child.kill('SIGKILL'); } catch (e) { /* */ } finish(null); }, 20000);
     child.stdout.on('data', (d) => (out += d));
-    child.on('error', () => resolve(null));
-    child.on('close', () => resolve(slugify(out) || null));
+    child.on('error', () => { clearTimeout(timer); finish(null); });
+    child.on('close', () => { clearTimeout(timer); finish(slugify(out) || null); });
     child.stdin.write(prompt); child.stdin.end();
   });
 }
@@ -838,6 +845,7 @@ async function pollTick() {
       const cwd = await getCwd(file);
       if (!cwd || !repoToChat[cwd]) continue;
 
+      if (id.startsWith('agent-')) continue;                         // sub-agent sessions never get a topic
       const link = linkBySession[id];
       if (!link) {
         if (ignoredSessions.has(id)) continue;                       // /new-detached — permanent
