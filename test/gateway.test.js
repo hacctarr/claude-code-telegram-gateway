@@ -323,7 +323,7 @@ test('invertRepoMappings: repoDir -> chatId', () => {
   assert.equal(inv['/repo/b'], '-100def');
 });
 test('splitThreadKey: handles negative chat ids with underscores', () => {
-  assert.deepEqual(g.splitThreadKey('-1003953985506_104'), ['-1003953985506', '104']);
+  assert.deepEqual(g.splitThreadKey('-1001234567890_104'), ['-1001234567890', '104']);
 });
 test('buildThreadIndex: maps chat_thread -> sessionId', () => {
   const idx = g.buildThreadIndex({ sidA: { chatId: '-100', threadId: 5 } });
@@ -331,8 +331,8 @@ test('buildThreadIndex: maps chat_thread -> sessionId', () => {
 });
 test('migrateLegacy: converts old sessions.json entries into links', () => {
   const links = {};
-  g.migrateLegacy(links, { '-1003953985506_104': 'sid-1' });
-  assert.equal(links['sid-1'].chatId, '-1003953985506');
+  g.migrateLegacy(links, { '-1001234567890_104': 'sid-1' });
+  assert.equal(links['sid-1'].chatId, '-1001234567890');
   assert.equal(links['sid-1'].threadId, 104);
   assert.equal(links['sid-1'].offset, 0);
 });
