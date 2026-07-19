@@ -20,11 +20,19 @@ sed -e "s|__NODE__|$NODE_BIN|g" \
     -e "s|__PATH__|$NODE_DIR:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin|g" \
     "$PLIST_SRC" > "$PLIST_DST"
 
-# (Re)load the service.
+# (Re)load the service. bootout is async, so retry bootstrap a few times to dodge the
+# "Input/output error (5)" race when the old instance hasn't fully torn down yet.
 launchctl bootout "gui/$(id -u)/$LABEL" 2>/dev/null || true
-launchctl bootstrap "gui/$(id -u)" "$PLIST_DST"
-launchctl enable "gui/$(id -u)/$LABEL"
-launchctl kickstart -k "gui/$(id -u)/$LABEL" 2>/dev/null || true
+booted=0
+for _ in 1 2 3 4 5; do
+  sleep 1
+  if launchctl bootstrap "gui/$(id -u)" "$PLIST_DST" 2>/dev/null; then booted=1; break; fi
+done
+if [ "$booted" != 1 ]; then
+  echo "⚠️  launchctl bootstrap failed. Try: launchctl bootout gui/$(id -u)/$LABEL ; ./install-service.sh" >&2
+fi
+launchctl enable "gui/$(id -u)/$LABEL" 2>/dev/null || true
+launchctl kickstart "gui/$(id -u)/$LABEL" 2>/dev/null || true
 
 # Shell integration: auto-resume the branch you were working on from your phone, so opening a
 # terminal drops you straight back in — no `cr` needed (multi-repo aware). `cr` stays as a manual
