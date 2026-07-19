@@ -18,5 +18,7 @@
   "POLL_MS": 2000,
   "MIRROR_FLUSH_MS": 4000,
   "DESK_URL_TEMPLATE": "vscode://anthropic.claude-code/open?session={session}",
-  "DESK_OPEN_CMD": "open"
+  "DESK_OPEN_CMD": "open",
+  "TITLE_MODE": "generated",
+  "TITLE_MODEL": "haiku"
 }

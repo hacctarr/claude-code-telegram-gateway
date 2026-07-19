@@ -39,6 +39,10 @@ const PRUNE_AFTER_MS = (config.PRUNE_AFTER_DAYS || 7) * 86_400_000;
 const PRUNE_MODE = config.PRUNE_MODE || 'close';   // "close" | "delete"
 const POLL_MS = config.POLL_MS || 2000;
 const MIRROR_FLUSH_MS = config.MIRROR_FLUSH_MS || 4000;  // min gap between mirror posts per topic
+// How to name topics: "generated" = a short AI slug (VS Code-tab style, e.g. telegram-topic-fix);
+// "session-name" = Claude's derived name (documents-14); "first-message" = the opening prompt.
+const TITLE_MODE = config.TITLE_MODE || 'generated';
+const TITLE_MODEL = config.TITLE_MODEL || 'haiku';
 // /desk opens a topic's session in the desktop editor. Template's {session} is the session id.
 // Default targets the Claude Code VS Code extension; Cursor/Windsurf users can swap the scheme.
 const DESK_URL_TEMPLATE = config.DESK_URL_TEMPLATE || 'vscode://anthropic.claude-code/open?session={session}';
@@ -720,10 +724,41 @@ function sessionNameById(sessionId) {
   } catch (e) { /* */ }
   return null;
 }
+function slugify(s) {
+  return (s || '').toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').split('-').filter(Boolean).slice(0, 4).join('-').slice(0, 32);
+}
+
+// Ask a small/fast model for a short kebab-case slug (VS Code-tab style) from the session's content.
+function generateTitle(firstMsg, recentMsg) {
+  return new Promise((resolve) => {
+    if (!firstMsg && !recentMsg) return resolve(null);
+    const prompt = `Give a 1-3 word kebab-case slug titling this work session. Reply ONLY the slug, no quotes or extra text.\n` +
+      `First message: "${(firstMsg || '').slice(0, 300)}"` + (recentMsg ? `\nRecent: "${recentMsg.slice(0, 200)}"` : '');
+    let out = '';
+    let child; try { child = spawn(CLAUDE_BINARY, ['-p', '--model', TITLE_MODEL, '--permission-mode', 'bypassPermissions'], { cwd: process.env.HOME, env: process.env }); }
+    catch (e) { return resolve(null); }
+    child.stdout.on('data', (d) => (out += d));
+    child.on('error', () => resolve(null));
+    child.on('close', () => resolve(slugify(out) || null));
+    child.stdin.write(prompt); child.stdin.end();
+  });
+}
+
+// Sync fallback namer (also used in tests).
 function topicName(info) {
-  const name = sessionNameById(info.id);
+  const name = TITLE_MODE === 'first-message' ? slugify(info.label) : sessionNameById(info.id);
   if (name) return `🤖 ${name}`;
-  return info.label ? `🤖 ${info.label.slice(0, 60)}` : `🤖 Claude ${info.id.slice(0, 8)}`;
+  return info.label ? `🤖 ${slugify(info.label)}` : `🤖 claude-${info.id.slice(0, 6)}`;
+}
+
+// Async resolver used at topic creation — generates a slug when TITLE_MODE=generated.
+async function resolveTopicName(info) {
+  if (TITLE_MODE === 'generated') {
+    const { lastUser } = lastExchange(info.path);
+    const slug = await generateTitle(info.label, lastUser);
+    if (slug) return `🤖 ${slug}`;
+  }
+  return topicName(info);
 }
 function openerText(info) {
   const name = sessionNameById(info.id);
@@ -739,7 +774,7 @@ async function ensureTopicForSession(info) {
   if (!shouldAutoCreate(info)) return null;   // skip sub-agent/empty/command-only sessions
   const chatId = repoToChat[info.cwd];
   if (!chatId || !AUTO_CREATE_TOPICS) return null;
-  const threadId = await createForumTopic(chatId, topicName(info));
+  const threadId = await createForumTopic(chatId, await resolveTopicName(info));
   if (!threadId) return null;
   const tkey = `${chatId}_${threadId}`;
   if (sessionByThread.has(tkey) && sessionByThread.get(tkey) !== info.id) {   // never bind two sessions to one thread

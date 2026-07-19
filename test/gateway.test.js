@@ -345,9 +345,9 @@ test('migrateLegacy: does not overwrite an existing link', () => {
 // ---------------------------------------------------------------------------
 // Topic naming / opener formatting
 // ---------------------------------------------------------------------------
-test('topicName: uses label, falls back to short id', () => {
-  assert.equal(g.topicName({ id: 'abcdef12-0000', label: 'Fix login' }), '🤖 Fix login');
-  assert.match(g.topicName({ id: 'abcdef12-0000', label: '' }), /^🤖 Claude abcdef12$/);
+test('topicName: slugifies the label, falls back to short id', () => {
+  assert.equal(g.topicName({ id: 'abcdef12-0000', label: 'Fix login' }), '🤖 fix-login');
+  assert.match(g.topicName({ id: 'abcdef12-0000', label: '' }), /^🤖 claude-abcdef$/);
 });
 test('openerText: mentions the session id and the cr resume hint', () => {
   const t = g.openerText({ id: 'abcdef12-3456', label: 'Fix login', mtime: Date.now() });
