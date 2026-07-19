@@ -106,6 +106,8 @@ tail -f gateway.log       # watch it live
   - Reply in a topic to steer that session (runs when the desk session is idle).
   - `/new <message>` — start a brand-new, independent session in its own topic.
   - `/new` (bare) — detach the current topic so your next message starts a fresh session there.
+  - `/exit` (or `/close`) — close this topic and stop mirroring its session. The session stays
+    resumable on disk, and fresh desk activity re-opens a topic for it automatically.
   - **`/desk`** — open this topic's session in the editor on your Mac (VS Code by default). The
     clean "hand it back to the desk" move: it opens the exact session so you continue there.
   - `/sessions` — list recent sessions in the repo.
@@ -137,6 +139,11 @@ tail -f gateway.log       # watch it live
 - Mirror latency ≈ `POLL_MS` (~2s); it posts completed turns, not token-by-token (phone-injected
   turns *do* stream token-by-token via the live-edited message). Failing desk tool calls are
   surfaced as `⚠️ tool error`; successful tool output is kept quiet.
+- **Stall/approval notices:** a desk permission prompt is editor-UI state and never appears in the
+  transcript — from the phone the session just looks stuck. If a desk tool call stays unresolved
+  past `STALL_NOTICE_SECONDS` (default 60, 0 = off), the topic gets a one-time notice naming the
+  tool ("may be running long — or waiting for approval at the desk"), and a follow-up when it
+  completes. Approval itself must happen at the desk; `/desk` jumps you there.
 - With `bypassPermissions` (default), phone-injected turns never block on a tool-permission prompt.
   A clarifying question in Claude's reply just streams to you; answer in the topic to continue.
 - A single-instance lock prevents two gateways from fighting over `getUpdates`. Linux users: a

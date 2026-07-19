@@ -453,3 +453,40 @@ test('heldByOtherPids: filters the gateway\'s own pid out of lsof output', () =>
   assert.deepEqual(g.heldByOtherPids('123\n789\n', 456), [123, 789]); // multiple others
   assert.deepEqual(g.heldByOtherPids('garbage\n123\n', 456), [123]);  // non-numeric lines ignored
 });
+
+// ---------------------------------------------------------------------------
+// Stall/approval notices — updatePendingTools + dueStallNotices
+// ---------------------------------------------------------------------------
+test('updatePendingTools: tracks tool_use, clears on tool_result', () => {
+  const state = {};
+  const t0 = 1000;
+  g.updatePendingTools(state, [
+    { type: 'assistant', message: { content: [{ type: 'tool_use', id: 'tu1', name: 'Bash', input: { command: 'npm test' } }] } },
+  ], t0);
+  assert.ok(state.tu1, 'pending after tool_use');
+  assert.equal(state.tu1.name, 'Bash');
+  const resolved = g.updatePendingTools(state, [
+    { type: 'user', message: { content: [{ type: 'tool_result', tool_use_id: 'tu1', content: 'ok' }] } },
+  ], t0 + 500);
+  assert.equal(state.tu1, undefined, 'cleared after tool_result');
+  assert.deepEqual(resolved, [], 'not announced → no resolution notice');
+});
+test('updatePendingTools: resolution of a NOTIFIED entry is returned for announcement', () => {
+  const state = { tu1: { name: 'Bash', summary: 'x', ts: 0, notified: true } };
+  const resolved = g.updatePendingTools(state, [
+    { type: 'user', message: { content: [{ type: 'tool_result', tool_use_id: 'tu1' }] } },
+  ], 99999);
+  assert.equal(resolved.length, 1);
+  assert.equal(resolved[0].name, 'Bash');
+});
+test('dueStallNotices: fires once past threshold, never twice', () => {
+  const state = { tu1: { name: 'Bash', summary: 'slow', ts: 0, notified: false } };
+  assert.equal(g.dueStallNotices(state, 30_000, 60_000).length, 0, 'below threshold');
+  const due = g.dueStallNotices(state, 61_000, 60_000);
+  assert.equal(due.length, 1, 'fires at threshold');
+  assert.equal(g.dueStallNotices(state, 120_000, 60_000).length, 0, 'does not repeat');
+});
+test('dueStallNotices: disabled threshold or missing state is safe', () => {
+  assert.deepEqual(g.dueStallNotices({ a: { ts: 0, notified: false } }, 99999, 0), []);
+  assert.deepEqual(g.dueStallNotices(undefined, 99999, 60_000), []);
+});

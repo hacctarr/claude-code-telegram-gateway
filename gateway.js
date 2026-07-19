@@ -48,6 +48,10 @@ const TITLE_MODEL = config.TITLE_MODEL || 'haiku';
 // held-detection ignores the gateway's own pid — the three fixes that make this safe. Set
 // AUTO_FORK:false to disable; replies into a held session then run with full context but don't persist.
 const AUTO_FORK = config.AUTO_FORK !== false;
+// After this many seconds with a desk tool call still unresolved, post a one-time notice to the
+// topic (it may be a long-running tool OR a permission prompt sitting unanswered at the desk — the
+// transcript can't distinguish them, so the notice says both). 0 disables.
+const STALL_NOTICE_MS = config.STALL_NOTICE_SECONDS === 0 ? 0 : (config.STALL_NOTICE_SECONDS || 60) * 1000;
 // /desk opens a topic's session in the desktop editor. Template's {session} is the session id.
 // Default targets the Claude Code VS Code extension; Cursor/Windsurf users can swap the scheme.
 const DESK_URL_TEMPLATE = config.DESK_URL_TEMPLATE || 'vscode://anthropic.claude-code/open?session={session}';
@@ -616,6 +620,45 @@ async function upsertLink(sessionId, chatId, threadId, labelHint) {
   return link;
 }
 
+// --- Desk stall / approval notices -----------------------------------------
+// A desk permission prompt is UI state and never appears in the transcript — the session just goes
+// quiet after an assistant tool_use with no tool_result. We track unresolved tool calls per session
+// and, past a threshold, post one honest notice (could be a slow tool OR an unanswered prompt),
+// plus a resolution line when it completes so the phone knows the session is moving again.
+const pendingTools = {};   // sessionId -> { toolUseId: { name, summary, ts, notified } }
+
+// Pure: fold mirrored transcript records into one session's pending-tool state.
+// Returns entries that had been notified and just resolved (worth announcing).
+function updatePendingTools(state, records, now) {
+  const resolved = [];
+  for (const o of records) {
+    if (!o || typeof o !== 'object') continue;
+    if (o.type === 'assistant' && o.message && Array.isArray(o.message.content)) {
+      for (const b of o.message.content) {
+        if (b.type === 'tool_use' && b.id) state[b.id] = { name: b.name, summary: summarizeToolInput(b.name, b.input), ts: now, notified: false };
+      }
+    } else if (o.type === 'user' && o.message && Array.isArray(o.message.content)) {
+      for (const b of o.message.content) {
+        if (b.type === 'tool_result' && b.tool_use_id && state[b.tool_use_id]) {
+          if (state[b.tool_use_id].notified) resolved.push(state[b.tool_use_id]);
+          delete state[b.tool_use_id];
+        }
+      }
+    }
+  }
+  return resolved;
+}
+
+// Pure: entries past the threshold not yet announced (marks them announced).
+function dueStallNotices(state, now, thresholdMs) {
+  const due = [];
+  if (!thresholdMs || !state) return due;
+  for (const e of Object.values(state)) {
+    if (!e.notified && now - e.ts >= thresholdMs) { e.notified = true; due.push(e); }
+  }
+  return due;
+}
+
 // A resumed turn "sticks" only if the transcript grew. If it didn't, the desk TUI is holding the
 // session open and the injected turn ran in memory only (verified behavior) — nothing was saved.
 function persisted(sizeBefore, sizeAfter) { return sizeAfter > sizeBefore; }
@@ -847,6 +890,7 @@ async function pruneTopic(sessionId) {
     await closeForumTopic(l.chatId, l.threadId);
     l.closed = true;
   }
+  delete pendingTools[sessionId];
   persistLinks();
   console.log(`[Topic] pruned (${PRUNE_MODE}) session ${sessionId.slice(0, 8)}`);
 }
@@ -863,11 +907,23 @@ async function reviveTopic(sessionId) {
 // ---------------------------------------------------------------------------
 // Poll loop: discover new sessions, mirror activity, prune, flush queues.
 // ---------------------------------------------------------------------------
+// Graceful self-restart: `touch restart.flag` (from anywhere — including a phone-driven turn) and
+// the gateway exits once no injected turns are in flight; launchd relaunches it with fresh code.
+// Never `launchctl kickstart -k` from inside a gateway-driven turn — that kills the process group,
+// including the turn that issued it, mid-command.
+const RESTART_FLAG = path.join(__dirname, 'restart.flag');
+
 let polling = false;
 async function pollTick() {
   if (polling) return;
   polling = true;
   try {
+    if (fs.existsSync(RESTART_FLAG) && injecting.size === 0) {
+      try { fs.unlinkSync(RESTART_FLAG); } catch (e) { /* */ }
+      console.log('[Restart] restart.flag seen and no turns in flight — exiting for launchd relaunch.');
+      persistLinks();
+      process.exit(1);   // non-zero → KeepAlive relaunches
+    }
     const now = Date.now();
     let topicsThisTick = 0;
     const files = allSessionFiles();
@@ -904,9 +960,21 @@ async function pollTick() {
         const { lines, newOffset } = readNewLines(file, link.offset);
         const posts = [];
         for (const o of lines) posts.push(...renderTranscriptLine(o, SHOW_TOOLS));
+        // Track unresolved tool calls; announce completion of any we'd flagged as stalled.
+        const pstate = (pendingTools[id] = pendingTools[id] || {});
+        for (const r of updatePendingTools(pstate, lines, now)) {
+          posts.push(`▶️ ${r.name} finished — session continuing.`);
+        }
         if (posts.length) { await sendPlain(link.chatId, link.threadId, posts.join('\n\n')); lastMirrorAt.set(id, now); }
         link.offset = newOffset;
         persistLinks();
+      }
+      // Stall notice: a tool call unresolved past the threshold — slow tool, or a permission
+      // prompt sitting unanswered at the desk (the transcript can't tell which; say both).
+      for (const e of dueStallNotices(pendingTools[id], now, STALL_NOTICE_MS)) {
+        await sendPlain(link.chatId, link.threadId,
+          `⏳ Desk session has been on this for ${Math.round((now - e.ts) / 1000)}s:\n🔧 ${e.name}${e.summary ? ': ' + e.summary : ''}\n` +
+          `It may just be running long — or waiting for tool approval at the desk (/desk opens it).`);
       }
     }
 
@@ -918,6 +986,7 @@ async function pollTick() {
       if (l) sessionByThread.delete(`${l.chatId}_${l.threadId}`);
       delete linkBySession[id];
       lastMirrorAt.delete(id);
+      delete pendingTools[id];
       persistLinks();
       console.log(`[Cleanup] dropped link for missing session ${id.slice(0, 8)}`);
     }
@@ -997,6 +1066,24 @@ async function pollUpdates() {
           const sid = sessionByThread.get(key);
           if (sid) { ignoredSessions.add(sid); persistIgnored(); sessionByThread.delete(key); delete linkBySession[sid]; persistLinks(); }
           sendPlain(chatId, threadId, "🆕 This topic will start a fresh session on your next message.");
+          continue;
+        }
+        // /exit — close this session's topic and stop mirroring it. The session file stays on disk
+        // (resume any time via /sessions or `cr`); if the desk keeps working it, it re-topics itself.
+        if (text === '/exit' || text === '/close') {
+          const sid = sessionByThread.get(key);
+          if (!sid) { sendPlain(chatId, threadId, "This topic isn't bound to a session — nothing to close."); continue; }
+          await sendPlain(chatId, threadId, `👋 Session ${sid.slice(0, 8)} closed. It stays resumable on disk ` +
+            `(/sessions in another topic, or \`cr\` at the Mac); fresh desk activity will re-open a topic for it.`);
+          sessionByThread.delete(key);
+          delete linkBySession[sid];
+          queues.delete(sid);
+          delete pendingTools[sid];
+          supersededAt[sid] = sizeCurrent(sid); persistSuperseded();   // hidden unless the desk grows it again
+          persistLinks();
+          if (PRUNE_MODE === 'delete') await deleteForumTopic(chatId, threadId);
+          else await closeForumTopic(chatId, threadId);
+          console.log(`[Exit] closed topic ${threadId} for session ${sid.slice(0, 8)}`);
           continue;
         }
         // /sessions or bare /resume — list recent sessions.
@@ -1104,5 +1191,5 @@ module.exports = {
   listSessions, matchSessions, readSessionInfo, relTime, formatSessionList,
   isActive, shouldPrune, isDeskBusy, invertRepoMappings, splitThreadKey, buildThreadIndex,
   migrateLegacy, topicName, openerText, shouldAutoCreate, loadIgnored, persistIgnored, persisted, deskUrl,
-  lastExchange, sessionNameById, heldByOtherPids,
+  lastExchange, sessionNameById, heldByOtherPids, updatePendingTools, dueStallNotices,
 };
