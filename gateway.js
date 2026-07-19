@@ -43,6 +43,10 @@ const MIRROR_FLUSH_MS = config.MIRROR_FLUSH_MS || 4000;  // min gap between mirr
 // "session-name" = Claude's derived name (documents-14); "first-message" = the opening prompt.
 const TITLE_MODE = config.TITLE_MODE || 'generated';
 const TITLE_MODEL = config.TITLE_MODEL || 'haiku';
+// Auto-fork a held-open desk session into a phone branch (experimental — off by default; it can
+// shuffle topic↔session bindings). When off, a reply into a held session resumes it with full
+// context but isn't saved to disk (the desk owns the file); the user is told so.
+const AUTO_FORK = config.AUTO_FORK === true;
 // /desk opens a topic's session in the desktop editor. Template's {session} is the session id.
 // Default targets the Claude Code VS Code extension; Cursor/Windsurf users can swap the scheme.
 const DESK_URL_TEMPLATE = config.DESK_URL_TEMPLATE || 'vscode://anthropic.claude-code/open?session={session}';
@@ -635,12 +639,13 @@ async function driveTurn(chatId, threadId, prompt, knownSessionId) {
   const typing = startTyping(chatId, threadId);
   const live = new LiveMessage(chatId, threadId);
   const sessionId = knownSessionId || null;
-  // Decide the mode up front (single run, no double side effects):
-  //   held-open existing session → fork into a persistent phone branch
-  //   free existing session      → resume in place
-  //   no session                 → fresh session (id reserved so the poller can't duplicate its topic)
-  const forkHeld = !!(sessionId && isSessionHeld(sessionFileById(sessionId)));
+  // Always resume the SAME session so the reply keeps full context and the topic↔session binding
+  // stays stable (no duplicates/rebinds). Auto-fork is opt-in; without it a reply into a held-open
+  // desk session still runs with full context but isn't persisted (the desk owns the file).
+  const held = !!(sessionId && isSessionHeld(sessionFileById(sessionId)));
+  const forkHeld = AUTO_FORK && held;
   const createId = sessionId ? null : crypto.randomUUID();
+  const sizeBefore = sessionId ? sizeCurrent(sessionId) : 0;
   let activeSid = sessionId || createId;
   if (activeSid) injecting.add(activeSid);
   try {
@@ -675,18 +680,24 @@ async function driveTurn(chatId, threadId, prompt, knownSessionId) {
       return;
     }
 
-    await live.finalize(body);
+    // Held-open but not forking: the reply had full context but won't be saved to the desk copy.
+    const ephemeral = held && result.ok && !persisted(sizeBefore, sizeCurrent(sessionId));
+    await live.finalize(ephemeral
+      ? `${body}\n\n⚠️ The desk session is open, so this reply isn't saved to it (close the desk ` +
+        `session to persist). The reply above still used the full session context.`
+      : body);
+
     const finalSid = result.sessionId || sessionId || createId;
     if (finalSid) {
       injecting.add(finalSid);
       if (createId && finalSid !== createId) injecting.delete(createId);
       activeSid = finalSid;
       await upsertLink(finalSid, chatId, threadId, prompt);
-      try { linkBySession[finalSid].offset = sizeCurrent(finalSid); } catch (e) { /* */ }
+      if (!ephemeral) { try { linkBySession[finalSid].offset = sizeCurrent(finalSid); } catch (e) { /* */ } }
       persistLinks();
-      if (result.ok) writeResumeMarker(repoDir, finalSid);
+      if (result.ok && !ephemeral) writeResumeMarker(repoDir, finalSid);
     }
-    console.log(`[Drive → thread ${threadId}] ok=${result.ok} session=${finalSid || '—'}${forkHeld ? ' (forked)' : ''}`);
+    console.log(`[Drive → thread ${threadId}] ok=${result.ok} session=${finalSid || '—'}${ephemeral ? ' (held/ephemeral)' : ''}`);
   } catch (err) {
     clearInterval(typing);
     console.error('driveTurn error:', err);

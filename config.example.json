@@ -1,6 +1,8 @@
 {
   "BOT_TOKEN": "123456789:AAHfiqksKZ8...",
-  "ALLOWED_USER_IDS": ["412587349"],
+  "ALLOWED_USER_IDS": [
+    "412587349"
+  ],
   "REPO_MAPPINGS": {
     "-1001654782309": "/Users/you/projects/auth-service",
     "-1001987654321": "/Users/you/projects/frontend-ui"
@@ -20,5 +22,6 @@
   "DESK_URL_TEMPLATE": "vscode://anthropic.claude-code/open?session={session}",
   "DESK_OPEN_CMD": "open",
   "TITLE_MODE": "generated",
-  "TITLE_MODEL": "haiku"
+  "TITLE_MODEL": "haiku",
+  "AUTO_FORK": false
 }
