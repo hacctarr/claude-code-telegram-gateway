@@ -472,12 +472,12 @@ function readNewLines(filePath, offset) {
 // ---------------------------------------------------------------------------
 // Running a Claude turn (streaming headless) — used for phone injections.
 // ---------------------------------------------------------------------------
-function runClaudeTurn(prompt, cwd, sessionId, live, createId) {
+function runClaudeTurn(prompt, cwd, sessionId, live, createId, fork) {
   return new Promise((resolve) => {
     const args = ['-p', '--output-format', 'stream-json', '--include-partial-messages', '--verbose',
                   '--permission-mode', PERM_MODE];
     if (MODEL) args.push('--model', MODEL);
-    if (sessionId) args.push('--resume', sessionId);
+    if (sessionId) { args.push('--resume', sessionId); if (fork) args.push('--fork-session'); }
     else if (createId) args.push('--session-id', createId);  // deterministic id for a fresh session
     args.push(...EXTRA);
 
@@ -533,6 +533,7 @@ async function upsertLink(sessionId, chatId, threadId, labelHint) {
 // A resumed turn "sticks" only if the transcript grew. If it didn't, the desk TUI is holding the
 // session open and the injected turn ran in memory only (verified behavior) — nothing was saved.
 function persisted(sizeBefore, sizeAfter) { return sizeAfter > sizeBefore; }
+function sizeCurrent(sessionId) { try { return fs.statSync(sessionFileById(sessionId)).size; } catch (e) { return 0; } }
 
 // Drive one turn in `threadId` on behalf of `knownSessionId` (or a fresh session if null).
 async function driveTurn(chatId, threadId, prompt, knownSessionId) {
@@ -558,20 +559,32 @@ async function driveTurn(chatId, threadId, prompt, knownSessionId) {
       return;
     }
 
-    let finalText = result.ok ? result.body
+    const finalText = result.ok ? result.body
       : `${result.body && result.body !== '⚙️ Working…' ? result.body + '\n\n' : ''}⚠️ ${result.error}`;
 
-    // Held-open detection: injected into an existing session but nothing persisted → desk owns it.
-    let heldOpen = false;
-    if (sessionId && result.ok) {
-      let sizeAfter = sizeBefore;
-      try { sizeAfter = fs.statSync(sessionFileById(sessionId)).size; } catch (e) { /* */ }
-      if (!persisted(sizeBefore, sizeAfter)) {
-        heldOpen = true;
-        finalText += `\n\n⚠️ The desk session is open right now, so this ran but was NOT saved to it ` +
-          `(the desk won't see it). Close the desk session — or use /new here — so phone replies stick.`;
+    // Held-open: injected into an existing session but nothing persisted → the desk TUI owns it, so
+    // that turn was ephemeral. Fork into a persistent phone-owned branch and re-run, so you can
+    // keep going from your phone whether or not you closed the desk session.
+    if (sessionId && result.ok && !persisted(sizeBefore, sizeCurrent(sessionId))) {
+      const forkResult = await runClaudeTurn(prompt, repoDir, sessionId, live, null, true);
+      const forkSid = forkResult.sessionId;
+      if (forkResult.ok && forkSid && forkSid !== sessionId) {
+        injecting.add(forkSid); injecting.delete(sessionId); activeSid = forkSid;
+        ignoredSessions.add(sessionId); persistIgnored();   // desk keeps its own copy; don't re-topic it
+        delete linkBySession[sessionId];                    // move this topic onto the fork
+        await upsertLink(forkSid, chatId, threadId, prompt);
+        try { linkBySession[forkSid].offset = fs.statSync(sessionFileById(forkSid)).size; } catch (e) { /* */ }
+        persistLinks();
+        await live.finalize(`${forkResult.body}\n\n↪️ Desk session was open, so I continued in a phone branch ` +
+          `(your desk copy is untouched). Back at the Mac, \`cr\` picks up this branch.`);
+        console.log(`[Drive → thread ${threadId}] forked ${sessionId.slice(0, 8)} → ${forkSid.slice(0, 8)} (desk held open)`);
+      } else {
+        await live.finalize(`${finalText}\n\n⚠️ The desk session is open and I couldn't fork it; this reply ` +
+          `wasn't saved. Close the desk session (or /new) so phone replies stick.`);
       }
+      return;
     }
+
     await live.finalize(finalText);
 
     const finalSid = result.sessionId || sessionId || createId;
@@ -580,7 +593,7 @@ async function driveTurn(chatId, threadId, prompt, knownSessionId) {
       if (createId && finalSid !== createId) injecting.delete(createId);  // release unused reservation
       activeSid = finalSid;
       await upsertLink(finalSid, chatId, threadId, prompt);
-      if (!heldOpen) { try { linkBySession[finalSid].offset = fs.statSync(sessionFileById(finalSid)).size; } catch (e) { /* */ } }
+      try { linkBySession[finalSid].offset = fs.statSync(sessionFileById(finalSid)).size; } catch (e) { /* */ }
       persistLinks();
     }
     console.log(`[Drive → thread ${threadId}] ok=${result.ok} session=${finalSid || '—'}${heldOpen ? ' (held/ephemeral)' : ''}`);

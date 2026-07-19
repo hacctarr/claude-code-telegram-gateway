@@ -112,12 +112,18 @@ tail -f gateway.log       # watch it live
   session — including any turns you ran from the phone. (A background service can't open a TUI into
   your terminal, so this one command is the "return to desk" step.)
 
-### Limitations (by design — "native TUI primary")
-- **Phone replies stick only when the desk session is closed.** Verified behavior: injecting into a
-  session the desk TUI holds open runs safely (no lock error, no corruption, no forked transcript)
-  **but the turn is not saved** — the holder owns the file, so it evaporates and the desk never sees
-  it. The gateway detects this (the transcript didn't grow) and replies with a clear warning telling
-  you to close the desk session (or `/new`) so the message persists. Away from the desk (session
-  closed) is the reliable phone→desk path.
+### Phone continuation — works whether or not the desk session is closed
+- **Desk session closed:** your phone reply continues the *same* session and is saved — seamless,
+  and `cr` at the Mac picks it right up.
+- **Desk session left open:** a plain resume into a held session runs but wouldn't persist (the desk
+  owns the file). The gateway detects this (the transcript didn't grow) and **automatically forks a
+  phone-owned branch** that *does* persist, continuing there — you get a one-line "continued in a
+  phone branch" notice. Your desk copy is untouched; from that point the phone and desk branches
+  diverge, and `cr` at the Mac resumes whichever branch is most recent. So you never have to remember
+  to close the TUI before walking away.
+
+### Other notes
 - Mirror latency ≈ `POLL_MS` (~2s); it posts completed turns, not token-by-token (phone-injected
   turns *do* stream token-by-token via the live-edited message).
+- With `bypassPermissions` (default), phone-injected turns never block on a tool-permission prompt.
+  A clarifying question in Claude's reply just streams to you; answer in the topic to continue.
