@@ -419,3 +419,26 @@ test('deskUrl: builds the VS Code deep link with the session id', () => {
 test('deskUrl: url-encodes the session id', () => {
   assert.match(g.deskUrl('a b/c'), /session=a%20b%2Fc$/);
 });
+
+// ---------------------------------------------------------------------------
+// lastExchange — seed a new topic with where the session left off
+// ---------------------------------------------------------------------------
+test('lastExchange: returns the final user prompt + assistant response', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'gw-le-'));
+  const f = path.join(dir, 's.jsonl');
+  try {
+    const lines = [
+      { type: 'user', message: { content: 'first question' } },
+      { type: 'assistant', message: { content: [{ type: 'text', text: 'first answer' }] } },
+      { type: 'user', message: { content: 'second question' } },
+      { type: 'assistant', message: { content: [{ type: 'tool_use', name: 'Bash', input: {} }, { type: 'text', text: 'the final answer' }] } },
+    ];
+    fs.writeFileSync(f, lines.map((l) => JSON.stringify(l)).join('\n') + '\n');
+    const r = g.lastExchange(f);
+    assert.equal(r.lastUser, 'second question');
+    assert.equal(r.lastText, 'the final answer');
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
+test('lastExchange: missing file is safe', () => {
+  assert.deepEqual(g.lastExchange('/nope/missing.jsonl'), { lastText: null, lastUser: null });
+});

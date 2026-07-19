@@ -145,6 +145,16 @@ const injecting = new Set();             // sessionIds the gateway is currently 
 const queues = new Map();                // sessionId -> [prompt] awaiting an idle desk session
 const lastMirrorAt = new Map();          // sessionId -> ts of last mirror post (rate-limit coalescing)
 
+// Growth baseline: a session only earns a topic once its transcript grows PAST its size when the
+// gateway started. This stops a restart (or a `resume`/read that merely bumps mtime) from
+// mass-creating topics for pre-existing sessions — only genuinely-progressing work gets a topic.
+const sessionBaseline = {};              // sessionId -> transcript size at startup (new files default 0)
+function snapshotBaseline() {
+  for (const f of allSessionFiles()) {
+    try { sessionBaseline[path.basename(f, '.jsonl')] = fs.statSync(f).size; } catch (e) { /* */ }
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
@@ -480,6 +490,33 @@ function renderTranscriptLine(o, showTools = true) {
   return [];
 }
 
+// The last user prompt + assistant response in a transcript, so a freshly-created topic shows where
+// the session left off. Reads only the tail of the file to stay cheap on large transcripts.
+function lastExchange(file) {
+  try {
+    const size = fs.statSync(file).size;
+    const start = Math.max(0, size - 131072);   // last 128 KB is plenty for the final turn
+    const len = size - start;
+    const buf = Buffer.alloc(len);
+    const fd = fs.openSync(file, 'r');
+    try { fs.readSync(fd, buf, 0, len, start); } finally { fs.closeSync(fd); }
+    let lastText = null, lastUser = null;
+    for (const line of buf.toString('utf8').split('\n')) {
+      if (!line.trim()) continue;
+      let o; try { o = JSON.parse(line); } catch (e) { continue; }
+      if (o.type === 'assistant' && o.message && Array.isArray(o.message.content)) {
+        const t = o.message.content.filter((b) => b.type === 'text' && b.text && b.text.trim()).map((b) => b.text.trim()).join('\n');
+        if (t) lastText = t;
+      } else if (o.type === 'user' && !o.isMeta && o.message) {
+        const c = o.message.content;
+        const t = typeof c === 'string' ? c : (Array.isArray(c) ? (c.find((x) => x.type === 'text') || {}).text : null);
+        if (t && !t.startsWith('<') && t.trim()) lastUser = t.replace(/\s+/g, ' ').trim();
+      }
+    }
+    return { lastText, lastUser };
+  } catch (e) { return { lastText: null, lastUser: null }; }
+}
+
 // Read complete JSONL records appended since `offset`. Returns parsed lines + advanced offset.
 function readNewLines(filePath, offset) {
   let size;
@@ -671,11 +708,26 @@ function queueForSession(sessionId, prompt) {
 // ---------------------------------------------------------------------------
 // Topic lifecycle
 // ---------------------------------------------------------------------------
+// Claude Code's own session name (e.g. "documents-f7"), from ~/.claude/sessions/*.json, so a topic
+// is named the same as the session you see in the editor / picker. Falls back to the first message.
+function sessionNameById(sessionId) {
+  const dir = path.join(process.env.HOME, '.claude', 'sessions');
+  try {
+    for (const f of fs.readdirSync(dir)) {
+      if (!f.endsWith('.json')) continue;
+      try { const o = JSON.parse(fs.readFileSync(path.join(dir, f), 'utf8')); if (o.sessionId === sessionId && o.name) return o.name; } catch (e) { /* */ }
+    }
+  } catch (e) { /* */ }
+  return null;
+}
 function topicName(info) {
+  const name = sessionNameById(info.id);
+  if (name) return `🤖 ${name}`;
   return info.label ? `🤖 ${info.label.slice(0, 60)}` : `🤖 Claude ${info.id.slice(0, 8)}`;
 }
 function openerText(info) {
-  return `🤖 Claude session ${info.id.slice(0, 8)}` +
+  const name = sessionNameById(info.id);
+  return `🤖 Session ${name || info.id.slice(0, 8)}` +
     (info.label ? `\n“${info.label}”` : '') +
     `\nLast active ${relTime(info.mtime)}.\n\n` +
     `This topic mirrors the desk session live. Reply here to steer it — your message runs when the ` +
@@ -689,10 +741,21 @@ async function ensureTopicForSession(info) {
   if (!chatId || !AUTO_CREATE_TOPICS) return null;
   const threadId = await createForumTopic(chatId, topicName(info));
   if (!threadId) return null;
+  const tkey = `${chatId}_${threadId}`;
+  if (sessionByThread.has(tkey) && sessionByThread.get(tkey) !== info.id) {   // never bind two sessions to one thread
+    console.warn(`[Topic] thread ${threadId} already bound to ${sessionByThread.get(tkey).slice(0, 8)}; skipping duplicate for ${info.id.slice(0, 8)}`);
+    return null;
+  }
   linkBySession[info.id] = { chatId, threadId, label: info.label || '', offset: info.size || 0, closed: false };
-  sessionByThread.set(`${chatId}_${threadId}`, info.id);
+  sessionByThread.set(tkey, info.id);
   persistLinks();
   await sendPlain(chatId, threadId, openerText(info));
+  // Seed the topic with where the session left off (last prompt + last response).
+  const { lastText, lastUser } = lastExchange(info.path);
+  if (lastText) {
+    await sendPlain(chatId, threadId,
+      `— where it left off —${lastUser ? `\n🖥️ desk: ${lastUser.slice(0, 400)}` : ''}\n\n${lastText}`);
+  }
   console.log(`[Topic] created for ${info.id.slice(0, 8)} → chat ${chatId} thread ${threadId}`);
   return linkBySession[info.id];
 }
@@ -730,6 +793,7 @@ async function pollTick() {
   polling = true;
   try {
     const now = Date.now();
+    let topicsThisTick = 0;
     const files = allSessionFiles();
     const existingIds = new Set(files.map((f) => path.basename(f, '.jsonl')));
 
@@ -746,9 +810,11 @@ async function pollTick() {
           if (st.size > supersededAt[id]) { delete supersededAt[id]; persistSuperseded(); }  // desk kept working → re-topic
           else continue;                                             // still at the fork point → stay hidden
         }
-        // Discover: only real, active sessions we aren't already driving get a topic.
-        if (MIRROR && AUTO_CREATE_TOPICS && !injecting.has(id) && isActive(st.mtimeMs, now)) {
-          await ensureTopicForSession(await readSessionInfo(file));
+        const grew = st.size > (sessionBaseline[id] || 0);           // grew past startup size (new files: baseline 0 → eligible)
+        // Discover: real, active, progressing sessions. At most ONE creation per tick so a burst of
+        // active sessions can never hammer Telegram's rate limit again.
+        if (MIRROR && AUTO_CREATE_TOPICS && !injecting.has(id) && grew && isActive(st.mtimeMs, now) && topicsThisTick < 1) {
+          if (await ensureTopicForSession(await readSessionInfo(file))) topicsThisTick++;
         }
         continue;
       }
@@ -940,6 +1006,7 @@ if (require.main === module) {
   loadLinks();
   loadIgnored();
   loadSuperseded();
+  snapshotBaseline();   // record current sizes so a restart doesn't mass-create topics
   console.log("=============================================");
   console.log("🚀 CLAUDE CODE MULTI-SESSION TELEGRAM GATEWAY");
   console.log("=============================================");
@@ -958,4 +1025,5 @@ module.exports = {
   listSessions, matchSessions, readSessionInfo, relTime, formatSessionList,
   isActive, shouldPrune, isDeskBusy, invertRepoMappings, splitThreadKey, buildThreadIndex,
   migrateLegacy, topicName, openerText, shouldAutoCreate, loadIgnored, persistIgnored, persisted, deskUrl,
+  lastExchange, sessionNameById,
 };
