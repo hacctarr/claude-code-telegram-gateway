@@ -1,0 +1,23 @@
+# Linux (systemd --user) unit for the Claude Code Telegram gateway.
+# Install:
+#   mkdir -p ~/.config/systemd/user
+#   sed "s#__DIR__#$(pwd)#; s#__NODE__#$(command -v node)#" systemd/claude-gateway.service \
+#     > ~/.config/systemd/user/claude-gateway.service
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now claude-gateway
+#   loginctl enable-linger "$USER"     # keep it running after you log out
+# Logs:   journalctl --user -u claude-gateway -f
+[Unit]
+Description=Claude Code Telegram gateway
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=__DIR__
+ExecStart=__NODE__ __DIR__/gateway.js
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=default.target

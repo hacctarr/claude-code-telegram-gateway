@@ -30,11 +30,13 @@
   "files": [
     "gateway.js",
     "setup.js",
+    "resume-hook.js",
     "bin/",
     "test/",
     "install-service.sh",
     "uninstall-service.sh",
     "com.claude.telegram-gateway.plist",
+    "systemd/claude-gateway.service",
     "config.example.json",
     "README.md",
     "SETUP.md",

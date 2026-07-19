@@ -2,7 +2,7 @@ const https = require('https');
 const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
-const { spawn } = require('child_process');
+const { spawn, execFileSync } = require('child_process');
 
 // ---------------------------------------------------------------------------
 // Config
@@ -66,6 +66,27 @@ function loadIgnored(file = IGNORED_FILE, set = ignoredSessions) {
 }
 function persistIgnored(file = IGNORED_FILE, set = ignoredSessions) {
   try { fs.writeFileSync(file, JSON.stringify([...set])); } catch (e) { /* */ }
+}
+
+// Branch management: when a phone reply forks a held-open desk session, the ORIGINAL desk session is
+// "superseded" — we record the transcript size at the fork point and skip re-topicing it, UNLESS the
+// desk keeps working on it (file grows past that point), in which case it automatically gets its own
+// topic again. So divergence is handled without any manual /branches command.
+const SUPERSEDED_FILE = path.join(__dirname, 'superseded.json');
+let supersededAt = {};   // sessionId -> transcript size when it was forked away from
+function loadSuperseded() { try { if (fs.existsSync(SUPERSEDED_FILE)) supersededAt = JSON.parse(fs.readFileSync(SUPERSEDED_FILE, 'utf8')); } catch (e) { supersededAt = {}; } }
+function persistSuperseded() { try { fs.writeFileSync(SUPERSEDED_FILE, JSON.stringify(supersededAt)); } catch (e) { /* */ } }
+
+// Auto-resume marker: the newest phone-driven branch per repo. A shell hook reads it so opening a
+// terminal drops you straight back into what you were doing on your phone (no `cr` needed).
+const RESUME_MARKER = path.join(process.env.HOME, '.claude-gateway', 'resume.json');
+function writeResumeMarker(repoDir, sessionId) {
+  try {
+    fs.mkdirSync(path.dirname(RESUME_MARKER), { recursive: true });
+    let m = {}; try { m = JSON.parse(fs.readFileSync(RESUME_MARKER, 'utf8')); } catch (e) { /* */ }
+    m[repoDir] = { sessionId, ts: Date.now() };
+    fs.writeFileSync(RESUME_MARKER, JSON.stringify(m, null, 2));
+  } catch (e) { /* */ }
 }
 
 // Only real interactive sessions (with an actual user message) get a topic. This filters out
@@ -439,6 +460,17 @@ function renderTranscriptLine(o, showTools = true) {
     const c = o.message.content;
     const t = typeof c === 'string' ? c : (Array.isArray(c) ? (c.find((x) => x.type === 'text') || {}).text : null);
     if (t && !t.startsWith('<') && t.trim()) return [`🖥️ desk: ${t.replace(/\s+/g, ' ').trim()}`];
+    // Surface tool errors (but not the noisy success output) so a failing desk run is visible.
+    if (Array.isArray(c) && showTools) {
+      const errs = [];
+      for (const b of c) {
+        if (b.type === 'tool_result' && b.is_error) {
+          const et = typeof b.content === 'string' ? b.content : (Array.isArray(b.content) ? (b.content.find((x) => x.type === 'text') || {}).text : '');
+          errs.push(`⚠️ tool error: ${(et || '').replace(/\s+/g, ' ').trim().slice(0, 150)}`);
+        }
+      }
+      return errs;
+    }
     return [];
   }
   return [];
@@ -536,67 +568,72 @@ function persisted(sizeBefore, sizeAfter) { return sizeAfter > sizeBefore; }
 function sizeCurrent(sessionId) { try { return fs.statSync(sessionFileById(sessionId)).size; } catch (e) { return 0; } }
 
 // Drive one turn in `threadId` on behalf of `knownSessionId` (or a fresh session if null).
+// Is the transcript currently held open by another process (the desk TUI)? Verified: a live TUI
+// keeps its .jsonl open even when idle, so lsof detects it — letting us decide fork-vs-resume BEFORE
+// running, so the prompt (and its side effects) never runs twice.
+function isSessionHeld(file) {
+  if (!file) return false;
+  try { return execFileSync('lsof', ['-t', file], { stdio: ['ignore', 'pipe', 'ignore'] }).toString().trim().length > 0; }
+  catch (e) { return false; }   // lsof exits non-zero when nothing holds the file
+}
+
 async function driveTurn(chatId, threadId, prompt, knownSessionId) {
   const repoDir = resolveHome(REPO_MAPPINGS[chatId]);
   const typing = startTyping(chatId, threadId);
   const live = new LiveMessage(chatId, threadId);
   const sessionId = knownSessionId || null;
-  // For a fresh session, mint the id up front and reserve it so the poller can't race us into a
-  // duplicate topic before we bind it.
+  // Decide the mode up front (single run, no double side effects):
+  //   held-open existing session → fork into a persistent phone branch
+  //   free existing session      → resume in place
+  //   no session                 → fresh session (id reserved so the poller can't duplicate its topic)
+  const forkHeld = !!(sessionId && isSessionHeld(sessionFileById(sessionId)));
   const createId = sessionId ? null : crypto.randomUUID();
-  let activeSid = sessionId || createId;   // which session to un-suppress in finally
-  let sizeBefore = 0;
+  let activeSid = sessionId || createId;
   if (activeSid) injecting.add(activeSid);
-  if (sessionId) { try { sizeBefore = fs.statSync(sessionFileById(sessionId)).size; } catch (e) { /* */ } }
   try {
-    const result = await runClaudeTurn(prompt, repoDir, sessionId, live, createId);
+    const result = await runClaudeTurn(prompt, repoDir, sessionId, live, createId, forkHeld);
     clearInterval(typing);
 
-    // Injection into an existing session that failed to resume: do NOT fork a divergent session.
-    if (!result.ok && sessionId && !result.sawContent) {
+    if (!result.ok && sessionId && !result.sawContent && !forkHeld) {
       await live.finalize(`⚠️ Couldn't reach session ${sessionId.slice(0, 8)} — it may have been cleared. ` +
         `Send /sessions to pick another, or /new to start fresh here.`);
       return;
     }
 
-    const finalText = result.ok ? result.body
+    const body = result.ok ? result.body
       : `${result.body && result.body !== '⚙️ Working…' ? result.body + '\n\n' : ''}⚠️ ${result.error}`;
 
-    // Held-open: injected into an existing session but nothing persisted → the desk TUI owns it, so
-    // that turn was ephemeral. Fork into a persistent phone-owned branch and re-run, so you can
-    // keep going from your phone whether or not you closed the desk session.
-    if (sessionId && result.ok && !persisted(sizeBefore, sizeCurrent(sessionId))) {
-      const forkResult = await runClaudeTurn(prompt, repoDir, sessionId, live, null, true);
-      const forkSid = forkResult.sessionId;
-      if (forkResult.ok && forkSid && forkSid !== sessionId) {
+    if (forkHeld) {
+      const forkSid = result.sessionId;
+      if (result.ok && forkSid && forkSid !== sessionId) {
         injecting.add(forkSid); injecting.delete(sessionId); activeSid = forkSid;
-        ignoredSessions.add(sessionId); persistIgnored();   // desk keeps its own copy; don't re-topic it
-        delete linkBySession[sessionId];                    // move this topic onto the fork
+        supersededAt[sessionId] = sizeCurrent(sessionId); persistSuperseded();  // desk branch re-topics only if it grows past here
+        delete linkBySession[sessionId];                                        // move this topic onto the fork
         await upsertLink(forkSid, chatId, threadId, prompt);
-        try { linkBySession[forkSid].offset = fs.statSync(sessionFileById(forkSid)).size; } catch (e) { /* */ }
+        try { linkBySession[forkSid].offset = sizeCurrent(forkSid); } catch (e) { /* */ }
         persistLinks();
-        await live.finalize(`${forkResult.body}\n\n↪️ Desk session was open, so I continued in a phone branch ` +
-          `(your desk copy is untouched). Back at the Mac, \`cr\` picks up this branch.`);
+        writeResumeMarker(repoDir, forkSid);
+        await live.finalize(`${body}\n\n↪️ Desk session was open, so I continued in a phone branch ` +
+          `(your desk copy is untouched). Opening a terminal on your Mac resumes this branch automatically.`);
         console.log(`[Drive → thread ${threadId}] forked ${sessionId.slice(0, 8)} → ${forkSid.slice(0, 8)} (desk held open)`);
       } else {
-        await live.finalize(`${finalText}\n\n⚠️ The desk session is open and I couldn't fork it; this reply ` +
-          `wasn't saved. Close the desk session (or /new) so phone replies stick.`);
+        await live.finalize(`${body}\n\n⚠️ The desk session is open and I couldn't fork it — try again in a moment.`);
       }
       return;
     }
 
-    await live.finalize(finalText);
-
+    await live.finalize(body);
     const finalSid = result.sessionId || sessionId || createId;
     if (finalSid) {
       injecting.add(finalSid);
-      if (createId && finalSid !== createId) injecting.delete(createId);  // release unused reservation
+      if (createId && finalSid !== createId) injecting.delete(createId);
       activeSid = finalSid;
       await upsertLink(finalSid, chatId, threadId, prompt);
-      try { linkBySession[finalSid].offset = fs.statSync(sessionFileById(finalSid)).size; } catch (e) { /* */ }
+      try { linkBySession[finalSid].offset = sizeCurrent(finalSid); } catch (e) { /* */ }
       persistLinks();
+      if (result.ok) writeResumeMarker(repoDir, finalSid);
     }
-    console.log(`[Drive → thread ${threadId}] ok=${result.ok} session=${finalSid || '—'}${heldOpen ? ' (held/ephemeral)' : ''}`);
+    console.log(`[Drive → thread ${threadId}] ok=${result.ok} session=${finalSid || '—'}${forkHeld ? ' (forked)' : ''}`);
   } catch (err) {
     clearInterval(typing);
     console.error('driveTurn error:', err);
@@ -692,8 +729,13 @@ async function pollTick() {
 
       const link = linkBySession[id];
       if (!link) {
-        // Discover: only real, active, un-ignored sessions we aren't already driving get a topic.
-        if (MIRROR && AUTO_CREATE_TOPICS && !ignoredSessions.has(id) && !injecting.has(id) && isActive(st.mtimeMs, now)) {
+        if (ignoredSessions.has(id)) continue;                       // /new-detached — permanent
+        if (supersededAt[id] !== undefined) {                        // desk branch we forked away from
+          if (st.size > supersededAt[id]) { delete supersededAt[id]; persistSuperseded(); }  // desk kept working → re-topic
+          else continue;                                             // still at the fork point → stay hidden
+        }
+        // Discover: only real, active sessions we aren't already driving get a topic.
+        if (MIRROR && AUTO_CREATE_TOPICS && !injecting.has(id) && isActive(st.mtimeMs, now)) {
           await ensureTopicForSession(await readSessionInfo(file));
         }
         continue;
@@ -844,9 +886,26 @@ async function pollUpdates() {
 // ---------------------------------------------------------------------------
 // Boot
 // ---------------------------------------------------------------------------
+const LOCK_FILE = path.join(__dirname, '.gateway.lock');
+function pidAlive(pid) { try { process.kill(pid, 0); return true; } catch (e) { return e.code === 'EPERM'; } }
+function acquireLock() {
+  try {
+    if (fs.existsSync(LOCK_FILE)) {
+      const pid = parseInt(fs.readFileSync(LOCK_FILE, 'utf8'), 10);
+      if (pid && pid !== process.pid && pidAlive(pid)) {
+        console.error(`Another gateway is already running (pid ${pid}). Exiting to avoid a getUpdates conflict.`);
+        process.exit(1);
+      }
+    }
+    fs.writeFileSync(LOCK_FILE, String(process.pid));
+  } catch (e) { /* */ }
+}
+function releaseLock() { try { if (fs.existsSync(LOCK_FILE) && parseInt(fs.readFileSync(LOCK_FILE, 'utf8'), 10) === process.pid) fs.unlinkSync(LOCK_FILE); } catch (e) { /* */ } }
+
 function shutdown() {
   console.log("\n🛑 [Gateway Shutdown] Exiting. Headless turns are short-lived; no orphaned sessions to kill.");
   persistLinks();
+  releaseLock();
   process.exit(0);
 }
 
@@ -854,8 +913,10 @@ if (require.main === module) {
   process.on('SIGINT', shutdown);
   process.on('SIGTERM', shutdown);
 
+  acquireLock();
   loadLinks();
   loadIgnored();
+  loadSuperseded();
   console.log("=============================================");
   console.log("🚀 CLAUDE CODE MULTI-SESSION TELEGRAM GATEWAY");
   console.log("=============================================");

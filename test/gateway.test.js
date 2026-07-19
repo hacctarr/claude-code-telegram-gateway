@@ -392,3 +392,19 @@ test('persisted: transcript growth means the turn stuck; no growth means desk he
   assert.equal(g.persisted(1000, 1000), false);  // no growth -> desk open, ephemeral
   assert.equal(g.persisted(1000, 999), false);
 });
+
+// ---------------------------------------------------------------------------
+// renderTranscriptLine — tool errors surface, successes stay quiet
+// ---------------------------------------------------------------------------
+test('renderTranscriptLine: surfaces tool errors from desk runs', () => {
+  const o = { type: 'user', message: { content: [{ type: 'tool_result', is_error: true, content: 'ENOENT: missing.txt' }] } };
+  assert.deepEqual(g.renderTranscriptLine(o), ['⚠️ tool error: ENOENT: missing.txt']);
+});
+test('renderTranscriptLine: successful tool results stay quiet', () => {
+  const o = { type: 'user', message: { content: [{ type: 'tool_result', is_error: false, content: 'lots of output' }] } };
+  assert.deepEqual(g.renderTranscriptLine(o), []);
+});
+test('renderTranscriptLine: tool error content as text blocks', () => {
+  const o = { type: 'user', message: { content: [{ type: 'tool_result', is_error: true, content: [{ type: 'text', text: 'boom happened' }] }] } };
+  assert.deepEqual(g.renderTranscriptLine(o), ['⚠️ tool error: boom happened']);
+});

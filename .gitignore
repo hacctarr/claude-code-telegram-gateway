@@ -2,7 +2,9 @@
 config.json
 links.json
 ignored.json
+superseded.json
 sessions.json
+.gateway.lock
 gateway.log
 *.log
 

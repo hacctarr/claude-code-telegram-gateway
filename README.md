@@ -108,9 +108,9 @@ tail -f gateway.log       # watch it live
   - `/new` (bare) — detach the current topic so your next message starts a fresh session there.
   - `/sessions` — list recent sessions in the repo.
   - `/resume <uuid | text>` — link this topic to an existing session (searches first message + content).
-- **Back at the desk:** run **`cr`** (alias for `claude -c`) in the repo to resume the most recent
-  session — including any turns you ran from the phone. (A background service can't open a TUI into
-  your terminal, so this one command is the "return to desk" step.)
+- **Back at the desk:** just **open a terminal** — if you drove a session from your phone, an
+  auto-resume hook (installed into `~/.zshrc`) drops you straight into that exact branch, multi-repo
+  aware, and clears itself so ordinary terminals stay ordinary. `cr` remains as a manual resume.
 
 ### Phone continuation — works whether or not the desk session is closed
 - **Desk session closed:** your phone reply continues the *same* session and is saved — seamless,
@@ -119,11 +119,16 @@ tail -f gateway.log       # watch it live
   owns the file). The gateway detects this (the transcript didn't grow) and **automatically forks a
   phone-owned branch** that *does* persist, continuing there — you get a one-line "continued in a
   phone branch" notice. Your desk copy is untouched; from that point the phone and desk branches
-  diverge, and `cr` at the Mac resumes whichever branch is most recent. So you never have to remember
-  to close the TUI before walking away.
+  diverge — but you never have to remember to close the TUI, and opening a terminal auto-resumes the
+  phone branch. If you *do* keep working the desk branch afterward, it automatically gets its own
+  topic again (no manual `/branches` command needed). Held-open is detected with `lsof` **before**
+  the turn runs, so the prompt (and any tool side effects) never executes twice.
 
 ### Other notes
 - Mirror latency ≈ `POLL_MS` (~2s); it posts completed turns, not token-by-token (phone-injected
-  turns *do* stream token-by-token via the live-edited message).
+  turns *do* stream token-by-token via the live-edited message). Failing desk tool calls are
+  surfaced as `⚠️ tool error`; successful tool output is kept quiet.
 - With `bypassPermissions` (default), phone-injected turns never block on a tool-permission prompt.
   A clarifying question in Claude's reply just streams to you; answer in the topic to continue.
+- A single-instance lock prevents two gateways from fighting over `getUpdates`. Linux users: a
+  `systemd --user` unit is in `systemd/` (macOS uses the bundled launchd installer).

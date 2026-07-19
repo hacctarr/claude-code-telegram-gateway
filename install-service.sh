@@ -26,13 +26,26 @@ launchctl bootstrap "gui/$(id -u)" "$PLIST_DST"
 launchctl enable "gui/$(id -u)/$LABEL"
 launchctl kickstart -k "gui/$(id -u)/$LABEL" 2>/dev/null || true
 
-# Convenience alias: `cr` resumes the most recent session in the primary repo.
-PRIMARY_REPO="$(node -e 'const c=require("./config.json");const v=Object.values(c.REPO_MAPPINGS||{});process.stdout.write(v[0]||process.env.HOME)' 2>/dev/null || echo "$HOME")"
-ALIAS_LINE="alias cr='cd \"$PRIMARY_REPO\" && claude -c'"
+# Shell integration: auto-resume the branch you were working on from your phone, so opening a
+# terminal drops you straight back in — no `cr` needed (multi-repo aware). `cr` stays as a manual
+# fallback. The block is idempotent and marked so uninstall can strip it.
 RC="$HOME/.zshrc"
-if ! grep -qF "alias cr=" "$RC" 2>/dev/null; then
-  printf '\n# Claude gateway: resume most recent session\n%s\n' "$ALIAS_LINE" >> "$RC"
-  echo "🔗 Added 'cr' alias to $RC (open a new shell or 'source $RC')."
+if ! grep -qF 'claude-gateway auto-resume' "$RC" 2>/dev/null; then
+  cat >> "$RC" <<HOOK
+
+# >>> claude-gateway auto-resume >>>
+# On an interactive shell, resume any branch you just drove from your phone, then clear the marker.
+_claude_gateway_resume() {
+  local out; out="\$(node "$DIR/resume-hook.js" 2>/dev/null)" || return
+  [ -z "\$out" ] && return
+  local repo="\${out%%\$'\t'*}" sid="\${out##*\$'\t'}"
+  [ -d "\$repo" ] && cd "\$repo" && command claude --resume "\$sid"
+}
+alias cr='node "$DIR/resume-hook.js" >/dev/null 2>&1; claude -c'   # manual: resume most recent here
+[[ -o interactive ]] && _claude_gateway_resume
+# <<< claude-gateway auto-resume <<<
+HOOK
+  echo "🔗 Added auto-resume hook to $RC (open a new terminal to use it)."
 fi
 
 echo "✅ Installed and started $LABEL."
