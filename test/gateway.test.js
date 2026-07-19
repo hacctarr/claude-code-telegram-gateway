@@ -490,3 +490,34 @@ test('dueStallNotices: disabled threshold or missing state is safe', () => {
   assert.deepEqual(g.dueStallNotices({ a: { ts: 0, notified: false } }, 99999, 0), []);
   assert.deepEqual(g.dueStallNotices(undefined, 99999, 60_000), []);
 });
+
+// ---------------------------------------------------------------------------
+// Phone approvals — createApprovalRegistry
+// ---------------------------------------------------------------------------
+test('approvalRegistry: resolve allows and returns meta once', async () => {
+  const reg = g.createApprovalRegistry();
+  const { id, promise } = reg.create({ chatId: 'c', threadId: 7 }, 0);
+  const meta = reg.resolve(id, true, 'user1');
+  assert.deepEqual(meta, { chatId: 'c', threadId: 7 });
+  const res = await promise;
+  assert.equal(res.allowed, true);
+  assert.equal(res.by, 'user1');
+  assert.equal(reg.resolve(id, false), null, 'second resolve is a no-op');
+  assert.equal(reg.size(), 0);
+});
+test('approvalRegistry: times out to a deny', async () => {
+  const reg = g.createApprovalRegistry();
+  const { promise } = reg.create({ chatId: 'c', threadId: 7 }, 30);
+  const res = await promise;
+  assert.equal(res.allowed, false);
+  assert.equal(res.timedOut, true);
+  assert.equal(reg.size(), 0, 'timed-out entry cleaned up');
+});
+test('approvalRegistry: deny resolution', async () => {
+  const reg = g.createApprovalRegistry();
+  const { id, promise } = reg.create({}, 0);
+  reg.resolve(id, false, 'user1');
+  const res = await promise;
+  assert.equal(res.allowed, false);
+  assert.ok(!res.timedOut);
+});

@@ -74,9 +74,15 @@ then `npm run setup` does the rest. Everything below is the manual equivalent.
    `IDLE_INJECT_SECONDS` (15), `ACTIVE_WINDOW_MIN` (30), `PRUNE_AFTER_DAYS` (7),
    `PRUNE_MODE` ("close" | "delete"), `POLL_MS` (2000).
 
-> **Permissions note:** the default `bypassPermissions` lets phone-injected turns run tools without
-> an approval prompt (there's no way to tap "approve" from Telegram). Anyone allowed to post in the
-> group gets unattended tool access to that repo — `ALLOWED_USER_IDS` is what protects it.
+> **Permissions — two ways to run it:**
+> - **`bypassPermissions`** (default): phone-injected turns run tools without prompts. Anyone
+>   allowed to post in the group gets unattended tool access to that repo — `ALLOWED_USER_IDS` is
+>   what protects it.
+> - **Any stricter mode** (e.g. `"PERMISSION_MODE": "acceptEdits"` or `"manual"`): tool-permission
+>   prompts appear **in the Telegram topic as ✅ Allow / ❌ Deny buttons** — tap to approve from your
+>   phone (only `ALLOWED_USER_IDS` presses are honored). Unanswered requests deny after
+>   `APPROVAL_TIMEOUT_SECONDS` (default 300) so turns can't hang. Your configured allow/deny rules
+>   still apply first; buttons appear only for what would genuinely prompt.
 
 ---
 

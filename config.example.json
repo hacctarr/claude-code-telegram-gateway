@@ -24,5 +24,6 @@
   "TITLE_MODE": "generated",
   "TITLE_MODEL": "haiku",
   "AUTO_FORK": true,
-  "STALL_NOTICE_SECONDS": 60
+  "STALL_NOTICE_SECONDS": 60,
+  "APPROVAL_TIMEOUT_SECONDS": 300
 }

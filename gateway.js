@@ -52,6 +52,11 @@ const AUTO_FORK = config.AUTO_FORK !== false;
 // topic (it may be a long-running tool OR a permission prompt sitting unanswered at the desk — the
 // transcript can't distinguish them, so the notice says both). 0 disables.
 const STALL_NOTICE_MS = config.STALL_NOTICE_SECONDS === 0 ? 0 : (config.STALL_NOTICE_SECONDS || 60) * 1000;
+// Phone approvals: when PERMISSION_MODE is anything other than bypassPermissions, injected turns
+// route tool-permission prompts to the Telegram topic as Allow/Deny buttons instead of silently
+// auto-denying. Unanswered requests deny after this timeout so turns can't hang forever.
+const PHONE_APPROVALS = PERM_MODE !== 'bypassPermissions';
+const APPROVAL_TIMEOUT_MS = (config.APPROVAL_TIMEOUT_SECONDS || 300) * 1000;
 // /desk opens a topic's session in the desktop editor. Template's {session} is the session id.
 // Default targets the Claude Code VS Code extension; Cursor/Windsurf users can swap the scheme.
 const DESK_URL_TEMPLATE = config.DESK_URL_TEMPLATE || 'vscode://anthropic.claude-code/open?session={session}';
@@ -322,6 +327,46 @@ function startTyping(chatId, threadId) {
   return setInterval(ping, 4000);
 }
 
+// --- Phone approvals: registry + Telegram buttons ---------------------------
+// When PERMISSION_MODE isn't bypassPermissions, injected turns pause on tool permissions
+// (can_use_tool control requests) and route them here as Allow/Deny inline buttons.
+function createApprovalRegistry() {
+  let seq = 0;
+  const pending = new Map();   // id -> { resolve, timer, meta }
+  return {
+    create(meta, timeoutMs) {
+      const id = String(++seq);
+      let resolveFn;
+      const promise = new Promise((res) => { resolveFn = res; });
+      const entry = { meta, timer: null, resolve: (r) => { if (entry.timer) clearTimeout(entry.timer); pending.delete(id); resolveFn(r); } };
+      if (timeoutMs) entry.timer = setTimeout(() => entry.resolve({ allowed: false, timedOut: true }), timeoutMs);
+      pending.set(id, entry);
+      return { id, promise };
+    },
+    resolve(id, allowed, by) {
+      const e = pending.get(id);
+      if (!e) return null;                    // already handled / timed out
+      const meta = e.meta;
+      e.resolve({ allowed, by });
+      return meta;
+    },
+    size() { return pending.size; },
+  };
+}
+const approvals = createApprovalRegistry();
+
+async function sendApprovalRequest(chatId, threadId, toolName, summary, approvalId) {
+  const r = await telegramRequest('sendMessage', {
+    chat_id: chatId, message_thread_id: threadId,
+    text: `🔐 Permission request:\n${toolName}${summary ? ': ' + summary : ''}`,
+    reply_markup: { inline_keyboard: [[
+      { text: '✅ Allow', callback_data: `ap:${approvalId}:1` },
+      { text: '❌ Deny', callback_data: `ap:${approvalId}:0` },
+    ]] },
+  }).catch(() => null);
+  return r && r.ok ? r.result.message_id : null;
+}
+
 async function createForumTopic(chatId, name) {
   const r = await telegramRequest('createForumTopic', { chat_id: chatId, name: name.slice(0, 128) })
     .catch((e) => ({ ok: false, description: e.message }));
@@ -558,10 +603,13 @@ function readNewLines(filePath, offset) {
 // ---------------------------------------------------------------------------
 // Running a Claude turn (streaming headless) — used for phone injections.
 // ---------------------------------------------------------------------------
-function runClaudeTurn(prompt, cwd, sessionId, live, createId, forkId) {
+function runClaudeTurn(prompt, cwd, sessionId, live, createId, forkId, onPermission) {
   return new Promise((resolve) => {
     const args = ['-p', '--output-format', 'stream-json', '--include-partial-messages', '--verbose',
                   '--permission-mode', PERM_MODE];
+    // Non-bypass modes: route tool-permission prompts to us over stdio (verified: the CLI emits
+    // control_request/can_use_tool and pauses the tool until our control_response arrives).
+    if (PHONE_APPROVALS) args.push('--permission-prompt-tool', 'stdio', '--input-format', 'stream-json');
     if (MODEL) args.push('--model', MODEL);
     if (sessionId) {
       args.push('--resume', sessionId);
@@ -576,6 +624,14 @@ function runClaudeTurn(prompt, cwd, sessionId, live, createId, forkId) {
     const feed = createFeed(SHOW_TOOLS);
     let stderr = '', rem = '';
 
+    const answerPermission = async (o) => {
+      let resp = { behavior: 'deny', message: 'No approval handler available' };
+      try { if (onPermission) resp = await onPermission(o.request); }
+      catch (e) { resp = { behavior: 'deny', message: `Approval handler error: ${e.message}` }; }
+      try { child.stdin.write(JSON.stringify({ type: 'control_response', response: { subtype: 'success', request_id: o.request_id, response: resp } }) + '\n'); }
+      catch (e) { /* child gone */ }
+    };
+
     child.stdout.on('data', (d) => {
       rem += d.toString();
       const lines = rem.split('\n');
@@ -583,7 +639,10 @@ function runClaudeTurn(prompt, cwd, sessionId, live, createId, forkId) {
       for (const line of lines) {
         if (!line.trim()) continue;
         let o; try { o = JSON.parse(line); } catch (e) { continue; }
+        if (o.type === 'control_request' && o.request && o.request.subtype === 'can_use_tool') { answerPermission(o); continue; }
         try { if (feed.handle(o)) live.set(feed.render()); } catch (e) { console.error('event handler error:', e.message); }
+        // In stream-json input mode the CLI waits for more input after the result — close stdin to let it exit.
+        if (o.type === 'result' && PHONE_APPROVALS) { try { child.stdin.end(); } catch (e) { /* */ } }
       }
     });
     child.stderr.on('data', (d) => (stderr += d.toString()));
@@ -596,8 +655,13 @@ function runClaudeTurn(prompt, cwd, sessionId, live, createId, forkId) {
       }
       resolve({ ok: true, sessionId: feed.sessionId, sawContent: feed.sawContent, body });
     });
-    child.stdin.write(prompt);
-    child.stdin.end();
+    if (PHONE_APPROVALS) {
+      // stdin must STAY OPEN for control responses; closed after the result arrives (above).
+      child.stdin.write(JSON.stringify({ type: 'user', message: { role: 'user', content: [{ type: 'text', text: prompt }] } }) + '\n');
+    } else {
+      child.stdin.write(prompt);
+      child.stdin.end();
+    }
   });
 }
 
@@ -710,8 +774,22 @@ async function driveTurn(chatId, threadId, prompt, resolveSession) {
   // Reserve every id this turn may touch BEFORE spawning, so the poller can't topic any of them.
   const reserved = [sessionId, createId, forkId].filter(Boolean);
   reserved.forEach((id) => injecting.add(id));
+  // Non-bypass modes: tool-permission prompts become Allow/Deny buttons in this topic.
+  const onPermission = PHONE_APPROVALS ? (async (req) => {
+    const summary = summarizeToolInput(req.tool_name, req.input);
+    const { id, promise } = approvals.create({ chatId, threadId }, APPROVAL_TIMEOUT_MS);
+    const msgId = await sendApprovalRequest(chatId, threadId, req.tool_name, summary, id);
+    const res = await promise;
+    if (res.timedOut && msgId) {
+      telegramRequest('editMessageText', { chat_id: chatId, message_id: msgId,
+        text: `🔐 ${req.tool_name}${summary ? ': ' + summary : ''}\n\n⏱ Timed out — denied.` }).catch(() => {});
+    }
+    return res.allowed
+      ? { behavior: 'allow', updatedInput: req.input }
+      : { behavior: 'deny', message: res.timedOut ? 'Approval timed out on Telegram' : 'Denied from Telegram' };
+  }) : null;
   try {
-    const result = await runClaudeTurn(prompt, repoDir, sessionId, live, createId, forkId);
+    const result = await runClaudeTurn(prompt, repoDir, sessionId, live, createId, forkId, onPermission);
     clearInterval(typing);
 
     if (!result.ok && sessionId && !result.sawContent && !forkId) {
@@ -1017,6 +1095,30 @@ async function pollUpdates() {
     if (res.ok && res.result.length > 0) {
       for (const update of res.result) {
         lastUpdateId = update.update_id;
+
+        // Inline-button presses (phone approvals).
+        const cb = update.callback_query;
+        if (cb) {
+          const fromId = cb.from ? String(cb.from.id) : '';
+          if (!ALLOWED_USER_IDS.includes(fromId)) {
+            telegramRequest('answerCallbackQuery', { callback_query_id: cb.id, text: 'Not authorized' }).catch(() => {});
+            continue;
+          }
+          const m = /^ap:(\d+):([01])$/.exec(cb.data || '');
+          if (m) {
+            const allowed = m[2] === '1';
+            const meta = approvals.resolve(m[1], allowed, fromId);
+            telegramRequest('answerCallbackQuery', { callback_query_id: cb.id, text: meta ? (allowed ? 'Allowed ✅' : 'Denied ❌') : 'Already handled' }).catch(() => {});
+            if (meta && cb.message) {
+              telegramRequest('editMessageText', {
+                chat_id: cb.message.chat.id, message_id: cb.message.message_id,
+                text: `${cb.message.text}\n\n${allowed ? '✅ Allowed' : '❌ Denied'}`,
+              }).catch(() => {});
+            }
+          }
+          continue;
+        }
+
         const message = update.message;
         if (!message) continue;
 
@@ -1191,5 +1293,5 @@ module.exports = {
   listSessions, matchSessions, readSessionInfo, relTime, formatSessionList,
   isActive, shouldPrune, isDeskBusy, invertRepoMappings, splitThreadKey, buildThreadIndex,
   migrateLegacy, topicName, openerText, shouldAutoCreate, loadIgnored, persistIgnored, persisted, deskUrl,
-  lastExchange, sessionNameById, heldByOtherPids, updatePendingTools, dueStallNotices,
+  lastExchange, sessionNameById, heldByOtherPids, updatePendingTools, dueStallNotices, createApprovalRegistry,
 };
