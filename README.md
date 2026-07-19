@@ -43,12 +43,13 @@ It is a transcript **watcher**, not a terminal scraper — it reads Claude's own
 ## Quick start
 
 ```bash
-git clone https://github.com/hacctarr/claude-code-telegram-gateway
-cd claude-code-telegram-gateway
-npm run setup          # interactive: validates your bot, auto-detects your
+npm install -g claude-code-telegram-gateway
+claude-tg setup        # interactive: validates your bot, auto-detects your
                        # user id + group chat id, writes config.json, and can
                        # install the background service for you
 ```
+
+Or from source: `git clone https://github.com/hacctarr/claude-code-telegram-gateway && cd claude-code-telegram-gateway && npm run setup`
 
 First create the bot + group (Telegram side) as in **[SETUP.md](SETUP.md)** — it takes ~2 minutes —
 then `npm run setup` does the rest. Everything below is the manual equivalent.
