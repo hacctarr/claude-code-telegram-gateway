@@ -3,8 +3,15 @@
   "version": "1.0.0",
   "description": "Steer and mirror Claude Code sessions from your phone via Telegram — auto-created Forum Topics, live desk↔phone mirroring, launchd service.",
   "main": "gateway.js",
+  "bin": {
+    "claude-tg": "bin/claude-tg.js"
+  },
   "scripts": {
+    "setup": "node setup.js",
     "start": "node gateway.js",
+    "check": "node test/check-telegram.js",
+    "install-service": "./install-service.sh",
+    "uninstall-service": "./uninstall-service.sh",
     "test": "node --test test/*.test.js"
   },
   "keywords": [
@@ -16,6 +23,22 @@
     "gateway",
     "macos",
     "launchd"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "files": [
+    "gateway.js",
+    "setup.js",
+    "bin/",
+    "test/",
+    "install-service.sh",
+    "uninstall-service.sh",
+    "com.claude.telegram-gateway.plist",
+    "config.example.json",
+    "README.md",
+    "SETUP.md",
+    "LICENSE"
   ],
   "dependencies": {},
   "author": "hacctarr",

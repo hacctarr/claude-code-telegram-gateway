@@ -7,11 +7,12 @@ const { spawn } = require('child_process');
 // ---------------------------------------------------------------------------
 // Config
 // ---------------------------------------------------------------------------
-if (!fs.existsSync('./config.json')) {
-  console.error("Error: config.json file not found. Copy config.example.json to config.json and populate it.");
+const CONFIG_PATH = path.join(__dirname, 'config.json');
+if (!fs.existsSync(CONFIG_PATH)) {
+  console.error("Error: config.json not found. Run `npm run setup`, or copy config.example.json to config.json and fill it in.");
   process.exit(1);
 }
-const config = JSON.parse(fs.readFileSync('./config.json', 'utf8'));
+const config = JSON.parse(fs.readFileSync(CONFIG_PATH, 'utf8'));
 const {
   BOT_TOKEN,
   ALLOWED_USER_IDS,

@@ -40,15 +40,26 @@ It is a transcript **watcher**, not a terminal scraper — it reads Claude's own
 
 ---
 
-## Setup
+## Quick start
 
-> 📖 **New here? Follow the step-by-step [SETUP.md](SETUP.md)** for the full Telegram walkthrough
-> (bot, supergroup, topics, IDs). The condensed version:
+```bash
+git clone https://github.com/hacctarr/claude-code-telegram-gateway
+cd claude-code-telegram-gateway
+npm run setup          # interactive: validates your bot, auto-detects your
+                       # user id + group chat id, writes config.json, and can
+                       # install the background service for you
+```
+
+First create the bot + group (Telegram side) as in **[SETUP.md](SETUP.md)** — it takes ~2 minutes —
+then `npm run setup` does the rest. Everything below is the manual equivalent.
+
+## Setup (manual)
 
 1. **Create a bot** via `@BotFather` (`/newbot`) and copy the HTTP API token.
 2. **Create a Supergroup** per repo, enable **Topics**, add the bot, and promote it to
    **Admin → Manage Topics + Post Messages**.
-3. **Get IDs:** your numeric user id (`@userinfobot`) and the group chat id (`-100…`, via `@RawDataBot`).
+3. **Get IDs:** your numeric user id (`@userinfobot`) and the group chat id (`-100…`, via the
+   `getUpdates` URL in [SETUP.md](SETUP.md)).
 4. **Configure:** `cp config.example.json config.json` and fill it in:
    ```json
    {
