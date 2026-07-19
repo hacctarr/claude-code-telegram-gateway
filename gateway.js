@@ -298,6 +298,7 @@ function telegramRequest(method, payload) {
       res.on('data', (c) => (body += c));
       res.on('end', () => { try { resolve(JSON.parse(body)); } catch (e) { reject(e); } });
     });
+    req.setTimeout(15000, () => req.destroy(new Error('telegram request timeout')));  // fail fast; a hung send must not stall the poll loop
     req.on('error', reject);
     req.write(data);
     req.end();
@@ -315,10 +316,14 @@ async function sendPlain(chatId, threadId, text) {
     rest = rest.slice(cut).replace(/^\s+/, '');
   }
   if (rest) chunks.push(rest);
+  let allSent = true;
   for (const c of chunks) {
-    try { await telegramRequest('sendMessage', { chat_id: chatId, message_thread_id: threadId, text: c }); }
-    catch (e) { console.error('sendPlain error:', e.code || e.message || String(e)); }
+    try {
+      const r = await telegramRequest('sendMessage', { chat_id: chatId, message_thread_id: threadId, text: c });
+      if (!r || !r.ok) allSent = false;
+    } catch (e) { console.error('sendPlain error:', e.code || e.message || String(e)); allSent = false; }
   }
+  return allSent;   // callers that mirror content use this to avoid advancing past unsent lines
 }
 
 function startTyping(chatId, threadId) {
@@ -1043,7 +1048,11 @@ async function pollTick() {
         for (const r of updatePendingTools(pstate, lines, now)) {
           posts.push(`▶️ ${r.name} finished — session continuing.`);
         }
-        if (posts.length) { await sendPlain(link.chatId, link.threadId, posts.join('\n\n')); lastMirrorAt.set(id, now); }
+        if (posts.length) {
+          const sent = await sendPlain(link.chatId, link.threadId, posts.join('\n\n'));
+          if (!sent) continue;   // network hiccup: keep the offset so these lines retry next tick
+          lastMirrorAt.set(id, now);
+        }
         link.offset = newOffset;
         persistLinks();
       }
@@ -1267,6 +1276,11 @@ function shutdown() {
 }
 
 if (require.main === module) {
+  // Timestamp every log line (launchd's log file has no timestamps of its own).
+  for (const m of ['log', 'warn', 'error']) {
+    const orig = console[m].bind(console);
+    console[m] = (...a) => orig(new Date().toISOString(), ...a);
+  }
   process.on('SIGINT', shutdown);
   process.on('SIGTERM', shutdown);
 
