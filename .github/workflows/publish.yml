@@ -1,6 +1,6 @@
-# Publishes to npm via Trusted Publishing (OIDC) — no tokens stored anywhere.
-# Configure once on npmjs.com: package Settings → Trusted Publisher → GitHub Actions →
-#   user: hacctarr · repo: claude-code-telegram-gateway · workflow: publish.yml
+# Publishes to npm via Trusted Publishing (OIDC) - no tokens stored anywhere.
+# Configure once on npmjs.com: package Settings -> Trusted Publisher -> GitHub Actions ->
+#   user: hacctarr / repo: claude-code-telegram-gateway / workflow: publish.yml
 # Then every release is:  git tag v1.x.y && git push --tags
 name: Publish to npm
 
