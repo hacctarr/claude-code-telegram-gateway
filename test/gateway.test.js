@@ -521,3 +521,64 @@ test('approvalRegistry: deny resolution', async () => {
   assert.equal(res.allowed, false);
   assert.ok(!res.timedOut);
 });
+
+// ---------------------------------------------------------------------------
+// Cost containment: the titling turn and topic-creation retries
+// ---------------------------------------------------------------------------
+
+test('titleArgs: isolates the titling turn from the user MCP/CLAUDE.md surface', () => {
+  const a = g.titleArgs('tmp-id', 'haiku');
+  const joined = a.join(' ');
+  // Without these the throwaway titler inherits every MCP server, skill and CLAUDE.md
+  // the user has installed — measured at ~64k tokens to produce a three-word slug.
+  assert.ok(joined.includes('--strict-mcp-config'), 'must not load user MCP servers');
+  assert.ok(joined.includes('--mcp-config {"mcpServers":{}}'), 'must pass an empty MCP config');
+  assert.ok(a.includes('--allowedTools'), 'must not load tool definitions');
+  assert.ok(a.includes('--max-turns'), 'must be capped at one turn');
+  assert.ok(a.includes('--exclude-dynamic-system-prompt-sections'));
+  assert.ok(a.includes('--disable-slash-commands'), 'must not load the skills index');
+  assert.ok(a.includes('--setting-sources'), 'must not load user/project settings');
+  assert.equal(a[a.indexOf('--model') + 1], 'haiku');
+  assert.equal(a[a.indexOf('--session-id') + 1], 'tmp-id');
+});
+
+test('topicCooldown: a failed creation is not retried on the very next tick', () => {
+  const cd = g.createTopicCooldown(1000, 60000);
+  assert.equal(cd.blocked('s1', 0), false, 'first attempt is allowed');
+  cd.fail('s1', 0, 0);
+  assert.equal(cd.blocked('s1', 500), true, 'blocked immediately after a failure');
+  assert.equal(cd.blocked('s1', 1500), false, 'allowed again after the backoff elapses');
+});
+
+test('topicCooldown: backoff grows and honours Telegram retry_after', () => {
+  const cd = g.createTopicCooldown(1000, 60000);
+  cd.fail('s1', 0, 0);
+  cd.fail('s1', 0, 0);
+  assert.equal(cd.blocked('s1', 1500), true, 'second failure backs off further than the first');
+  const cd2 = g.createTopicCooldown(1000, 60000);
+  cd2.fail('s2', 38000, 0);            // Telegram said "retry after 38"
+  assert.equal(cd2.blocked('s2', 30000), true, 'respects a retry_after longer than the backoff');
+  assert.equal(cd2.blocked('s2', 39000), false);
+});
+
+test('topicCooldown: caps at the ceiling and clears on success', () => {
+  const cd = g.createTopicCooldown(1000, 5000);
+  for (let i = 0; i < 20; i++) cd.fail('s1', 0, 0);
+  assert.equal(cd.blocked('s1', 5001), false, 'never backs off past the ceiling');
+  cd.fail('s1', 0, 0);
+  cd.clear('s1');
+  assert.equal(cd.blocked('s1', 0), false, 'success clears the cooldown');
+});
+
+test('parseRetryAfter: pulls the delay out of a Telegram 429 description', () => {
+  assert.equal(g.parseRetryAfter('Too Many Requests: retry after 38'), 38000);
+  assert.equal(g.parseRetryAfter('Bad Request: TOPIC_NOT_MODIFIED'), 0);
+  assert.equal(g.parseRetryAfter(undefined), 0);
+});
+
+test('getUpdates long-poll must complete inside the socket timeout', () => {
+  // A 30s server-side long-poll behind a 15s socket timeout can never return when the
+  // update queue is idle — it wedges permanently and lastUpdateId never advances.
+  assert.ok(g.UPDATE_POLL_TIMEOUT_S * 1000 < g.updateSocketTimeoutMs(),
+    `long-poll ${g.UPDATE_POLL_TIMEOUT_S}s must be shorter than socket timeout ${g.updateSocketTimeoutMs()}ms`);
+});

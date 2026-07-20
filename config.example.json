@@ -21,8 +21,12 @@
   "MIRROR_FLUSH_MS": 4000,
   "DESK_URL_TEMPLATE": "vscode://anthropic.claude-code/open?session={session}",
   "DESK_OPEN_CMD": "open",
-  "TITLE_MODE": "generated",
+  "_TITLE_MODE": "first-message (free) | session-name | generated — 'generated' spawns a Claude turn per topic-creation attempt, ~25k tokens each",
+  "TITLE_MODE": "first-message",
   "TITLE_MODEL": "haiku",
+  "TOPIC_RETRY_BASE_MS": 30000,
+  "TOPIC_RETRY_MAX_MS": 900000,
+  "UPDATE_POLL_TIMEOUT_S": 25,
   "AUTO_FORK": true,
   "STALL_NOTICE_SECONDS": 60,
   "APPROVAL_TIMEOUT_SECONDS": 300

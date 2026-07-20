@@ -39,10 +39,16 @@ const PRUNE_AFTER_MS = (config.PRUNE_AFTER_DAYS || 7) * 86_400_000;
 const PRUNE_MODE = config.PRUNE_MODE || 'close';   // "close" | "delete"
 const POLL_MS = config.POLL_MS || 2000;
 const MIRROR_FLUSH_MS = config.MIRROR_FLUSH_MS || 4000;  // min gap between mirror posts per topic
-// How to name topics: "generated" = a short AI slug (VS Code-tab style, e.g. telegram-topic-fix);
-// "session-name" = Claude's derived name (documents-14); "first-message" = the opening prompt.
-const TITLE_MODE = config.TITLE_MODE || 'generated';
+// How to name topics: "first-message" = the opening prompt (free, the default);
+// "session-name" = Claude's derived name (documents-14); "generated" = a short AI slug.
+// "generated" spawns a real Claude turn per topic-creation ATTEMPT. Even fully isolated
+// (see titleArgs) that costs ~25k tokens for a three-word slug, so it is opt-in.
+const TITLE_MODE = config.TITLE_MODE || 'first-message';
 const TITLE_MODEL = config.TITLE_MODEL || 'haiku';
+// Topic creation is rate-limited by Telegram. A failure must not be retried on the next
+// 2s tick — with TITLE_MODE=generated that would respawn the titling turn every time.
+const TOPIC_RETRY_BASE_MS = config.TOPIC_RETRY_BASE_MS || 30_000;
+const TOPIC_RETRY_MAX_MS = config.TOPIC_RETRY_MAX_MS || 15 * 60_000;
 // Auto-fork a held-open desk session into a persistent phone branch (on by default). The fork id is
 // pre-minted and reserved before the turn spawns, the topic is atomically rebound to the branch, and
 // held-detection ignores the gateway's own pid — the three fixes that make this safe. Set
@@ -285,7 +291,14 @@ function isDeskBusy(mtime, now = Date.now()) { return (now - mtime) <= IDLE_INJE
 // ---------------------------------------------------------------------------
 // Telegram API
 // ---------------------------------------------------------------------------
-function telegramRequest(method, payload) {
+const SOCKET_TIMEOUT_MS = 15000;   // fail fast; a hung send must not stall the poll loop
+// getUpdates is a long-poll: the server deliberately holds the connection open until an
+// update arrives or this many seconds pass. The socket timeout must exceed it, or every
+// idle poll is killed client-side before the server ever answers and the loop wedges.
+const UPDATE_POLL_TIMEOUT_S = config.UPDATE_POLL_TIMEOUT_S || 25;
+function updateSocketTimeoutMs() { return UPDATE_POLL_TIMEOUT_S * 1000 + 10_000; }
+
+function telegramRequest(method, payload, timeoutMs = SOCKET_TIMEOUT_MS) {
   return new Promise((resolve, reject) => {
     const data = JSON.stringify(payload);
     const options = {
@@ -298,11 +311,17 @@ function telegramRequest(method, payload) {
       res.on('data', (c) => (body += c));
       res.on('end', () => { try { resolve(JSON.parse(body)); } catch (e) { reject(e); } });
     });
-    req.setTimeout(15000, () => req.destroy(new Error('telegram request timeout')));  // fail fast; a hung send must not stall the poll loop
+    req.setTimeout(timeoutMs, () => req.destroy(new Error('telegram request timeout')));
     req.on('error', reject);
     req.write(data);
     req.end();
   });
+}
+
+// Telegram reports 429s as "Too Many Requests: retry after 38". Returns ms, 0 if absent.
+function parseRetryAfter(description) {
+  const m = /retry after (\d+)/i.exec(description || '');
+  return m ? Number(m[1]) * 1000 : 0;
 }
 
 async function sendPlain(chatId, threadId, text) {
@@ -372,12 +391,37 @@ async function sendApprovalRequest(chatId, threadId, toolName, summary, approval
   return r && r.ok ? r.result.message_id : null;
 }
 
+// Returns { threadId, retryAfterMs }. threadId is null on failure; callers that create topics
+// on a timer use retryAfterMs to back off instead of retrying on the very next tick.
 async function createForumTopic(chatId, name) {
   const r = await telegramRequest('createForumTopic', { chat_id: chatId, name: name.slice(0, 128) })
     .catch((e) => ({ ok: false, description: e.message }));
-  if (!r.ok) { console.error(`[Topic] createForumTopic failed (${r.description || 'unknown'}). Bot needs admin + Manage Topics.`); return null; }
-  return r.result.message_thread_id;
+  if (!r.ok) {
+    console.error(`[Topic] createForumTopic failed (${r.description || 'unknown'}). Bot needs admin + Manage Topics.`);
+    return { threadId: null, retryAfterMs: parseRetryAfter(r.description) };
+  }
+  return { threadId: r.result.message_thread_id, retryAfterMs: 0 };
 }
+
+// Per-session backoff for topic creation. Exponential from base, capped at max, never shorter
+// than Telegram's own retry_after.
+function createTopicCooldown(baseMs = TOPIC_RETRY_BASE_MS, maxMs = TOPIC_RETRY_MAX_MS) {
+  const state = new Map();   // sessionId -> { until, fails }
+  return {
+    blocked(id, now = Date.now()) { const e = state.get(id); return !!e && now < e.until; },
+    fail(id, retryAfterMs = 0, now = Date.now()) {
+      const e = state.get(id) || { fails: 0, until: 0 };
+      e.fails += 1;
+      const backoff = Math.min(maxMs, baseMs * 2 ** (e.fails - 1));
+      e.until = now + Math.max(backoff, retryAfterMs);
+      state.set(id, e);
+      return e;
+    },
+    clear(id) { state.delete(id); },
+    size() { return state.size; },
+  };
+}
+const topicCooldown = createTopicCooldown();
 const closeForumTopic = (chatId, threadId) => telegramRequest('closeForumTopic', { chat_id: chatId, message_thread_id: threadId }).catch(() => {});
 const reopenForumTopic = (chatId, threadId) => telegramRequest('reopenForumTopic', { chat_id: chatId, message_thread_id: threadId }).catch(() => {});
 const deleteForumTopic = (chatId, threadId) => telegramRequest('deleteForumTopic', { chat_id: chatId, message_thread_id: threadId }).catch(() => {});
@@ -888,6 +932,26 @@ function slugify(s) {
   return (s || '').toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').split('-').filter(Boolean).slice(0, 4).join('-').slice(0, 32);
 }
 
+// argv for the throwaway titling turn. Every flag here exists to keep a three-word slug from
+// costing a full agent turn: without them the child inherits the user's entire MCP surface,
+// skills index, settings and CLAUDE.md. Measured on a real install: 63,720 tokens with none of
+// these, 25,269 with all of them. The remainder is Claude Code's own base prompt.
+function titleArgs(tmpId, model = TITLE_MODEL) {
+  return [
+    '-p',
+    '--session-id', tmpId,
+    '--model', model,
+    '--permission-mode', 'bypassPermissions',
+    '--max-turns', '1',
+    '--allowedTools', '',
+    '--mcp-config', '{"mcpServers":{}}',
+    '--strict-mcp-config',
+    '--exclude-dynamic-system-prompt-sections',
+    '--disable-slash-commands',
+    '--setting-sources', '',
+  ];
+}
+
 // Ask a small/fast model for a short kebab-case slug (VS Code-tab style) from the session's content.
 // Runs in HOME (never a mapped repo) with a throwaway session id that we delete afterward, so title
 // generation never leaves a stray session file that could itself spawn a topic.
@@ -901,7 +965,7 @@ function generateTitle(firstMsg, recentMsg) {
     const cleanup = () => { try { const enc = '-' + home.replace(/^\//, '').replace(/[/.]/g, '-'); fs.unlinkSync(path.join(home, '.claude', 'projects', enc, tmpId + '.jsonl')); } catch (e) { /* */ } };
     let out = '', done = false;
     const finish = (v) => { if (done) return; done = true; cleanup(); resolve(v); };
-    let child; try { child = spawn(CLAUDE_BINARY, ['-p', '--session-id', tmpId, '--model', TITLE_MODEL, '--permission-mode', 'bypassPermissions'], { cwd: home, env: process.env }); }
+    let child; try { child = spawn(CLAUDE_BINARY, titleArgs(tmpId), { cwd: home, env: process.env }); }
     catch (e) { return resolve(null); }
     const timer = setTimeout(() => { try { child.kill('SIGKILL'); } catch (e) { /* */ } finish(null); }, 20000);
     child.stdout.on('data', (d) => (out += d));
@@ -919,11 +983,15 @@ function topicName(info) {
 }
 
 // Async resolver used at topic creation — generates a slug when TITLE_MODE=generated.
+// Generated slugs are cached per session: a topic creation that fails and is later retried
+// must not pay for the titling turn twice.
+const titleCache = new Map();   // sessionId -> "🤖 slug"
 async function resolveTopicName(info) {
   if (TITLE_MODE === 'generated') {
+    if (titleCache.has(info.id)) return titleCache.get(info.id);
     const { lastUser } = lastExchange(info.path);
     const slug = await generateTitle(info.label, lastUser);
-    if (slug) return `🤖 ${slug}`;
+    if (slug) { const n = `🤖 ${slug}`; titleCache.set(info.id, n); return n; }
   }
   return topicName(info);
 }
@@ -941,8 +1009,14 @@ async function ensureTopicForSession(info) {
   if (!shouldAutoCreate(info)) return null;   // skip sub-agent/empty/command-only sessions
   const chatId = repoToChat[info.cwd];
   if (!chatId || !AUTO_CREATE_TOPICS) return null;
-  const threadId = await createForumTopic(chatId, await resolveTopicName(info));
-  if (!threadId) return null;
+  if (topicCooldown.blocked(info.id)) return null;   // backing off from a recent failure
+  const { threadId, retryAfterMs } = await createForumTopic(chatId, await resolveTopicName(info));
+  if (!threadId) {
+    const { fails, until } = topicCooldown.fail(info.id, retryAfterMs);
+    console.error(`[Topic] backing off ${info.id.slice(0, 8)} for ${Math.round((until - Date.now()) / 1000)}s (failure #${fails})`);
+    return null;
+  }
+  topicCooldown.clear(info.id);
   const tkey = `${chatId}_${threadId}`;
   if (sessionByThread.has(tkey) && sessionByThread.get(tkey) !== info.id) {   // never bind two sessions to one thread
     console.warn(`[Topic] thread ${threadId} already bound to ${sessionByThread.get(tkey).slice(0, 8)}; skipping duplicate for ${info.id.slice(0, 8)}`);
@@ -1100,7 +1174,8 @@ async function pollTick() {
 let lastUpdateId = 0;
 async function pollUpdates() {
   try {
-    const res = await telegramRequest('getUpdates', { offset: lastUpdateId + 1, timeout: 30 });
+    const res = await telegramRequest('getUpdates',
+      { offset: lastUpdateId + 1, timeout: UPDATE_POLL_TIMEOUT_S }, updateSocketTimeoutMs());
     if (res.ok && res.result.length > 0) {
       for (const update of res.result) {
         lastUpdateId = update.update_id;
@@ -1166,7 +1241,7 @@ async function pollUpdates() {
         // /new <message> — brand-new session in its own new topic.
         if (text.startsWith('/new ')) {
           const firstMsg = text.substring(5).trim();
-          const newThread = await createForumTopic(chatId, `🤖 ${firstMsg.slice(0, 50)}`);
+          const { threadId: newThread } = await createForumTopic(chatId, `🤖 ${firstMsg.slice(0, 50)}`);
           if (!newThread) { sendPlain(chatId, threadId, "⚠️ Couldn't create a topic — grant the bot admin + Manage Topics."); continue; }
           scheduleDrive(chatId, newThread, firstMsg, null);
           sendPlain(chatId, threadId, "🆕 New session started in its own topic.");
@@ -1308,4 +1383,5 @@ module.exports = {
   isActive, shouldPrune, isDeskBusy, invertRepoMappings, splitThreadKey, buildThreadIndex,
   migrateLegacy, topicName, openerText, shouldAutoCreate, loadIgnored, persistIgnored, persisted, deskUrl,
   lastExchange, sessionNameById, heldByOtherPids, updatePendingTools, dueStallNotices, createApprovalRegistry,
+  titleArgs, createTopicCooldown, parseRetryAfter, updateSocketTimeoutMs, UPDATE_POLL_TIMEOUT_S,
 };
