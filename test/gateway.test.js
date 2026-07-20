@@ -686,3 +686,62 @@ test('dueForRename: disabled when threshold is 0', () => {
 test('dueForRename: tolerates a link from an older version with no counter', () => {
   assert.equal(g.dueForRename({}, 3), false);
 });
+
+// ---------------------------------------------------------------------------
+// doctor.sh — machine diagnostic
+// ---------------------------------------------------------------------------
+
+// Runs test/doctor.sh against a fixture $HOME with a stub `npm` on PATH, so the
+// "global npm install" branch is exercised without touching the real machine.
+function runDoctor({ home, npmRoot, shell = '/bin/bash' }) {
+  const bin = fs.mkdtempSync(path.join(os.tmpdir(), 'gw-bin-'));
+  fs.writeFileSync(path.join(bin, 'npm'),
+    `#!/bin/sh\n[ "$1" = root ] && echo '${npmRoot || ''}'\nexit 0\n`, { mode: 0o755 });
+  const r = require('child_process').spawnSync(
+    shell, [path.join(__dirname, 'doctor.sh')],
+    { encoding: 'utf8', env: { ...process.env, HOME: home,
+      PATH: `${bin}:${process.env.PATH}`,
+      CLAUDE_GATEWAY_DIR: path.join(home, '.claude-gateway') } });
+  return r.stdout;
+}
+
+// Builds a fake install dir containing the two files doctor.sh probes for.
+function fakeInstall(dir, version, log) {
+  fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(path.join(dir, 'gateway.js'), '// stub');
+  fs.writeFileSync(path.join(dir, 'package.json'), JSON.stringify({ version }));
+  if (log !== undefined) fs.writeFileSync(path.join(dir, 'gateway.log'), log);
+  return dir;
+}
+
+test('doctor: reports BOTH a git checkout and an npm install', () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'gw-home-'));
+  const npmRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'gw-nr-'));
+  fakeInstall(path.join(home, 'telegram_gateway'), '1.0.5', '');
+  fakeInstall(path.join(npmRoot, 'claude-code-telegram-gateway'), '1.0.0', '');
+  const out = runDoctor({ home, npmRoot });
+  assert.match(out, /telegram_gateway {2}v1\.0\.5/, 'checkout listed with its version');
+  assert.match(out, /claude-code-telegram-gateway {2}v1\.0\.0/, 'npm install listed too');
+});
+
+test('doctor: reports per-install log counts without double zeros', () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'gw-home-'));
+  fakeInstall(path.join(home, 'telegram_gateway'), '1.0.5', 'nothing interesting here\n');
+  const out = runDoctor({ home, npmRoot: '' });
+  assert.match(out, /retry storms 0 {2}poll timeouts 0/, 'counts render on one line');
+  assert.ok(!/^\s*0\s*$/m.test(out), 'no stray bare-zero line from `grep -c || echo 0`');
+});
+
+test('doctor: says so plainly when nothing is installed', () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'gw-home-'));
+  const out = runDoctor({ home, npmRoot: '' });
+  assert.match(out, /installs:\s*\n\s*NONE FOUND/);
+});
+
+test('doctor: no zsh unmatched-glob error when the projects dir is empty', () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'gw-home-'));
+  fs.mkdirSync(path.join(home, '.claude', 'projects', `-${home.replace(/^\//, '').replace(/[/.]/g, '-')}`), { recursive: true });
+  const out = runDoctor({ home, npmRoot: '', shell: '/bin/zsh' });
+  assert.match(out, /orphaned titlers: 0/);
+  assert.ok(!/no matches found/.test(out));
+});
