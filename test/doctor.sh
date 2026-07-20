@@ -26,7 +26,18 @@ running_pid_for() {
   want="$(lower "$1")/gateway.js"
   for pid in $(pgrep -f 'gateway\.js' 2>/dev/null); do
     cmd="$(lower "$(ps -o command= -p "$pid" 2>/dev/null)")"
-    case "$cmd" in *"$want"*) printf '%s' "$pid"; return 0;; esac
+    # $want must appear as a whole argv token, not just any substring — otherwise
+    # `tail -f <install>/gateway.js.log` (or `vim`/`git diff` on that log) matches
+    # too, since it literally contains "<install>/gateway.js" as a prefix of a
+    # longer token. Anchor both ends: start-of-string or space before, end-of-string
+    # or space after. "$want" stays quoted inside each pattern so glob metacharacters
+    # in the path (e.g. brackets) are matched literally, not as glob syntax.
+    case "$cmd" in
+      "$want") printf '%s' "$pid"; return 0;;
+      "$want "*) printf '%s' "$pid"; return 0;;
+      *" $want") printf '%s' "$pid"; return 0;;
+      *" $want "*) printf '%s' "$pid"; return 0;;
+    esac
   done
   return 1
 }

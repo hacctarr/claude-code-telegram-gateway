@@ -765,3 +765,20 @@ test('doctor: leaves installs unmarked when nothing is running from them', () =>
   const out = runDoctor({ home, npmRoot: '' });
   assert.ok(!/<- running/.test(out), 'no false positive from an unrelated gateway elsewhere');
 });
+
+test('doctor: a process merely referencing gateway.js.log does not count as running', () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'gw-home-'));
+  const dir = fakeInstall(path.join(home, 'telegram_gateway'), '1.0.5', '');
+  // A real, long-lived process whose argv contains <dir>/gateway.js.log — a near miss:
+  // it has "<install>/gateway.js" as a substring, but as part of a longer token
+  // (e.g. what `tail -f`, `vim`, or `git diff` on the log file would look like).
+  // pgrep -f 'gateway\.js' finds it too, since the pattern is unanchored.
+  const logPath = path.join(dir, 'gateway.js.log');
+  const child = require('child_process').spawn(process.execPath,
+    ['-e', 'setTimeout(()=>{},60000)', '--', logPath], { stdio: 'ignore' });
+  try {
+    const out = runDoctor({ home, npmRoot: '' });
+    assert.ok(!/<- running/.test(out),
+      'a substring match on gateway.js.log must not mark the install as running');
+  } finally { child.kill('SIGKILL'); }
+});
