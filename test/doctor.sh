@@ -69,4 +69,10 @@ for d in "${INSTALLS[@]}"; do
 done
 
 # find, not `ls *.jsonl`: zsh errors on an unmatched glob where bash passes it through.
-echo "orphaned titlers: $(find "$PROJ" -maxdepth 1 -name '*.jsonl' 2>/dev/null | wc -l | tr -d ' ')  in $PROJ"
+# This dir holds a .jsonl for EVERY Claude Code session run from $HOME, not just titler
+# spawns — counting all of them reported 300 "orphaned titlers" on a machine whose real
+# count was 0. Titler turns are identified by the prompt generateTitle() sends; keep this
+# string in sync with gateway.js.
+SESSIONS=$(find "$PROJ" -maxdepth 1 -name '*.jsonl' 2>/dev/null | wc -l | tr -d ' ')
+TITLERS=$(find "$PROJ" -maxdepth 1 -name '*.jsonl' -exec grep -l 'kebab-case slug titling this work session' {} + 2>/dev/null | wc -l | tr -d ' ')
+echo "orphaned titlers: $TITLERS  of $SESSIONS sessions in $PROJ"

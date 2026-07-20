@@ -746,6 +746,26 @@ test('doctor: no zsh unmatched-glob error when the projects dir is empty', () =>
   assert.ok(!/no matches found/.test(out));
 });
 
+// The projects dir holds a .jsonl for EVERY Claude Code session run from that cwd,
+// not just titler spawns. Counting all of them reported 300 "orphaned titlers" on a
+// machine whose real titler count was 0 — the diagnostic overstated the burn it exists
+// to measure. Only sessions carrying the titling prompt count.
+test('doctor: counts only titler sessions, not every session in the projects dir', () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'gw-home-'));
+  const proj = path.join(home, '.claude', 'projects',
+    `-${home.replace(/^\//, '').replace(/[/.]/g, '-')}`);
+  fs.mkdirSync(proj, { recursive: true });
+  fs.writeFileSync(path.join(proj, 'titler-a.jsonl'), JSON.stringify(
+    { type: 'user', message: { content: 'Give a 1-3 word kebab-case slug titling this work session. Reply ONLY the slug, no quotes or extra text.' } }) + '\n');
+  fs.writeFileSync(path.join(proj, 'real-work-1.jsonl'), JSON.stringify(
+    { type: 'user', message: { content: 'refactor the billing module' } }) + '\n');
+  fs.writeFileSync(path.join(proj, 'real-work-2.jsonl'), JSON.stringify(
+    { type: 'user', message: { content: 'why is the deploy failing' } }) + '\n');
+  const out = runDoctor({ home, npmRoot: '' });
+  assert.match(out, /orphaned titlers: 1\b/, 'one titler, not three sessions');
+  assert.match(out, /of 3 sessions/, 'total still reported, so the ratio is visible');
+});
+
 test('doctor: marks the install a running gateway was launched from', () => {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), 'gw-home-'));
   const dir = fakeInstall(path.join(home, 'telegram_gateway'), '1.0.5', '');
