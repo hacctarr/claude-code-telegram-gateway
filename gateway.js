@@ -97,6 +97,9 @@ const TITLE_MODEL = config.TITLE_MODEL || 'haiku';
 // 2s tick — with TITLE_MODE=generated that would respawn the titling turn every time.
 const TOPIC_RETRY_BASE_MS = config.TOPIC_RETRY_BASE_MS || 30_000;
 const TOPIC_RETRY_MAX_MS = config.TOPIC_RETRY_MAX_MS || 15 * 60_000;
+// Rename a topic once, after this many mirrored desk prompts, so its name reflects the work
+// rather than the opening message. 0 disables. Only does anything when TITLE_MODE=generated.
+const RENAME_AFTER_TURNS = config.RENAME_AFTER_TURNS === 0 ? 0 : (config.RENAME_AFTER_TURNS || 3);
 // Auto-fork a held-open desk session into a persistent phone branch (on by default). The fork id is
 // pre-minted and reserved before the turn spawns, the topic is atomically rebound to the branch, and
 // held-detection ignores the gateway's own pid — the three fixes that make this safe. Set
@@ -470,6 +473,9 @@ function createTopicCooldown(baseMs = TOPIC_RETRY_BASE_MS, maxMs = TOPIC_RETRY_M
   };
 }
 const topicCooldown = createTopicCooldown();
+const editForumTopic = (chatId, threadId, name) =>
+  telegramRequest('editForumTopic', { chat_id: chatId, message_thread_id: threadId, name: name.slice(0, 128) })
+    .catch((e) => ({ ok: false, description: e.message }));
 const closeForumTopic = (chatId, threadId) => telegramRequest('closeForumTopic', { chat_id: chatId, message_thread_id: threadId }).catch(() => {});
 const reopenForumTopic = (chatId, threadId) => telegramRequest('reopenForumTopic', { chat_id: chatId, message_thread_id: threadId }).catch(() => {});
 const deleteForumTopic = (chatId, threadId) => telegramRequest('deleteForumTopic', { chat_id: chatId, message_thread_id: threadId }).catch(() => {});
@@ -1030,6 +1036,28 @@ function topicName(info) {
   return info.label ? `🤖 ${slugify(info.label)}` : `🤖 claude-${info.id.slice(0, 6)}`;
 }
 
+// A topic is named at creation, when the session is usually one message old — which is how you
+// end up with topics called "ping" or "re-you-sure-it". Once RENAME_AFTER_TURNS real desk prompts
+// have been mirrored, regenerate the name once from what the session actually became.
+// Counting happens on already-parsed mirrored lines, so it costs nothing extra: O(new bytes),
+// never a re-read of a transcript that can run to tens of MB.
+function countUserTurns(lines) {
+  let n = 0;
+  for (const o of lines) {
+    if (!o || o.type !== 'user' || o.isMeta || !o.message) continue;
+    const c = o.message.content;
+    const t = typeof c === 'string' ? c : (Array.isArray(c) ? (c.find((x) => x.type === 'text') || {}).text : null);
+    if (t && !t.startsWith('<') && t.trim()) n++;
+  }
+  return n;
+}
+
+// True exactly once per topic: enough substance to name it, and not yet renamed.
+function dueForRename(link, threshold = RENAME_AFTER_TURNS) {
+  if (!threshold || !link || link.renamed) return false;
+  return (link.userTurns || 0) >= threshold;
+}
+
 // Async resolver used at topic creation — generates a slug when TITLE_MODE=generated.
 // Generated slugs are cached per session: a topic creation that fails and is later retried
 // must not pay for the titling turn twice.
@@ -1082,6 +1110,32 @@ async function ensureTopicForSession(info) {
   }
   console.log(`[Topic] created for ${info.id.slice(0, 8)} → chat ${chatId} thread ${threadId}`);
   return linkBySession[info.id];
+}
+
+// Regenerate a topic's name from the session's current content and apply it. Only meaningful
+// under TITLE_MODE=generated — the other modes are derived from the first message, which by
+// definition hasn't changed. Returns the new name, or null if nothing was renamed.
+async function renameTopicFromContent(sessionId, link, file) {
+  if (TITLE_MODE !== 'generated') return null;
+  try {
+    const info = await readSessionInfo(file || sessionFileById(sessionId));
+    if (!info) return null;
+    titleCache.delete(sessionId);       // force a fresh slug rather than reusing the creation-time one
+    const name = await resolveTopicName(info);
+    if (!name) return null;
+    const r = await editForumTopic(link.chatId, link.threadId, name);
+    if (!r || !r.ok) {
+      console.error(`[Topic] rename failed for ${sessionId.slice(0, 8)} (${(r && r.description) || 'unknown'})`);
+      return null;
+    }
+    link.label = info.label || link.label;
+    persistLinks();
+    console.log(`[Topic] renamed ${sessionId.slice(0, 8)} → ${name}`);
+    return name;
+  } catch (e) {
+    console.error(`[Topic] rename error for ${sessionId.slice(0, 8)}: ${e.message}`);
+    return null;
+  }
 }
 
 async function pruneTopic(sessionId) {
@@ -1179,8 +1233,16 @@ async function pollTick() {
           if (!sent) continue;   // network hiccup: keep the offset so these lines retry next tick
           lastMirrorAt.set(id, now);
         }
+        link.userTurns = (link.userTurns || 0) + countUserTurns(lines);
         link.offset = newOffset;
         persistLinks();
+
+        // Settled: name it after what the session became, not its opening line. Once only.
+        if (dueForRename(link)) {
+          link.renamed = true;          // set first — a failed rename must not retry every tick
+          persistLinks();
+          await renameTopicFromContent(id, link, file);
+        }
       }
       // Stall notice: a tool call unresolved past the threshold — slow tool, or a permission
       // prompt sitting unanswered at the desk (the transcript can't tell which; say both).
@@ -1276,7 +1338,30 @@ async function pollUpdates() {
 
         if (text === '/start') {
           sendPlain(chatId, threadId, "👋 Claude Code gateway ready. Active desk sessions auto-appear as topics and mirror live.\n\n" +
-            "• reply in a topic to steer that session\n• /new <msg> — fresh session in its own topic\n• /desk — open this session in the editor on your Mac\n• /sessions, /resume <id|text>");
+            "• reply in a topic to steer that session\n• /new <msg> — fresh session in its own topic\n• /desk — open this session in the editor on your Mac\n• /rename [name] — rename this topic (bare = regenerate from content)\n• /sessions, /resume <id|text>");
+          continue;
+        }
+
+        // /rename [name] — rename this topic. With an argument, use it verbatim; bare, regenerate
+        // from the session's current content. The escape hatch for a session that has pivoted
+        // since the automatic settle-rename fired.
+        if (text === '/rename' || text.startsWith('/rename ')) {
+          const sid = sessionByThread.get(key);
+          const link = sid && linkBySession[sid];
+          if (!link) { sendPlain(chatId, threadId, "No session is linked to this topic yet — send a message first."); continue; }
+          const explicit = text.slice(7).trim();
+          if (explicit) {
+            const r = await editForumTopic(chatId, threadId, `🤖 ${slugify(explicit) || explicit.slice(0, 40)}`);
+            sendPlain(chatId, threadId, r && r.ok ? `✏️ Renamed.` : `⚠️ Rename failed (${(r && r.description) || 'unknown'}).`);
+            continue;
+          }
+          if (TITLE_MODE !== 'generated') {
+            sendPlain(chatId, threadId, `TITLE_MODE is "${TITLE_MODE}", so there's no name to regenerate. Use \`/rename <name>\`, or set TITLE_MODE to "generated".`);
+            continue;
+          }
+          sendPlain(chatId, threadId, "✏️ Regenerating the topic name…");
+          const name = await renameTopicFromContent(sid, link, sessionFileById(sid));
+          sendPlain(chatId, threadId, name ? `✏️ Renamed to ${name}` : "⚠️ Couldn't regenerate the name.");
           continue;
         }
 
@@ -1437,4 +1522,5 @@ module.exports = {
   lastExchange, sessionNameById, heldByOtherPids, updatePendingTools, dueStallNotices, createApprovalRegistry,
   titleArgs, createTopicCooldown, parseRetryAfter, updateSocketTimeoutMs, UPDATE_POLL_TIMEOUT_S,
   STATE_DIR, STATE_FILES, migrateStateFiles, statePath,
+  countUserTurns, dueForRename, RENAME_AFTER_TURNS,
 };

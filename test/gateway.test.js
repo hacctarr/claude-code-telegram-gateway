@@ -645,3 +645,44 @@ test('migrateStateFiles: works across filesystems (copy+unlink, not rename)', ()
     assert.equal(fs.readFileSync(path.join(to, 'ignored.json'), 'utf8'), '["a"]');
   } finally { fs.renameSync = realRename; }
 });
+
+// ---------------------------------------------------------------------------
+// Settle-then-rename: name a topic once the session has real substance
+// ---------------------------------------------------------------------------
+
+const userLine = (t) => ({ type: 'user', message: { content: t } });
+
+test('countUserTurns: counts real desk prompts only', () => {
+  const lines = [
+    userLine('first real prompt'),
+    { type: 'assistant', message: { content: [{ type: 'text', text: 'reply' }] } },
+    userLine('second real prompt'),
+    { type: 'user', isMeta: true, message: { content: 'meta noise' } },          // meta
+    { type: 'user', message: { content: '<command-name>/foo</command-name>' } }, // command envelope
+    { type: 'user', message: { content: [{ type: 'tool_result', content: 'x' }] } }, // tool result
+    userLine('   '),                                                              // whitespace only
+  ];
+  assert.equal(g.countUserTurns(lines), 2);
+});
+
+test('countUserTurns: array-content text blocks count', () => {
+  assert.equal(g.countUserTurns([{ type: 'user', message: { content: [{ type: 'text', text: 'hello' }] } }]), 1);
+});
+
+test('dueForRename: fires once at the threshold, never twice', () => {
+  const link = { userTurns: 0, renamed: false };
+  link.userTurns = 2;
+  assert.equal(g.dueForRename(link, 3), false, 'below threshold');
+  link.userTurns = 3;
+  assert.equal(g.dueForRename(link, 3), true, 'at threshold');
+  link.renamed = true;
+  assert.equal(g.dueForRename(link, 3), false, 'already renamed — never again');
+});
+
+test('dueForRename: disabled when threshold is 0', () => {
+  assert.equal(g.dueForRename({ userTurns: 99, renamed: false }, 0), false);
+});
+
+test('dueForRename: tolerates a link from an older version with no counter', () => {
+  assert.equal(g.dueForRename({}, 3), false);
+});

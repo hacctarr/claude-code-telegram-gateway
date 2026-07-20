@@ -24,6 +24,8 @@
   "_TITLE_MODE": "first-message (free) | session-name | generated — 'generated' spawns a Claude turn per topic-creation attempt, ~25k tokens each",
   "TITLE_MODE": "first-message",
   "TITLE_MODEL": "haiku",
+  "_RENAME_AFTER_TURNS": "with TITLE_MODE=generated, rename the topic once after this many mirrored desk prompts so its name reflects the work, not the opening message. 0 disables. /rename works regardless.",
+  "RENAME_AFTER_TURNS": 3,
   "TOPIC_RETRY_BASE_MS": 30000,
   "TOPIC_RETRY_MAX_MS": 900000,
   "UPDATE_POLL_TIMEOUT_S": 25,
