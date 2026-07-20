@@ -1,6 +1,6 @@
 {
   "name": "claude-code-telegram-gateway",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "Steer and mirror Claude Code sessions from your phone via Telegram — auto-created Forum Topics, live desk↔phone mirroring, launchd service.",
   "main": "gateway.js",
   "bin": {
