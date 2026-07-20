@@ -745,3 +745,23 @@ test('doctor: no zsh unmatched-glob error when the projects dir is empty', () =>
   assert.match(out, /orphaned titlers: 0/);
   assert.ok(!/no matches found/.test(out));
 });
+
+test('doctor: marks the install a running gateway was launched from', () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'gw-home-'));
+  const dir = fakeInstall(path.join(home, 'telegram_gateway'), '1.0.5', '');
+  // A real, long-lived process whose argv contains <dir>/gateway.js, so pgrep finds it.
+  fs.writeFileSync(path.join(dir, 'gateway.js'), 'setTimeout(()=>{},60000)');
+  const child = require('child_process').spawn(process.execPath, [path.join(dir, 'gateway.js')], { stdio: 'ignore' });
+  try {
+    const out = runDoctor({ home, npmRoot: '' });
+    assert.match(out, new RegExp(`v1\\.0\\.5\\s+<- running \\(pid ${child.pid}\\)`),
+      'the running install is marked with its pid');
+  } finally { child.kill('SIGKILL'); }
+});
+
+test('doctor: leaves installs unmarked when nothing is running from them', () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'gw-home-'));
+  fakeInstall(path.join(home, 'telegram_gateway'), '1.0.5', '');
+  const out = runDoctor({ home, npmRoot: '' });
+  assert.ok(!/<- running/.test(out), 'no false positive from an unrelated gateway elsewhere');
+});
