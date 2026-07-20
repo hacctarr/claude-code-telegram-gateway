@@ -738,7 +738,13 @@ test('doctor: says so plainly when nothing is installed', () => {
   assert.match(out, /installs:\s*\n\s*NONE FOUND/);
 });
 
-test('doctor: no zsh unmatched-glob error when the projects dir is empty', () => {
+// Runs under zsh deliberately: the unmatched-glob failure this guards is zsh-specific
+// (bash passes an unmatched glob through, zsh aborts), and the paste-into-a-terminal
+// path is zsh on macOS. CI runs on Linux with no /bin/zsh, so skip rather than fail —
+// spawnSync on a missing shell returns undefined stdout, which read as a real failure
+// and silently aborted the v1.0.6 publish.
+test('doctor: no zsh unmatched-glob error when the projects dir is empty',
+  { skip: fs.existsSync('/bin/zsh') ? false : 'no /bin/zsh on this machine' }, () => {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), 'gw-home-'));
   fs.mkdirSync(path.join(home, '.claude', 'projects', `-${home.replace(/^\//, '').replace(/[/.]/g, '-')}`), { recursive: true });
   const out = runDoctor({ home, npmRoot: '', shell: '/bin/zsh' });
