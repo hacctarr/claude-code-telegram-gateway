@@ -582,3 +582,16 @@ test('getUpdates long-poll must complete inside the socket timeout', () => {
   assert.ok(g.UPDATE_POLL_TIMEOUT_S * 1000 < g.updateSocketTimeoutMs(),
     `long-poll ${g.UPDATE_POLL_TIMEOUT_S}s must be shorter than socket timeout ${g.updateSocketTimeoutMs()}ms`);
 });
+
+test('gateway.js is requirable without config.json (CI has no config — it is gitignored)', () => {
+  // Regression: gateway.js used to process.exit(1) at require-time when config.json was
+  // absent, so `npm test` failed in CI and every tagged release silently failed to publish.
+  const os = require('os');
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'gw-noconfig-'));
+  fs.copyFileSync(path.join(__dirname, '..', 'gateway.js'), path.join(tmp, 'gateway.js'));
+  const r = require('child_process').spawnSync(
+    process.execPath, ['-e', `require(${JSON.stringify(path.join(tmp, 'gateway.js'))})`],
+    { encoding: 'utf8' });
+  fs.rmSync(tmp, { recursive: true, force: true });
+  assert.equal(r.status, 0, `requiring without config.json exited ${r.status}: ${r.stderr || r.stdout}`);
+});

@@ -7,12 +7,16 @@ const { spawn, execFileSync } = require('child_process');
 // ---------------------------------------------------------------------------
 // Config
 // ---------------------------------------------------------------------------
+// config.json is gitignored, so it is absent in CI and for anyone importing this file as a
+// module. Only refuse to start when we are actually being run as the gateway — bailing at
+// require-time broke `npm test` in CI, which silently failed every tagged npm release.
 const CONFIG_PATH = path.join(__dirname, 'config.json');
-if (!fs.existsSync(CONFIG_PATH)) {
+const HAS_CONFIG = fs.existsSync(CONFIG_PATH);
+if (!HAS_CONFIG && require.main === module) {
   console.error("Error: config.json not found. Run `npm run setup`, or copy config.example.json to config.json and fill it in.");
   process.exit(1);
 }
-const config = JSON.parse(fs.readFileSync(CONFIG_PATH, 'utf8'));
+const config = HAS_CONFIG ? JSON.parse(fs.readFileSync(CONFIG_PATH, 'utf8')) : {};
 const {
   BOT_TOKEN,
   ALLOWED_USER_IDS,
