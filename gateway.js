@@ -2,18 +2,62 @@ const https = require('https');
 const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
+const os = require('os');
 const { spawn, execFileSync } = require('child_process');
 
 // ---------------------------------------------------------------------------
 // Config
 // ---------------------------------------------------------------------------
+// Persistent state lives OUTSIDE the install directory. For an npm install __dirname sits in
+// node_modules and is replaced wholesale on `npm update`, which silently destroys config.json
+// (your bot token) and links.json (every topic binding). ~/.claude-gateway survives updates —
+// it is already where the resume marker lives. Override with CLAUDE_GATEWAY_DIR.
+const STATE_DIR = process.env.CLAUDE_GATEWAY_DIR || path.join(os.homedir(), '.claude-gateway');
+const STATE_FILES = ['config.json', 'links.json', 'sessions.json', 'ignored.json', 'superseded.json'];
+
+// One-time move of legacy in-package state into STATE_DIR. Copy+unlink rather than rename so it
+// works when the npm prefix and $HOME are on different filesystems (rename gives EXDEV). Never
+// overwrites a file already in the destination. Returns the names actually moved.
+function migrateStateFiles(fromDir, toDir, names = STATE_FILES) {
+  const moved = [];
+  if (fromDir === toDir) return moved;
+  for (const name of names) {
+    const src = path.join(fromDir, name);
+    const dst = path.join(toDir, name);
+    try {
+      if (!fs.existsSync(src) || fs.existsSync(dst)) continue;
+      fs.mkdirSync(toDir, { recursive: true });
+      try { fs.renameSync(src, dst); }
+      catch (e) { fs.copyFileSync(src, dst); fs.unlinkSync(src); }   // EXDEV across filesystems
+      moved.push(name);
+    } catch (e) { /* leave the legacy copy in place rather than lose it */ }
+  }
+  return moved;
+}
+
+const IS_GATEWAY = require.main === module;
+if (IS_GATEWAY) {
+  try { fs.mkdirSync(STATE_DIR, { recursive: true }); } catch (e) { /* */ }
+  const moved = migrateStateFiles(__dirname, STATE_DIR);
+  if (moved.length) console.log(`[State] migrated ${moved.join(', ')} → ${STATE_DIR} (survives npm update)`);
+}
+
+// Reads prefer STATE_DIR but fall back to a legacy in-package file when migration hasn't run
+// (e.g. this module imported by tests). New writes always land in STATE_DIR.
+function statePath(name) {
+  const current = path.join(STATE_DIR, name);
+  if (fs.existsSync(current)) return current;
+  const legacy = path.join(__dirname, name);
+  return fs.existsSync(legacy) ? legacy : current;
+}
+
 // config.json is gitignored, so it is absent in CI and for anyone importing this file as a
 // module. Only refuse to start when we are actually being run as the gateway — bailing at
 // require-time broke `npm test` in CI, which silently failed every tagged npm release.
-const CONFIG_PATH = path.join(__dirname, 'config.json');
+const CONFIG_PATH = statePath('config.json');
 const HAS_CONFIG = fs.existsSync(CONFIG_PATH);
-if (!HAS_CONFIG && require.main === module) {
-  console.error("Error: config.json not found. Run `npm run setup`, or copy config.example.json to config.json and fill it in.");
+if (!HAS_CONFIG && IS_GATEWAY) {
+  console.error(`Error: config.json not found in ${STATE_DIR}. Run \`npm run setup\`, or copy config.example.json there and fill it in.`);
   process.exit(1);
 }
 const config = HAS_CONFIG ? JSON.parse(fs.readFileSync(CONFIG_PATH, 'utf8')) : {};
@@ -83,10 +127,10 @@ function invertRepoMappings(mappings) {
 // Link store: sessionId <-> Telegram topic. Replaces the old sessions.json map.
 //   links.json = { "<sessionId>": { chatId, threadId, label, offset, closed } }
 // ---------------------------------------------------------------------------
-const LINKS_FILE = path.join(__dirname, 'links.json');
-const SESSIONS_FILE = path.join(__dirname, 'sessions.json'); // legacy, migrated once
+const LINKS_FILE = statePath('links.json');
+const SESSIONS_FILE = statePath('sessions.json'); // legacy, migrated once
 
-const IGNORED_FILE = path.join(__dirname, 'ignored.json');
+const IGNORED_FILE = statePath('ignored.json');
 let linkBySession = {};                 // sessionId -> link
 const sessionByThread = new Map();      // "chatId_threadId" -> sessionId
 const ignoredSessions = new Set();      // sessions deliberately detached via /new — don't re-topic
@@ -104,7 +148,7 @@ function persistIgnored(file = IGNORED_FILE, set = ignoredSessions) {
 // "superseded" — we record the transcript size at the fork point and skip re-topicing it, UNLESS the
 // desk keeps working on it (file grows past that point), in which case it automatically gets its own
 // topic again. So divergence is handled without any manual /branches command.
-const SUPERSEDED_FILE = path.join(__dirname, 'superseded.json');
+const SUPERSEDED_FILE = statePath('superseded.json');
 let supersededAt = {};   // sessionId -> transcript size when it was forked away from
 function loadSuperseded() { try { if (fs.existsSync(SUPERSEDED_FILE)) supersededAt = JSON.parse(fs.readFileSync(SUPERSEDED_FILE, 'utf8')); } catch (e) { supersededAt = {}; } }
 function persistSuperseded() { try { fs.writeFileSync(SUPERSEDED_FILE, JSON.stringify(supersededAt)); } catch (e) { /* */ } }
@@ -1072,15 +1116,19 @@ async function reviveTopic(sessionId) {
 // the gateway exits once no injected turns are in flight; launchd relaunches it with fresh code.
 // Never `launchctl kickstart -k` from inside a gateway-driven turn — that kills the process group,
 // including the turn that issued it, mid-command.
-const RESTART_FLAG = path.join(__dirname, 'restart.flag');
+// Watched in both places: STATE_DIR is the durable home, but `touch restart.flag` inside a git
+// checkout is long-standing muscle memory and stays working.
+const RESTART_FLAGS = [path.join(STATE_DIR, 'restart.flag'), path.join(__dirname, 'restart.flag')];
+function seenRestartFlag() { return RESTART_FLAGS.find((f) => { try { return fs.existsSync(f); } catch (e) { return false; } }); }
 
 let polling = false;
 async function pollTick() {
   if (polling) return;
   polling = true;
   try {
-    if (fs.existsSync(RESTART_FLAG) && injecting.size === 0) {
-      try { fs.unlinkSync(RESTART_FLAG); } catch (e) { /* */ }
+    const flag = seenRestartFlag();
+    if (flag && injecting.size === 0) {
+      try { fs.unlinkSync(flag); } catch (e) { /* */ }
       console.log('[Restart] restart.flag seen and no turns in flight — exiting for launchd relaunch.');
       persistLinks();
       process.exit(1);   // non-zero → KeepAlive relaunches
@@ -1331,7 +1379,7 @@ async function pollUpdates() {
 // ---------------------------------------------------------------------------
 // Boot
 // ---------------------------------------------------------------------------
-const LOCK_FILE = path.join(__dirname, '.gateway.lock');
+const LOCK_FILE = path.join(STATE_DIR, '.gateway.lock');
 function pidAlive(pid) { try { process.kill(pid, 0); return true; } catch (e) { return e.code === 'EPERM'; } }
 function acquireLock() {
   try {
@@ -1388,4 +1436,5 @@ module.exports = {
   migrateLegacy, topicName, openerText, shouldAutoCreate, loadIgnored, persistIgnored, persisted, deskUrl,
   lastExchange, sessionNameById, heldByOtherPids, updatePendingTools, dueStallNotices, createApprovalRegistry,
   titleArgs, createTopicCooldown, parseRetryAfter, updateSocketTimeoutMs, UPDATE_POLL_TIMEOUT_S,
+  STATE_DIR, STATE_FILES, migrateStateFiles, statePath,
 };

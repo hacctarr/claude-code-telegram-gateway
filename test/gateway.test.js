@@ -595,3 +595,53 @@ test('gateway.js is requirable without config.json (CI has no config — it is g
   fs.rmSync(tmp, { recursive: true, force: true });
   assert.equal(r.status, 0, `requiring without config.json exited ${r.status}: ${r.stderr || r.stdout}`);
 });
+
+// ---------------------------------------------------------------------------
+// State lives outside the install dir (npm update replaces __dirname wholesale)
+// ---------------------------------------------------------------------------
+
+function tmpdir(tag) { return fs.mkdtempSync(path.join(os.tmpdir(), `gw-${tag}-`)); }
+
+test('STATE_DIR is outside the install directory', () => {
+  assert.ok(!g.STATE_DIR.startsWith(__dirname), `${g.STATE_DIR} must not live under the package dir`);
+  assert.ok(g.STATE_DIR.includes('.claude-gateway'));
+});
+
+test('migrateStateFiles: moves legacy state out of the install dir', () => {
+  const from = tmpdir('from'), to = tmpdir('to');
+  fs.writeFileSync(path.join(from, 'config.json'), '{"BOT_TOKEN":"x"}');
+  fs.writeFileSync(path.join(from, 'links.json'), '{"s":{"threadId":1}}');
+  const moved = g.migrateStateFiles(from, to);
+  assert.deepEqual(moved.sort(), ['config.json', 'links.json']);
+  assert.equal(fs.readFileSync(path.join(to, 'config.json'), 'utf8'), '{"BOT_TOKEN":"x"}');
+  assert.ok(!fs.existsSync(path.join(from, 'config.json')), 'source removed so npm update cannot resurrect it');
+});
+
+test('migrateStateFiles: never clobbers state already in the destination', () => {
+  const from = tmpdir('from'), to = tmpdir('to');
+  fs.writeFileSync(path.join(from, 'config.json'), '{"BOT_TOKEN":"OLD"}');
+  fs.writeFileSync(path.join(to, 'config.json'), '{"BOT_TOKEN":"CURRENT"}');
+  const moved = g.migrateStateFiles(from, to);
+  assert.deepEqual(moved, []);
+  assert.equal(fs.readFileSync(path.join(to, 'config.json'), 'utf8'), '{"BOT_TOKEN":"CURRENT"}');
+});
+
+test('migrateStateFiles: idempotent and safe on a missing source dir', () => {
+  const from = tmpdir('from'), to = tmpdir('to');
+  fs.writeFileSync(path.join(from, 'links.json'), '{}');
+  assert.deepEqual(g.migrateStateFiles(from, to), ['links.json']);
+  assert.deepEqual(g.migrateStateFiles(from, to), [], 'second run is a no-op');
+  assert.deepEqual(g.migrateStateFiles(path.join(from, 'nope'), to), [], 'missing source dir does not throw');
+});
+
+test('migrateStateFiles: works across filesystems (copy+unlink, not rename)', () => {
+  // rename(2) fails with EXDEV across devices; a global npm prefix and $HOME can differ.
+  const from = tmpdir('from'), to = tmpdir('to');
+  fs.writeFileSync(path.join(from, 'ignored.json'), '["a"]');
+  const realRename = fs.renameSync;
+  fs.renameSync = () => { const e = new Error('EXDEV'); e.code = 'EXDEV'; throw e; };
+  try {
+    assert.deepEqual(g.migrateStateFiles(from, to), ['ignored.json']);
+    assert.equal(fs.readFileSync(path.join(to, 'ignored.json'), 'utf8'), '["a"]');
+  } finally { fs.renameSync = realRename; }
+});

@@ -36,7 +36,8 @@ topics and mirror live**, and you can **reply from your phone** to steer a sessi
 ## Step 4 — Configure
 
 ```bash
-cp config.example.json config.json
+mkdir -p ~/.claude-gateway
+cp config.example.json ~/.claude-gateway/config.json
 ```
 ```json
 {
@@ -46,8 +47,12 @@ cp config.example.json config.json
   "CLAUDE_PATH": "/Users/you/.nvm/versions/node/vXX/bin/claude"
 }
 ```
-`config.json` is gitignored — your token stays local. Optional tuning keys (mirror/prune/idle
-timings) are listed in `config.example.json`.
+Config and all runtime state live in `~/.claude-gateway/` (override with `CLAUDE_GATEWAY_DIR`),
+deliberately outside the install directory: for an npm install that directory sits in
+`node_modules` and is replaced on every `npm update`. A config left in the install dir still
+works and is moved to `~/.claude-gateway/` automatically on first run.
+
+Optional tuning keys (mirror/prune/idle timings) are listed in `config.example.json`.
 
 Run `node test/check-telegram.js` to verify the bot's identity and that it can create/delete a
 topic (self-cleaning). Expect `✅ All checks passed`.

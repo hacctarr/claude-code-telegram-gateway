@@ -27,6 +27,9 @@ It is a transcript **watcher**, not a terminal scraper — it reads Claude's own
 - A session's `cwd` (stored in its transcript) maps it to the right supergroup automatically.
 - Session ↔ topic links persist in `links.json`, so topics survive restarts. `sessions.json` from
   older versions is migrated automatically on first run.
+- Config and state live in `~/.claude-gateway/` (`CLAUDE_GATEWAY_DIR` to override), outside the
+  install dir so `npm update` can't wipe them. Pre-1.0.4 files left in the install directory are
+  moved there automatically on first run.
 
 ---
 
@@ -61,7 +64,7 @@ then `npm run setup` does the rest. Everything below is the manual equivalent.
    **Admin → Manage Topics + Post Messages**.
 3. **Get IDs:** your numeric user id (`@userinfobot`) and the group chat id (`-100…`, via the
    `getUpdates` URL in [SETUP.md](SETUP.md)).
-4. **Configure:** `cp config.example.json config.json` and fill it in:
+4. **Configure:** `cp config.example.json ~/.claude-gateway/config.json` and fill it in:
    ```json
    {
      "BOT_TOKEN": "…",

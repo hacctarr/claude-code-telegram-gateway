@@ -8,7 +8,15 @@ const https = require('https');
 const readline = require('readline');
 const { execSync } = require('child_process');
 
-const CONFIG = path.join(__dirname, 'config.json');
+// Config lives in ~/.claude-gateway, not the install dir: for an npm install __dirname is inside
+// node_modules and is wiped on every `npm update`. Keep reading a legacy in-package config so an
+// existing install still works before the gateway's own migration runs.
+const os = require('os');
+const STATE_DIR = process.env.CLAUDE_GATEWAY_DIR || path.join(os.homedir(), '.claude-gateway');
+const LEGACY_CONFIG = path.join(__dirname, 'config.json');
+const CONFIG = (!fs.existsSync(path.join(STATE_DIR, 'config.json')) && fs.existsSync(LEGACY_CONFIG))
+  ? LEGACY_CONFIG
+  : path.join(STATE_DIR, 'config.json');
 const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
 const ask = (q) => new Promise((res) => rl.question(q, (a) => res(a.trim())));
 const yes = (s) => /^y/i.test(s);
@@ -92,6 +100,7 @@ const expand = (p) => p.replace(/^~(?=\/|$)/, process.env.HOME);
     if (chatId && dir) { cfg.REPO_MAPPINGS[chatId] = dir; console.log(`   ✅ ${chatId} → ${dir}`); }
   }
 
+  fs.mkdirSync(path.dirname(CONFIG), { recursive: true });
   fs.writeFileSync(CONFIG, JSON.stringify(cfg, null, 2) + '\n');
   console.log(`\n✅ Wrote ${CONFIG}`);
   console.log('   (config.json is gitignored — your token stays local.)\n');
