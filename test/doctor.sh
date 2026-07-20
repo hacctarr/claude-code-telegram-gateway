@@ -17,7 +17,7 @@ for c in "$STATE/config.json" "$INSTALL/config.json"; do
 done
 
 # ~/.claude/projects dir for HOME, using Claude Code's own path encoding.
-PROJ="$HOME/.claude/projects/$(echo "$HOME" | sed 's|^/||; s|[/.]|-|g; s|^|-|')"
+PROJ="$HOME/.claude/projects/-$(printf '%s' "${HOME#/}" | tr '/.' '--')"
 
 echo "install:       ${INSTALL:-NOT FOUND}"
 echo "state dir:     $STATE $([ -d "$STATE" ] && echo '(exists)' || echo '(absent — pre-1.0.4)')"
@@ -31,13 +31,14 @@ fi
 
 LOG="$INSTALL/gateway.log"
 if [ -f "$LOG" ]; then
-  echo "retry storms:  $(grep -c 'createForumTopic failed' "$LOG" 2>/dev/null || echo 0)"
-  echo "poll timeouts: $(grep -c 'request timeout' "$LOG" 2>/dev/null || echo 0)"
+  # grep -c prints 0 AND exits 1 on no match, so `|| echo 0` would print it twice.
+  echo "retry storms:  $(grep -c 'createForumTopic failed' "$LOG" 2>/dev/null)"
+  echo "poll timeouts: $(grep -c 'request timeout' "$LOG" 2>/dev/null)"
 else
   echo "retry storms:  (no gateway.log at $LOG)"
 fi
 
-echo "orphaned titlers: $(ls "$PROJ"/*.jsonl 2>/dev/null | wc -l | tr -d ' ')  in $PROJ"
+echo "orphaned titlers: $(find "$PROJ" -maxdepth 1 -name '*.jsonl' 2>/dev/null | wc -l | tr -d ' ')  in $PROJ"
 
 VER="(unknown)"
 [ -f "$INSTALL/package.json" ] && VER=$(python3 -c "import json;print(json.load(open('$INSTALL/package.json'))['version'])" 2>/dev/null)
