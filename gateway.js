@@ -1885,6 +1885,10 @@ async function tgApply(method, payload) {
   try {
     const r = await telegramRequest(method, payload);
     if (r && r.ok) return true;
+    // Telegram returns 400 "...is not modified" when the value already matches the live object.
+    // That is the desired state, so treat it as success — otherwise the scope hash never persists
+    // and every boot re-attempts the call (and can trip rate limits).
+    if (r && /not modified/i.test(r.description || '')) return true;
     console.error(`appearance: ${method} failed (${(r && r.description) || 'unknown'})`);
     return false;
   } catch (e) { console.error(`appearance: ${method} failed (${e.message})`); return false; }
