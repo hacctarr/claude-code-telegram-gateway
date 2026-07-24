@@ -1034,6 +1034,34 @@ function createModuleRegistry(instances, log = console.error) {
   };
 }
 
+// Resolve a MODULES entry to an absolute path: ~ expands, absolute passes through,
+// anything else is relative to the gateway state dir (default ~/.claude-gateway).
+function resolveModulePath(entry, gatewayDir) {
+  const p = resolveHome(entry);
+  return path.isAbsolute(p) ? p : path.join(gatewayDir, p);
+}
+
+// Require each module file and instantiate its factory with the curated api.
+// A module that fails to load is logged and skipped — one bad module never
+// stops the gateway or the others.
+function loadModules(config, api, log = console.error, gatewayDir = STATE_DIR) {
+  const entries = Array.isArray(config && config.MODULES) ? config.MODULES : [];
+  const instances = [];
+  for (const entry of entries) {
+    const file = resolveModulePath(entry, gatewayDir);
+    try {
+      const factory = require(file);
+      if (typeof factory !== 'function') throw new Error('module does not export a factory function');
+      const hooks = factory(api);
+      instances.push({ name: (hooks && hooks.name) || path.basename(file, '.js'), hooks: hooks || {} });
+      log(`[Module] loaded ${(hooks && hooks.name) || path.basename(file, '.js')} from ${file}`);
+    } catch (e) {
+      log(`[Module] failed to load ${file}: ${e.message}`);
+    }
+  }
+  return createModuleRegistry(instances, log);
+}
+
 // ---------------------------------------------------------------------------
 // Topic lifecycle
 // ---------------------------------------------------------------------------
@@ -1642,4 +1670,5 @@ module.exports = {
   STATE_DIR, STATE_FILES, migrateStateFiles, statePath,
   countUserTurns, dueForRename, RENAME_AFTER_TURNS,
   createModuleRegistry,
+  resolveModulePath, loadModules,
 };
