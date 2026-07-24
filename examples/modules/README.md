@@ -25,11 +25,19 @@ A module is a factory that receives the `api` and returns hooks:
     module.exports = (api) => ({
       name: 'spec-kit',
       onTranscriptLine(ctx, record) { /* each new transcript record */ },
+      onInjectedTurn(ctx, prompt)   { /* a turn the gateway drove on the user's behalf */ },
       onTick(now)                   { /* once per poll tick */ },
     });
 
 `ctx = { sessionId, cwd, chatId, threadId }`. Every hook is optional. A throwing
 hook is logged and skipped — it can't crash the gateway or other modules.
+
+`onInjectedTurn` fires when the gateway drives a turn for the user (e.g. a command
+texted in from Telegram); such turns are suppressed from the transcript mirror, so
+`onTranscriptLine` never sees them — react to `onInjectedTurn` for the texted-in
+path and `onTranscriptLine` for desk-typed activity. Hooks are called synchronously;
+a hook that returns a rejected promise is outside the per-module try/catch, so keep
+hook bodies synchronous.
 
 ### api
 

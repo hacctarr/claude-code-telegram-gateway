@@ -986,6 +986,13 @@ async function driveTurn(chatId, threadId, prompt, resolveSession) {
       persistLinks();
       if (result.ok && !ephemeral) writeResumeMarker(repoDir, finalSid);
       if (!reserved.includes(finalSid)) reserved.push(finalSid);
+
+      // The gateway drove this turn on the user's behalf, so it already holds the prompt.
+      // Injected turns are suppressed from the transcript mirror (the offset jumped past them
+      // just above), so the transcriptLine tap never sees them — hand the prompt to modules
+      // directly. This is how a module arms on a command texted in from Telegram, without
+      // reaching into a stream the gateway deliberately hides.
+      moduleRegistry.emit('injectedTurn', { sessionId: finalSid, cwd: repoDir, chatId, threadId }, prompt);
     }
     console.log(`[Drive → thread ${threadId}] ok=${result.ok} session=${finalSid || '—'}${ephemeral ? ' (held/ephemeral)' : ''}`);
   } catch (err) {

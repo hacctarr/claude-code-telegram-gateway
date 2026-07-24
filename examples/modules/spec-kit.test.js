@@ -103,3 +103,34 @@ test('spec-kit: /compact and /code-review never arm a step', () => {
   assert.equal(api.calls.inject.length, 0);
   assert.equal(api.calls.spawn.length, 0);
 });
+
+test('commandFromText: leading slash command of a raw prompt, lowercased', () => {
+  assert.equal(m.commandFromText('/plan'), '/plan');
+  assert.equal(m.commandFromText('/plan do the thing'), '/plan');
+  assert.equal(m.commandFromText('  /Implement'), '/implement');
+  assert.equal(m.commandFromText('hello there'), null);
+  assert.equal(m.commandFromText(null), null);
+});
+
+test('spec-kit: onInjectedTurn arms a texted-in command, then a settled tick compacts', () => {
+  const api = fakeApi({ info: { cwd: '/repo', mtime: 0 } });
+  const mod = require('./spec-kit.js')(api);
+  mod.onInjectedTurn({ sessionId: 'S', cwd: '/repo', chatId: '1', threadId: 2 }, '/plan do it');
+  mod.onTick(9_999_999);
+  assert.deepEqual(api.calls.inject, [['S', '/compact']]);
+  assert.match(api.calls.post[0][1], /plan/);
+});
+
+test('spec-kit: onInjectedTurn ignores /compact (loop-safety)', () => {
+  const api = fakeApi();
+  const mod = require('./spec-kit.js')(api);
+  mod.onInjectedTurn({ sessionId: 'S' }, '/compact');
+  mod.onTick(9_999_999);
+  assert.equal(api.calls.inject.length, 0);
+  assert.equal(api.calls.spawn.length, 0);
+});
+
+test('extractCommand: a non-text block carrying a command string is ignored', () => {
+  const rec = { type: 'user', message: { content: [{ type: 'tool_result', text: '<command-name>/plan</command-name>' }] } };
+  assert.equal(m.extractCommand(rec), null);
+});

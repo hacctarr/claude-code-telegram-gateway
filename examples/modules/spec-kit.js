@@ -11,13 +11,19 @@ function recordText(record) {
   if (!record || record.type !== 'user' || !record.message) return '';
   const c = record.message.content;
   if (typeof c === 'string') return c;
-  if (Array.isArray(c)) return c.map((b) => (b && typeof b.text === 'string' ? b.text : '')).join(' ');
+  if (Array.isArray(c)) return c.map((b) => (b && b.type === 'text' && typeof b.text === 'string' ? b.text : '')).join(' ');
   return '';
 }
 
 function extractCommand(record) {
   const t = recordText(record);
   const mtch = /<command-name>\s*(\/[a-z0-9:_-]+)\s*<\/command-name>/i.exec(t);
+  return mtch ? mtch[1].toLowerCase() : null;
+}
+
+// A texted-in command arrives as the raw prompt the user sent (e.g. "/plan" or "/plan foo").
+function commandFromText(text) {
+  const mtch = /^\s*(\/[a-z0-9:_-]+)/i.exec(typeof text === 'string' ? text : '');
   return mtch ? mtch[1].toLowerCase() : null;
 }
 
@@ -49,20 +55,23 @@ function factory(api) {
   };
   const store = api.state('spec-kit');   // { data, save() }
 
+  // Desk-typed (onTranscriptLine) and texted-in (onInjectedTurn) commands both funnel here.
+  function arm(sessionId, cmd) {
+    if (!cmd || !STEP_COMMANDS.includes(cmd)) return;   // /compact & /code-review excluded → no re-arm
+    const prev = store.data[sessionId] || {};
+    store.data[sessionId] = {
+      armedStep: cmd,
+      armedAt: Date.now(),
+      firedSteps: prev.firedSteps || [],
+      reviewFired: prev.reviewFired || false,
+    };
+    store.save();
+  }
+
   return {
     name: 'spec-kit',
-    onTranscriptLine(ctx, record) {
-      const cmd = extractCommand(record);
-      if (!cmd || !STEP_COMMANDS.includes(cmd)) return;   // /compact & /code-review excluded → no re-arm
-      const prev = store.data[ctx.sessionId] || {};
-      store.data[ctx.sessionId] = {
-        armedStep: cmd,
-        armedAt: Date.now(),
-        firedSteps: prev.firedSteps || [],
-        reviewFired: prev.reviewFired || false,
-      };
-      store.save();
-    },
+    onTranscriptLine(ctx, record) { arm(ctx.sessionId, extractCommand(record)); },
+    onInjectedTurn(ctx, prompt) { arm(ctx.sessionId, commandFromText(prompt)); },
     onTick(now) {
       let changed = false;
       for (const sessionId of Object.keys(store.data)) {
@@ -90,3 +99,4 @@ function factory(api) {
 module.exports = factory;
 module.exports.extractCommand = extractCommand;
 module.exports.decideReaction = decideReaction;
+module.exports.commandFromText = commandFromText;
