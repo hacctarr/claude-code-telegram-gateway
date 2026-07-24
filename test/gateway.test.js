@@ -864,3 +864,67 @@ test('doctor: a process merely referencing gateway.js.log does not count as runn
       'a substring match on gateway.js.log must not mark the install as running');
   } finally { child.kill('SIGKILL'); }
 });
+
+// --- Inline action buttons (Task 1) ----------------------------------------
+test('chunkText: short text is a single chunk', () => {
+  assert.deepEqual(g.chunkText('hello'), ['hello']);
+});
+
+test('chunkText: splits on a newline near the limit', () => {
+  const a = 'a'.repeat(3000);
+  const b = 'b'.repeat(2000);
+  const chunks = g.chunkText(`${a}\n${b}`, 4000);
+  assert.equal(chunks.length, 2);
+  assert.equal(chunks[0], a);
+  assert.equal(chunks[1], b);
+});
+
+test('chunkText: empty string yields no chunks', () => {
+  assert.deepEqual(g.chunkText(''), []);
+});
+
+test('parseActionCallback: extracts action and session id', () => {
+  assert.deepEqual(g.parseActionCallback('act:desk:abc-123'), { action: 'desk', sid: 'abc-123' });
+  assert.deepEqual(g.parseActionCallback('act:resume:11111111-2222-3333-4444-555555555555'),
+    { action: 'resume', sid: '11111111-2222-3333-4444-555555555555' });
+});
+
+test('parseActionCallback: rejects non-act and unknown actions', () => {
+  assert.equal(g.parseActionCallback('ap:5:1'), null);
+  assert.equal(g.parseActionCallback('act:frobnicate:x'), null);
+  assert.equal(g.parseActionCallback('act:desk:'), null);
+  assert.equal(g.parseActionCallback(''), null);
+  assert.equal(g.parseActionCallback(undefined), null);
+});
+
+test('buildSessionActionBar: three buttons with act: callbacks', () => {
+  const sid = '11111111-2222-3333-4444-555555555555';
+  const bar = g.buildSessionActionBar(sid);
+  const row = bar.inline_keyboard[0];
+  assert.equal(row.length, 3);
+  assert.deepEqual(row.map((b) => b.callback_data),
+    [`act:desk:${sid}`, `act:rename:${sid}`, `act:exit:${sid}`]);
+  for (const b of row) assert.ok(Buffer.byteLength(b.callback_data) <= 64);
+});
+
+test('buildSessionActionBar: null when sid is falsy', () => {
+  assert.equal(g.buildSessionActionBar(''), null);
+  assert.equal(g.buildSessionActionBar(undefined), null);
+});
+
+test('buildSessionPickerKeyboard: one row per session, callbacks within 64 bytes', () => {
+  const sessions = [
+    { id: '11111111-2222-3333-4444-555555555555', label: 'fix the parser', mtime: Date.now() },
+    { id: '99999999-8888-7777-6666-555555555555', label: 'write docs', mtime: Date.now() - 3600_000 },
+  ];
+  const kb = g.buildSessionPickerKeyboard(sessions);
+  assert.equal(kb.inline_keyboard.length, 2);
+  assert.equal(kb.inline_keyboard[0][0].callback_data, `act:resume:${sessions[0].id}`);
+  for (const row of kb.inline_keyboard) assert.ok(Buffer.byteLength(row[0].callback_data) <= 64);
+});
+
+test('buildSessionPickerKeyboard: caps at max rows and returns null when empty', () => {
+  const many = Array.from({ length: 20 }, (_, i) => ({ id: `id-${i}`, label: `s${i}`, mtime: Date.now() }));
+  assert.equal(g.buildSessionPickerKeyboard(many, 12).inline_keyboard.length, 12);
+  assert.equal(g.buildSessionPickerKeyboard([]), null);
+});

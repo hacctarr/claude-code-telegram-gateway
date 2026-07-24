@@ -386,25 +386,85 @@ function parseRetryAfter(description) {
   return m ? Number(m[1]) * 1000 : 0;
 }
 
-async function sendPlain(chatId, threadId, text) {
-  const MAX = 4000;
+// Split text on newline boundaries so each piece fits Telegram's 4096-char message cap.
+function chunkText(text, max = 4000) {
   let rest = text;
   const chunks = [];
-  while (rest.length > MAX) {
-    let cut = rest.lastIndexOf('\n', MAX);
-    if (cut < MAX * 0.5) cut = MAX;
+  while (rest.length > max) {
+    let cut = rest.lastIndexOf('\n', max);
+    if (cut < max * 0.5) cut = max;
     chunks.push(rest.slice(0, cut));
     rest = rest.slice(cut).replace(/^\s+/, '');
   }
   if (rest) chunks.push(rest);
+  return chunks;
+}
+
+async function sendPlain(chatId, threadId, text) {
   let allSent = true;
-  for (const c of chunks) {
+  for (const c of chunkText(text)) {
     try {
       const r = await telegramRequest('sendMessage', { chat_id: chatId, message_thread_id: threadId, text: c });
       if (!r || !r.ok) allSent = false;
     } catch (e) { console.error('sendPlain error:', e.code || e.message || String(e)); allSent = false; }
   }
   return allSent;   // callers that mirror content use this to avoid advancing past unsent lines
+}
+
+// sendPlain's cousin: attaches reply_markup to the LAST chunk and returns that message's id so the
+// caller can strip the markup off it later. Returns { allSent, lastMessageId }.
+async function postWithMarkup(chatId, threadId, text, replyMarkup) {
+  const chunks = chunkText(text);
+  let allSent = true, lastMessageId = null;
+  for (let i = 0; i < chunks.length; i++) {
+    const payload = { chat_id: chatId, message_thread_id: threadId, text: chunks[i] };
+    if (replyMarkup && i === chunks.length - 1) payload.reply_markup = replyMarkup;
+    try {
+      const r = await telegramRequest('sendMessage', payload);
+      if (!r || !r.ok) allSent = false;
+      else if (r.result) lastMessageId = r.result.message_id;
+    } catch (e) { console.error('postWithMarkup error:', e.code || e.message || String(e)); allSent = false; }
+  }
+  return { allSent, lastMessageId };
+}
+
+// --- Inline action buttons: pure builders + parser --------------------------
+// Reuses the existing callback_query plumbing (the `ap:` approval prefix) with an `act:` family.
+const ACTION_RE = /^act:(desk|rename|exit|resume):(.+)$/;
+function parseActionCallback(data) {
+  const m = ACTION_RE.exec(data || '');
+  return m ? { action: m[1], sid: m[2] } : null;
+}
+
+// The per-session action bar that rides each mirrored prose message: one tap to hand back to the
+// desk, regenerate the name, or close the topic. Full session id fits callback_data (<=64 bytes).
+function buildSessionActionBar(sid) {
+  if (!sid) return null;
+  return { inline_keyboard: [[
+    { text: '🖥️ Desk',   callback_data: `act:desk:${sid}` },
+    { text: '✏️ Rename', callback_data: `act:rename:${sid}` },
+    { text: '❌ Close',  callback_data: `act:exit:${sid}` },
+  ]] };
+}
+
+// One tappable row per recent session for the /sessions picker; tapping links this topic to it.
+function buildSessionPickerKeyboard(sessions, max = 12) {
+  const rows = sessions.slice(0, max).map((s) => [{
+    text: `${(s.label || s.id).slice(0, 48)} · ${relTime(s.mtime)}`,
+    callback_data: `act:resume:${s.id}`,
+  }]);
+  return rows.length ? { inline_keyboard: rows } : null;
+}
+
+// Only the newest mirrored message per session should carry the action bar. Track the last one so
+// its markup can be cleared when a newer message takes over (editMessageReplyMarkup with []).
+const lastBar = new Map();   // sessionId -> { chatId, messageId }
+async function clearPrevBar(sid) {
+  const b = lastBar.get(sid);
+  if (!b) return;
+  await telegramRequest('editMessageReplyMarkup',
+    { chat_id: b.chatId, message_id: b.messageId, reply_markup: { inline_keyboard: [] } }).catch(() => {});
+  lastBar.delete(sid);
 }
 
 function startTyping(chatId, threadId) {
@@ -1761,4 +1821,5 @@ module.exports = {
   createModuleRegistry,
   resolveModulePath, loadModules,
   buildSpawnArgs, spawnSession, buildModuleApi,
+  chunkText, parseActionCallback, buildSessionActionBar, buildSessionPickerKeyboard,
 };
