@@ -377,9 +377,22 @@ test('migrateLegacy: does not overwrite an existing link', () => {
 // ---------------------------------------------------------------------------
 // Topic naming / opener formatting
 // ---------------------------------------------------------------------------
-test('topicName: slugifies the label, falls back to short id', () => {
-  assert.equal(g.topicName({ id: 'abcdef12-0000', label: 'Fix login' }), '🤖 fix-login');
-  assert.match(g.topicName({ id: 'abcdef12-0000', label: '' }), /^🤖 claude-abcdef$/);
+test('topicName: slugifies the label as plain text (icon carried separately), falls back to short id', () => {
+  assert.equal(g.topicName({ id: 'abcdef12-0000', label: 'Fix login' }), 'fix-login');
+  assert.equal(g.topicName({ id: 'abcdef12-0000', label: 'weekly review' }), 'weekly-review');
+  assert.match(g.topicName({ id: 'abcdef12-0000', label: '' }), /^claude-abcdef$/);
+});
+test('pickIcon: keyword match wins with a real custom-emoji id, 🤖 default otherwise', () => {
+  const bug = g.pickIcon('fix the login crash');
+  assert.equal(bug.emoji, '🦠');
+  assert.match(bug.id, /^\d+$/);          // a real getForumTopicIconStickers id
+  assert.equal(g.pickIcon('deploy to fly').emoji, '🏁');
+  assert.equal(g.pickIcon('sort the gmail inbox').emoji, '💬');
+  assert.equal(g.pickIcon('quarterly budget').emoji, '💰');
+  assert.equal(g.pickIcon('chat about the weather').emoji, '🤖');
+  assert.equal(g.pickIcon('chat about the weather').id, '5309832892262654231');
+  assert.equal(g.pickIcon('').emoji, '🤖');
+  assert.equal(g.pickEmoji('fix the login crash'), '🦠');   // back-compat shim
 });
 test('openerText: mentions the session id and the cr resume hint', () => {
   const t = g.openerText({ id: 'abcdef12-3456', label: 'Fix login', mtime: Date.now() });

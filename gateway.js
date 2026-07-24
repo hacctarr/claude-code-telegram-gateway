@@ -114,6 +114,12 @@ const STALL_NOTICE_MS = config.STALL_NOTICE_SECONDS === 0 ? 0 : (config.STALL_NO
 // auto-denying. Unanswered requests deny after this timeout so turns can't hang forever.
 const PHONE_APPROVALS = PERM_MODE !== 'bypassPermissions';
 const APPROVAL_TIMEOUT_MS = (config.APPROVAL_TIMEOUT_SECONDS || 300) * 1000;
+// Auto-approve: answer every tool-permission request with "allow" instead of posting Allow/Deny
+// buttons. For machines that can't run bypassPermissions (managed policy) but still want
+// hands-off phone driving. The `deny` list still short-circuits upstream — a denied tool never
+// reaches this handler — so this only ever rubber-stamps ask-bucket tools. One audit line per
+// approval keeps a runaway session visible.
+const AUTO_APPROVE = config.AUTO_APPROVE === true;
 // /desk opens a topic's session in the desktop editor. Template's {session} is the session id.
 // Default targets the Claude Code VS Code extension; Cursor/Windsurf users can swap the scheme.
 const DESK_URL_TEMPLATE = config.DESK_URL_TEMPLATE || 'vscode://anthropic.claude-code/open?session={session}';
@@ -444,8 +450,10 @@ async function sendApprovalRequest(chatId, threadId, toolName, summary, approval
 
 // Returns { threadId, retryAfterMs }. threadId is null on failure; callers that create topics
 // on a timer use retryAfterMs to back off instead of retrying on the very next tick.
-async function createForumTopic(chatId, name) {
-  const r = await telegramRequest('createForumTopic', { chat_id: chatId, name: name.slice(0, 128) })
+async function createForumTopic(chatId, name, iconId = null) {
+  const params = { chat_id: chatId, name: name.slice(0, 128) };
+  if (iconId) params.icon_custom_emoji_id = iconId;
+  const r = await telegramRequest('createForumTopic', params)
     .catch((e) => ({ ok: false, description: e.message }));
   if (!r.ok) {
     console.error(`[Topic] createForumTopic failed (${r.description || 'unknown'}). Bot needs admin + Manage Topics.`);
@@ -473,9 +481,12 @@ function createTopicCooldown(baseMs = TOPIC_RETRY_BASE_MS, maxMs = TOPIC_RETRY_M
   };
 }
 const topicCooldown = createTopicCooldown();
-const editForumTopic = (chatId, threadId, name) =>
-  telegramRequest('editForumTopic', { chat_id: chatId, message_thread_id: threadId, name: name.slice(0, 128) })
+const editForumTopic = (chatId, threadId, name, iconId) => {
+  const params = { chat_id: chatId, message_thread_id: threadId, name: name.slice(0, 128) };
+  if (iconId) params.icon_custom_emoji_id = iconId;
+  return telegramRequest('editForumTopic', params)
     .catch((e) => ({ ok: false, description: e.message }));
+};
 const closeForumTopic = (chatId, threadId) => telegramRequest('closeForumTopic', { chat_id: chatId, message_thread_id: threadId }).catch(() => {});
 const reopenForumTopic = (chatId, threadId) => telegramRequest('reopenForumTopic', { chat_id: chatId, message_thread_id: threadId }).catch(() => {});
 const deleteForumTopic = (chatId, threadId) => telegramRequest('deleteForumTopic', { chat_id: chatId, message_thread_id: threadId }).catch(() => {});
@@ -906,6 +917,12 @@ async function driveTurn(chatId, threadId, prompt, resolveSession) {
   // Non-bypass modes: tool-permission prompts become Allow/Deny buttons in this topic.
   const onPermission = PHONE_APPROVALS ? (async (req) => {
     const summary = summarizeToolInput(req.tool_name, req.input);
+    // Auto-approve: say yes without posting buttons. Denied tools never reach here (deny resolves
+    // upstream of the prompt tool), so this only allows ask-bucket tools. Audit line, no keyboard.
+    if (AUTO_APPROVE) {
+      sendPlain(chatId, threadId, `✅ auto-allowed: ${req.tool_name}${summary ? ': ' + summary : ''}`);
+      return { behavior: 'allow', updatedInput: req.input };
+    }
     const { id, promise } = approvals.create({ chatId, threadId }, APPROVAL_TIMEOUT_MS);
     const msgId = await sendApprovalRequest(chatId, threadId, req.tool_name, summary, id);
     const res = await promise;
@@ -1012,6 +1029,42 @@ function slugify(s) {
   return (s || '').toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').split('-').filter(Boolean).slice(0, 4).join('-').slice(0, 32);
 }
 
+// Pick a topic icon from the work's content. Telegram's real topic-icon slot
+// (icon_custom_emoji_id) only accepts emoji from a fixed sticker set — the ids below are from
+// getForumTopicIconStickers (getForumTopicIconStickers.js reprints the full set). Each rule pairs
+// the display emoji with the matching custom_emoji_id so the real icon and any text fallback agree.
+// First match wins, so order most-specific first; 🤖 is the neutral default.
+const DEFAULT_ICON = { emoji: '🤖', id: '5309832892262654231' };
+const ICON_RULES = [
+  [/\b(bug|fix|broken|crash|error|fail|regress|debug)/, '🦠', '5312424913615723286'],
+  [/\b(test|spec|assert|coverage|e2e)/,                 '🧪', '5411138633765757782'],
+  [/\b(refactor|cleanup|clean-?up|tidy|dedup)/,         '🧼', '5377468357907849200'],
+  [/\b(perf|performance|optimi|speed|latency|token-?burn|cost)/, '⚡️', '5312016608254762256'],
+  [/\b(deploy|release|ship|publish|launch|rollout)/,    '🏁', '5408906741125490282'],
+  [/\b(secur|auth|login|credential|password|oauth|vuln)/, '🪪', '5418115271267197333'],
+  [/\b(api|endpoint|http|webhook|route|server|git|commit|branch|merge|\bpr\b)/, '💻', '5350554349074391003'],
+  [/\b(ui|ux|css|style|layout|design|frontend|button)/, '🎨', '5310039132297242441'],
+  [/\b(mail|email|gmail|inbox)/,                        '💬', '5417915203100613993'],
+  [/\b(chart|graph|data|analytic|report|metric|stat|dashboard)/, '📈', '5350305691942788490'],
+  [/\b(money|finance|invoice|bill|payment|tax|budget|copilot)/, '💰', '5350452584119279096'],
+  [/\b(schedul|cron|timer|calendar|remind)/,            '📆', '5433614043006903194'],
+  [/\b(db|database|sql|sqlite|migrat|schema|query)/,    '📚', '5350481781306958339'],
+  [/\b(search|find|grep|lookup|explore|research)/,      '🔎', '5309965701241379366'],
+  [/\b(doc|docs|readme|write-?up|guide|note|summary)/,  '📝', '5373251851074415873'],
+  [/\b(property|home|house|mortgage|hoa|barwick|evolene)/, '🏠', '5312486108309757006'],
+  [/\b(travel|flight|hotel|trip|italy|hawaii|vacation)/, '✈️', '5348436127038579546'],
+  [/\b(car|vehicle|tesla|bmw|cybertruck|suburban)/,     '🚗', '5312322066328853156'],
+  [/\b(school|college|grade|homework|tuition)/,         '🎓', '5357419403325481346'],
+  [/\b(medical|doctor|health|prescription|\brx\b|dental)/, '🩺', '5350307998340226571'],
+  [/\b(file|upload|download|attach|organi|rename|sort)/, '📁', '5357315181649076022'],
+];
+function pickIcon(text) {
+  const t = (text || '').toLowerCase();
+  for (const [re, emoji, id] of ICON_RULES) if (re.test(t)) return { emoji, id };
+  return DEFAULT_ICON;
+}
+function pickEmoji(text) { return pickIcon(text).emoji; }
+
 // argv for the throwaway titling turn. Every flag here exists to keep a three-word slug from
 // costing a full agent turn: without them the child inherits the user's entire MCP surface,
 // skills index, settings and CLAUDE.md. Measured on a real install: 63,720 tokens with none of
@@ -1055,11 +1108,12 @@ function generateTitle(firstMsg, recentMsg) {
   });
 }
 
-// Sync fallback namer (also used in tests).
+// Sync fallback namer (also used in tests). The topic's visual now comes from its custom-emoji
+// icon (see pickIcon / resolveTopicName), so the name itself is plain text — no emoji prefix.
 function topicName(info) {
   const name = TITLE_MODE === 'first-message' ? slugify(info.label) : sessionNameById(info.id);
-  if (name) return `🤖 ${name}`;
-  return info.label ? `🤖 ${slugify(info.label)}` : `🤖 claude-${info.id.slice(0, 6)}`;
+  if (name) return name;
+  return info.label ? slugify(info.label) : `claude-${info.id.slice(0, 6)}`;
 }
 
 // A topic is named at creation, when the session is usually one message old — which is how you
@@ -1087,15 +1141,20 @@ function dueForRename(link, threshold = RENAME_AFTER_TURNS) {
 // Async resolver used at topic creation — generates a slug when TITLE_MODE=generated.
 // Generated slugs are cached per session: a topic creation that fails and is later retried
 // must not pay for the titling turn twice.
-const titleCache = new Map();   // sessionId -> "🤖 slug"
+// Returns { name, iconId } — the plain topic name plus the custom-emoji icon id to render beside it.
+const titleCache = new Map();   // sessionId -> { name, iconId }
 async function resolveTopicName(info) {
   if (TITLE_MODE === 'generated') {
     if (titleCache.has(info.id)) return titleCache.get(info.id);
     const { lastUser } = lastExchange(info.path);
     const slug = await generateTitle(info.label, lastUser);
-    if (slug) { const n = `🤖 ${slug}`; titleCache.set(info.id, n); return n; }
+    if (slug) {
+      const r = { name: slug, iconId: pickIcon(`${info.label || ''} ${slug} ${lastUser || ''}`).id };
+      titleCache.set(info.id, r);
+      return r;
+    }
   }
-  return topicName(info);
+  return { name: topicName(info), iconId: pickIcon(info.label).id };
 }
 function openerText(info) {
   const name = sessionNameById(info.id);
@@ -1112,7 +1171,8 @@ async function ensureTopicForSession(info) {
   const chatId = repoToChat[info.cwd];
   if (!chatId || !AUTO_CREATE_TOPICS) return null;
   if (topicCooldown.blocked(info.id)) return null;   // backing off from a recent failure
-  const { threadId, retryAfterMs } = await createForumTopic(chatId, await resolveTopicName(info));
+  const { name, iconId } = await resolveTopicName(info);
+  const { threadId, retryAfterMs } = await createForumTopic(chatId, name, iconId);
   if (!threadId) {
     const { fails, until } = topicCooldown.fail(info.id, retryAfterMs);
     console.error(`[Topic] backing off ${info.id.slice(0, 8)} for ${Math.round((until - Date.now()) / 1000)}s (failure #${fails})`);
@@ -1147,9 +1207,9 @@ async function renameTopicFromContent(sessionId, link, file) {
     const info = await readSessionInfo(file || sessionFileById(sessionId));
     if (!info) return null;
     titleCache.delete(sessionId);       // force a fresh slug rather than reusing the creation-time one
-    const name = await resolveTopicName(info);
+    const { name, iconId } = await resolveTopicName(info);
     if (!name) return null;
-    const r = await editForumTopic(link.chatId, link.threadId, name);
+    const r = await editForumTopic(link.chatId, link.threadId, name, iconId);
     if (!r || !r.ok) {
       console.error(`[Topic] rename failed for ${sessionId.slice(0, 8)} (${(r && r.description) || 'unknown'})`);
       return null;
@@ -1385,7 +1445,7 @@ async function pollUpdates() {
           if (!link) { sendPlain(chatId, threadId, "No session is linked to this topic yet — send a message first."); continue; }
           const explicit = text.slice(7).trim();
           if (explicit) {
-            const r = await editForumTopic(chatId, threadId, `🤖 ${slugify(explicit) || explicit.slice(0, 40)}`);
+            const r = await editForumTopic(chatId, threadId, slugify(explicit) || explicit.slice(0, 40), pickIcon(explicit).id);
             sendPlain(chatId, threadId, r && r.ok ? `✏️ Renamed.` : `⚠️ Rename failed (${(r && r.description) || 'unknown'}).`);
             continue;
           }
@@ -1412,7 +1472,7 @@ async function pollUpdates() {
         // /new <message> — brand-new session in its own new topic.
         if (text.startsWith('/new ')) {
           const firstMsg = text.substring(5).trim();
-          const { threadId: newThread } = await createForumTopic(chatId, `🤖 ${firstMsg.slice(0, 50)}`);
+          const { threadId: newThread } = await createForumTopic(chatId, firstMsg.slice(0, 50), pickIcon(firstMsg).id);
           if (!newThread) { sendPlain(chatId, threadId, "⚠️ Couldn't create a topic — grant the bot admin + Manage Topics."); continue; }
           scheduleDrive(chatId, newThread, firstMsg, null);
           sendPlain(chatId, threadId, "🆕 New session started in its own topic.");
@@ -1539,7 +1599,7 @@ if (require.main === module) {
   console.log("🚀 CLAUDE CODE MULTI-SESSION TELEGRAM GATEWAY");
   console.log("=============================================");
   console.log(`Allowed admins: ${ALLOWED_USER_IDS.length} · repos: ${Object.keys(REPO_MAPPINGS).length}`);
-  console.log(`Permission mode: ${PERM_MODE}${MODEL ? ` · model: ${MODEL}` : ''} · tools: ${SHOW_TOOLS ? 'on' : 'off'}`);
+  console.log(`Permission mode: ${PERM_MODE}${AUTO_APPROVE ? ' · auto-approve: ON' : ''}${MODEL ? ` · model: ${MODEL}` : ''} · tools: ${SHOW_TOOLS ? 'on' : 'off'}`);
   console.log(`Mirror: ${MIRROR ? 'on' : 'off'} · auto-topics: ${AUTO_CREATE_TOPICS ? 'on' : 'off'} · prune: ${PRUNE_MODE} after ${PRUNE_AFTER_MS / 86400000}d`);
   console.log(`Restored ${Object.keys(linkBySession).length} linked session(s). Poll ${POLL_MS}ms.`);
   console.log("Listening for Topic messages + mirroring desk sessions...");
@@ -1552,7 +1612,7 @@ module.exports = {
   LiveMessage, summarizeToolInput, createFeed, renderTranscriptLine, splitReadout, readNewLines,
   listSessions, matchSessions, readSessionInfo, relTime, formatSessionList,
   isActive, shouldPrune, isDeskBusy, invertRepoMappings, splitThreadKey, buildThreadIndex,
-  migrateLegacy, topicName, openerText, shouldAutoCreate, loadIgnored, persistIgnored, persisted, deskUrl,
+  migrateLegacy, topicName, pickEmoji, pickIcon, openerText, shouldAutoCreate, loadIgnored, persistIgnored, persisted, deskUrl,
   lastExchange, sessionNameById, heldByOtherPids, updatePendingTools, dueStallNotices, createApprovalRegistry,
   titleArgs, createTopicCooldown, parseRetryAfter, updateSocketTimeoutMs, UPDATE_POLL_TIMEOUT_S,
   STATE_DIR, STATE_FILES, migrateStateFiles, statePath,
