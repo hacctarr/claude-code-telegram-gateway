@@ -336,12 +336,12 @@ test('readNewLines: multi-byte content keeps byte offsets correct', () => {
 // ---------------------------------------------------------------------------
 // Activity windows
 // ---------------------------------------------------------------------------
-test('isActive / shouldPrune / isDeskBusy boundaries (defaults 30m / 7d / 15s)', () => {
+test('isActive / shouldPrune / isDeskBusy boundaries (defaults 30m / 1d / 15s)', () => {
   const now = Date.now();
   assert.equal(g.isActive(now - 60_000, now), true);           // 1m ago -> active
   assert.equal(g.isActive(now - 40 * 60_000, now), false);      // 40m ago -> not
-  assert.equal(g.shouldPrune(now - 3 * 86400_000, now), false); // 3d -> keep
-  assert.equal(g.shouldPrune(now - 8 * 86400_000, now), true);  // 8d -> prune
+  assert.equal(g.shouldPrune(now - 12 * 3600_000, now), false); // 12h -> keep
+  assert.equal(g.shouldPrune(now - 2 * 86400_000, now), true);  // 2d -> prune
   assert.equal(g.isDeskBusy(now - 5_000, now), true);           // 5s -> busy
   assert.equal(g.isDeskBusy(now - 60_000, now), false);         // 60s -> idle
 });
@@ -394,11 +394,22 @@ test('pickIcon: keyword match wins with a real custom-emoji id, 🤖 default oth
   assert.equal(g.pickIcon('').emoji, '🤖');
   assert.equal(g.pickEmoji('fix the login crash'), '🦠');   // back-compat shim
 });
-test('openerText: mentions the session id and the cr resume hint', () => {
+test('openerText: minimal (default) is one identifying line, no how-it-works paragraph', () => {
   const t = g.openerText({ id: 'abcdef12-3456', label: 'Fix login', mtime: Date.now() });
   assert.match(t, /abcdef12/);
-  assert.match(t, /cr/);
   assert.match(t, /Fix login/);
+  assert.match(t, /mirroring live/);
+  assert.doesNotMatch(t, /\bcr\b/);        // no resume paragraph in minimal
+  assert.ok(!t.includes('\n'), 'minimal opener is a single line');
+});
+test('openerText: full mode keeps the how-it-works paragraph and cr hint', () => {
+  const t = g.openerText({ id: 'abcdef12-3456', label: 'Fix login', mtime: Date.now() }, 'full');
+  assert.match(t, /abcdef12/);
+  assert.match(t, /cr/);
+  assert.match(t, /mirrors the desk session live/);
+});
+test('openerText: off mode posts nothing', () => {
+  assert.equal(g.openerText({ id: 'abcdef12-3456', label: 'x', mtime: Date.now() }, 'off'), '');
 });
 
 // ---------------------------------------------------------------------------
@@ -852,4 +863,112 @@ test('doctor: a process merely referencing gateway.js.log does not count as runn
     assert.ok(!/<- running/.test(out),
       'a substring match on gateway.js.log must not mark the install as running');
   } finally { child.kill('SIGKILL'); }
+});
+
+// --- Inline action buttons (Task 1) ----------------------------------------
+test('chunkText: short text is a single chunk', () => {
+  assert.deepEqual(g.chunkText('hello'), ['hello']);
+});
+
+test('chunkText: splits on a newline near the limit', () => {
+  const a = 'a'.repeat(3000);
+  const b = 'b'.repeat(2000);
+  const chunks = g.chunkText(`${a}\n${b}`, 4000);
+  assert.equal(chunks.length, 2);
+  assert.equal(chunks[0], a);
+  assert.equal(chunks[1], b);
+});
+
+test('chunkText: empty string yields no chunks', () => {
+  assert.deepEqual(g.chunkText(''), []);
+});
+
+test('parseActionCallback: extracts action and session id', () => {
+  assert.deepEqual(g.parseActionCallback('act:desk:abc-123'), { action: 'desk', sid: 'abc-123' });
+  assert.deepEqual(g.parseActionCallback('act:resume:11111111-2222-3333-4444-555555555555'),
+    { action: 'resume', sid: '11111111-2222-3333-4444-555555555555' });
+});
+
+test('parseActionCallback: rejects non-act and unknown actions', () => {
+  assert.equal(g.parseActionCallback('ap:5:1'), null);
+  assert.equal(g.parseActionCallback('act:frobnicate:x'), null);
+  assert.equal(g.parseActionCallback('act:desk:'), null);
+  assert.equal(g.parseActionCallback(''), null);
+  assert.equal(g.parseActionCallback(undefined), null);
+});
+
+test('buildSessionActionBar: three buttons with act: callbacks', () => {
+  const sid = '11111111-2222-3333-4444-555555555555';
+  const bar = g.buildSessionActionBar(sid);
+  const row = bar.inline_keyboard[0];
+  assert.equal(row.length, 3);
+  assert.deepEqual(row.map((b) => b.callback_data),
+    [`act:desk:${sid}`, `act:rename:${sid}`, `act:exit:${sid}`]);
+  for (const b of row) assert.ok(Buffer.byteLength(b.callback_data) <= 64);
+});
+
+test('buildSessionActionBar: null when sid is falsy', () => {
+  assert.equal(g.buildSessionActionBar(''), null);
+  assert.equal(g.buildSessionActionBar(undefined), null);
+});
+
+test('buildSessionPickerKeyboard: one row per session, callbacks within 64 bytes', () => {
+  const sessions = [
+    { id: '11111111-2222-3333-4444-555555555555', label: 'fix the parser', mtime: Date.now() },
+    { id: '99999999-8888-7777-6666-555555555555', label: 'write docs', mtime: Date.now() - 3600_000 },
+  ];
+  const kb = g.buildSessionPickerKeyboard(sessions);
+  assert.equal(kb.inline_keyboard.length, 2);
+  assert.equal(kb.inline_keyboard[0][0].callback_data, `act:resume:${sessions[0].id}`);
+  for (const row of kb.inline_keyboard) assert.ok(Buffer.byteLength(row[0].callback_data) <= 64);
+});
+
+test('buildSessionPickerKeyboard: caps at max rows and returns null when empty', () => {
+  const many = Array.from({ length: 20 }, (_, i) => ({ id: `id-${i}`, label: `s${i}`, mtime: Date.now() }));
+  assert.equal(g.buildSessionPickerKeyboard(many, 12).inline_keyboard.length, 12);
+  assert.equal(g.buildSessionPickerKeyboard([]), null);
+});
+
+// --- Group auto-config: pure helpers (Task 3) ------------------------------
+test('buildCommandList: six commands, lowercase names, non-empty descriptions', () => {
+  const cmds = g.buildCommandList();
+  assert.equal(cmds.length, 6);
+  assert.deepEqual(cmds.map((c) => c.command), ['new', 'sessions', 'desk', 'rename', 'exit', 'resume']);
+  for (const c of cmds) {
+    assert.match(c.command, /^[a-z]+$/);
+    assert.ok(c.description.length > 0 && c.description.length <= 256);
+  }
+});
+
+test('appearanceHash: stable for same input, changes when any field changes', () => {
+  const a = g.appearanceHash({ title: 'x', description: 'y', photoSha: 'z', commands: g.buildCommandList() });
+  const b = g.appearanceHash({ title: 'x', description: 'y', photoSha: 'z', commands: g.buildCommandList() });
+  const c = g.appearanceHash({ title: 'x', description: 'CHANGED', photoSha: 'z', commands: g.buildCommandList() });
+  assert.equal(a, b);
+  assert.notEqual(a, c);
+});
+
+test('resolveBotProfile: nulls when unset, values when set', () => {
+  assert.deepEqual(g.resolveBotProfile({}), { name: null, about: null, description: null });
+  assert.deepEqual(
+    g.resolveBotProfile({ bot_name: 'N', bot_about: 'A', bot_description: 'D' }),
+    { name: 'N', about: 'A', description: 'D' });
+});
+
+test('resolveChatAppearance: pulls the per-chat entry, defaults title/description to null', () => {
+  const appearance = { chats: { '-100': { title: 'T', description: 'D' } } };
+  const r = g.resolveChatAppearance(appearance, '-100', 'sha123');
+  assert.equal(r.title, 'T');
+  assert.equal(r.description, 'D');
+  assert.equal(r.photoSha, 'sha123');
+  assert.equal(r.commands.length, 6);
+  const missing = g.resolveChatAppearance(appearance, '-999', '');
+  assert.equal(missing.title, null);
+  assert.equal(missing.description, null);
+});
+
+test('chatPhotoPath: per-chat overrides default, null when neither set', () => {
+  assert.equal(g.chatPhotoPath({ default_photo_path: 'd.png', chats: {} }, '-1'), 'd.png');
+  assert.equal(g.chatPhotoPath({ default_photo_path: 'd.png', chats: { '-1': { photo_path: 'c.png' } } }, '-1'), 'c.png');
+  assert.equal(g.chatPhotoPath({ chats: {} }, '-1'), null);
 });

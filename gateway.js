@@ -83,10 +83,19 @@ const MIRROR = config.MIRROR !== false;
 const AUTO_CREATE_TOPICS = config.AUTO_CREATE_TOPICS !== false;
 const IDLE_INJECT_MS = (config.IDLE_INJECT_SECONDS || 15) * 1000;
 const ACTIVE_WINDOW_MS = (config.ACTIVE_WINDOW_MIN || 30) * 60_000;
-const PRUNE_AFTER_MS = (config.PRUNE_AFTER_DAYS || 7) * 86_400_000;
+const PRUNE_AFTER_MS = (config.PRUNE_AFTER_DAYS || 1) * 86_400_000;
 const PRUNE_MODE = config.PRUNE_MODE || 'close';   // "close" | "delete"
 const POLL_MS = config.POLL_MS || 2000;
 const MIRROR_FLUSH_MS = config.MIRROR_FLUSH_MS || 4000;  // min gap between mirror posts per topic
+// Inline action buttons: attach a per-session action bar (Desk / Rename / Close) to each mirrored
+// prose message, and render /sessions as a tap-to-link picker. false → no reply_markup is attached
+// and the act: callback router answers "buttons disabled" (slash commands still work).
+const BUTTONS = config.BUTTONS !== false;
+// Topic opener — the first message posted into a freshly created topic. In a forum, a topic's
+// first message renders at the very top, so a long opener reads like an auto-pinned banner on
+// every new topic. "minimal" (default) is one identifying line; "full" adds the how-it-works
+// paragraph + a "where it left off" seed; "off" posts nothing and the topic just starts mirroring.
+const TOPIC_OPENER = config.TOPIC_OPENER || 'minimal';   // "off" | "minimal" | "full"
 // How to name topics: "first-message" = the opening prompt (free, the default);
 // "session-name" = Claude's derived name (documents-14); "generated" = a short AI slug.
 // "generated" spawns a real Claude turn per topic-creation ATTEMPT. Even fully isolated
@@ -124,6 +133,11 @@ const AUTO_APPROVE = config.AUTO_APPROVE === true;
 // Default targets the Claude Code VS Code extension; Cursor/Windsurf users can swap the scheme.
 const DESK_URL_TEMPLATE = config.DESK_URL_TEMPLATE || 'vscode://anthropic.claude-code/open?session={session}';
 const DESK_OPEN_CMD = config.DESK_OPEN_CMD || 'open';   // macOS `open`; Linux users: "xdg-open"
+// Group auto-config: on boot, apply the group's title/description/photo, the bot's global
+// name/about/description, and the command menu, idempotently (per-scope hash in appearance.json).
+// APPEARANCE carries only what should differ from the live objects; unset fields are left untouched.
+const AUTO_CONFIGURE_GROUP = config.AUTO_CONFIGURE_GROUP !== false;
+const APPEARANCE = config.APPEARANCE || null;
 
 // repoDir (resolved) -> chatId, so a session's cwd tells us which supergroup owns it.
 function invertRepoMappings(mappings) {
@@ -381,25 +395,85 @@ function parseRetryAfter(description) {
   return m ? Number(m[1]) * 1000 : 0;
 }
 
-async function sendPlain(chatId, threadId, text) {
-  const MAX = 4000;
+// Split text on newline boundaries so each piece fits Telegram's 4096-char message cap.
+function chunkText(text, max = 4000) {
   let rest = text;
   const chunks = [];
-  while (rest.length > MAX) {
-    let cut = rest.lastIndexOf('\n', MAX);
-    if (cut < MAX * 0.5) cut = MAX;
+  while (rest.length > max) {
+    let cut = rest.lastIndexOf('\n', max);
+    if (cut < max * 0.5) cut = max;
     chunks.push(rest.slice(0, cut));
     rest = rest.slice(cut).replace(/^\s+/, '');
   }
   if (rest) chunks.push(rest);
+  return chunks;
+}
+
+async function sendPlain(chatId, threadId, text) {
   let allSent = true;
-  for (const c of chunks) {
+  for (const c of chunkText(text)) {
     try {
       const r = await telegramRequest('sendMessage', { chat_id: chatId, message_thread_id: threadId, text: c });
       if (!r || !r.ok) allSent = false;
     } catch (e) { console.error('sendPlain error:', e.code || e.message || String(e)); allSent = false; }
   }
   return allSent;   // callers that mirror content use this to avoid advancing past unsent lines
+}
+
+// sendPlain's cousin: attaches reply_markup to the LAST chunk and returns that message's id so the
+// caller can strip the markup off it later. Returns { allSent, lastMessageId }.
+async function postWithMarkup(chatId, threadId, text, replyMarkup) {
+  const chunks = chunkText(text);
+  let allSent = true, lastMessageId = null;
+  for (let i = 0; i < chunks.length; i++) {
+    const payload = { chat_id: chatId, message_thread_id: threadId, text: chunks[i] };
+    if (replyMarkup && i === chunks.length - 1) payload.reply_markup = replyMarkup;
+    try {
+      const r = await telegramRequest('sendMessage', payload);
+      if (!r || !r.ok) allSent = false;
+      else if (r.result) lastMessageId = r.result.message_id;
+    } catch (e) { console.error('postWithMarkup error:', e.code || e.message || String(e)); allSent = false; }
+  }
+  return { allSent, lastMessageId };
+}
+
+// --- Inline action buttons: pure builders + parser --------------------------
+// Reuses the existing callback_query plumbing (the `ap:` approval prefix) with an `act:` family.
+const ACTION_RE = /^act:(desk|rename|exit|resume):(.+)$/;
+function parseActionCallback(data) {
+  const m = ACTION_RE.exec(data || '');
+  return m ? { action: m[1], sid: m[2] } : null;
+}
+
+// The per-session action bar that rides each mirrored prose message: one tap to hand back to the
+// desk, regenerate the name, or close the topic. Full session id fits callback_data (<=64 bytes).
+function buildSessionActionBar(sid) {
+  if (!sid) return null;
+  return { inline_keyboard: [[
+    { text: '🖥️ Desk',   callback_data: `act:desk:${sid}` },
+    { text: '✏️ Rename', callback_data: `act:rename:${sid}` },
+    { text: '❌ Close',  callback_data: `act:exit:${sid}` },
+  ]] };
+}
+
+// One tappable row per recent session for the /sessions picker; tapping links this topic to it.
+function buildSessionPickerKeyboard(sessions, max = 12) {
+  const rows = sessions.slice(0, max).map((s) => [{
+    text: `${(s.label || s.id).slice(0, 48)} · ${relTime(s.mtime)}`,
+    callback_data: `act:resume:${s.id}`,
+  }]);
+  return rows.length ? { inline_keyboard: rows } : null;
+}
+
+// Only the newest mirrored message per session should carry the action bar. Track the last one so
+// its markup can be cleared when a newer message takes over (editMessageReplyMarkup with []).
+const lastBar = new Map();   // sessionId -> { chatId, messageId }
+async function clearPrevBar(sid) {
+  const b = lastBar.get(sid);
+  if (!b) return;
+  await telegramRequest('editMessageReplyMarkup',
+    { chat_id: b.chatId, message_id: b.messageId, reply_markup: { inline_keyboard: [] } }).catch(() => {});
+  lastBar.delete(sid);
 }
 
 function startTyping(chatId, threadId) {
@@ -1272,9 +1346,13 @@ async function resolveTopicName(info) {
   }
   return { name: topicName(info), iconId: pickIcon(info.label).id };
 }
-function openerText(info) {
-  const name = sessionNameById(info.id);
-  return `🤖 Session ${name || info.id.slice(0, 8)}` +
+function openerText(info, mode = TOPIC_OPENER) {
+  const name = sessionNameById(info.id) || info.id.slice(0, 8);
+  if (mode === 'off') return '';
+  if (mode === 'minimal') {
+    return `🤖 ${name}${info.label ? ` · “${info.label}”` : ''} · mirroring live`;
+  }
+  return `🤖 Session ${name}` +
     (info.label ? `\n“${info.label}”` : '') +
     `\nLast active ${relTime(info.mtime)}.\n\n` +
     `This topic mirrors the desk session live. Reply here to steer it — your message runs when the ` +
@@ -1303,12 +1381,16 @@ async function ensureTopicForSession(info) {
   linkBySession[info.id] = { chatId, threadId, label: info.label || '', offset: info.size || 0, closed: false };
   sessionByThread.set(tkey, info.id);
   persistLinks();
-  await sendPlain(chatId, threadId, openerText(info));
-  // Seed the topic with where the session left off (last prompt + last response).
-  const { lastText, lastUser } = lastExchange(info.path);
-  if (lastText) {
-    await sendPlain(chatId, threadId,
-      `— where it left off —${lastUser ? `\n🖥️ desk: ${lastUser.slice(0, 400)}` : ''}\n\n${lastText}`);
+  const opener = openerText(info);
+  if (opener) await sendPlain(chatId, threadId, opener);
+  // Seed the topic with where the session left off (last prompt + last response) — only in the
+  // "full" opener mode; "minimal"/"off" keep new topics from leading with a banner-like block.
+  if (TOPIC_OPENER === 'full') {
+    const { lastText, lastUser } = lastExchange(info.path);
+    if (lastText) {
+      await sendPlain(chatId, threadId,
+        `— where it left off —${lastUser ? `\n🖥️ desk: ${lastUser.slice(0, 400)}` : ''}\n\n${lastText}`);
+    }
   }
   console.log(`[Topic] created for ${info.id.slice(0, 8)} → chat ${chatId} thread ${threadId}`);
   return linkBySession[info.id];
@@ -1363,6 +1445,53 @@ async function reviveTopic(sessionId) {
   l.closed = false;
   persistLinks();
   console.log(`[Topic] reopened session ${sessionId.slice(0, 8)}`);
+}
+
+// The /exit teardown, shared by the /exit command and the ❌ Close button. Closes (or deletes) the
+// topic, unbinds the session, and marks it superseded so the mirror won't re-topic it until the
+// desk grows the transcript again.
+async function closeSessionTopic(sid, chatId, threadId) {
+  await sendPlain(chatId, threadId, `👋 Session ${sid.slice(0, 8)} closed. It stays resumable on disk ` +
+    `(/sessions in another topic, or \`cr\` at the Mac); fresh desk activity will re-open a topic for it.`);
+  sessionByThread.delete(`${chatId}_${threadId}`);
+  delete linkBySession[sid];
+  queues.delete(sid);
+  delete pendingTools[sid];
+  lastBar.delete(sid);
+  supersededAt[sid] = sizeCurrent(sid); persistSuperseded();
+  persistLinks();
+  if (PRUNE_MODE === 'delete') await deleteForumTopic(chatId, threadId);
+  else await closeForumTopic(chatId, threadId);
+  console.log(`[Exit] closed topic ${threadId} for session ${sid.slice(0, 8)}`);
+}
+
+// Dispatch an act: button press. cb is the raw callback_query (for chat/thread + answering).
+async function handleActionCallback(act, cb) {
+  const { action, sid } = act;
+  const answer = (text) => telegramRequest('answerCallbackQuery', { callback_query_id: cb.id, text }).catch(() => {});
+  if (action === 'desk') {
+    return void answer(openOnDesk(sid) ? '🖥️ Opening on your Mac' : '⚠️ Could not open it on the Mac');
+  }
+  if (action === 'resume') {
+    const chatId = String(cb.message.chat.id);
+    const threadId = cb.message.message_thread_id;
+    await upsertLink(sid, chatId, threadId); persistLinks();
+    await answer('🔗 Linked · send a message to continue it');
+    return void sendPlain(chatId, threadId, `🔗 Topic linked to session ${sid.slice(0, 8)}. Send a message to continue it.`);
+  }
+  const link = linkBySession[sid];
+  if (!link) return void answer('That session is no longer linked.');
+  if (action === 'rename') {
+    if (TITLE_MODE !== 'generated') return void answer('Set TITLE_MODE=generated, or use /rename <name>.');
+    await answer('✏️ Regenerating name…');
+    const name = await renameTopicFromContent(sid, link, sessionFileById(sid));
+    if (name) await sendPlain(link.chatId, link.threadId, `✏️ Renamed to ${name}`);
+    return;
+  }
+  if (action === 'exit') {
+    await answer('❌ Closing…');
+    await closeSessionTopic(sid, link.chatId, link.threadId);
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -1443,10 +1572,18 @@ async function pollTick() {
           // prose last, so the response is the clean reply-to-steer target. Advance the offset only
           // if every message sent — a mid-batch network hiccup retries the whole batch next tick.
           const { activity, prose } = splitReadout(posts);
-          const messages = [activity, prose].filter((a) => a.length).map((a) => a.join('\n\n'));
           let allSent = true;
-          for (const m of messages) {
-            if (!(await sendPlain(link.chatId, link.threadId, m))) { allSent = false; break; }
+          if (activity.length) {
+            if (!(await sendPlain(link.chatId, link.threadId, activity.join('\n\n')))) allSent = false;
+          }
+          if (allSent && prose.length) {
+            const bar = BUTTONS ? buildSessionActionBar(id) : null;
+            const res = await postWithMarkup(link.chatId, link.threadId, prose.join('\n\n'), bar);
+            if (!res.allSent) allSent = false;
+            else if (bar && res.lastMessageId) {
+              await clearPrevBar(id);
+              lastBar.set(id, { chatId: link.chatId, messageId: res.lastMessageId });
+            }
           }
           if (!allSent) continue;   // keep the offset so these lines retry next tick
           lastMirrorAt.set(id, now);
@@ -1534,6 +1671,14 @@ async function pollUpdates() {
               }).catch(() => {});
             }
           }
+          const act = parseActionCallback(cb.data);
+          if (act) {
+            if (!BUTTONS) {
+              telegramRequest('answerCallbackQuery', { callback_query_id: cb.id, text: 'Buttons are disabled.' }).catch(() => {});
+            } else {
+              await handleActionCallback(act, cb);
+            }
+          }
           continue;
         }
 
@@ -1616,25 +1761,20 @@ async function pollUpdates() {
         if (text === '/exit' || text === '/close') {
           const sid = sessionByThread.get(key);
           if (!sid) { sendPlain(chatId, threadId, "This topic isn't bound to a session — nothing to close."); continue; }
-          await sendPlain(chatId, threadId, `👋 Session ${sid.slice(0, 8)} closed. It stays resumable on disk ` +
-            `(/sessions in another topic, or \`cr\` at the Mac); fresh desk activity will re-open a topic for it.`);
-          sessionByThread.delete(key);
-          delete linkBySession[sid];
-          queues.delete(sid);
-          delete pendingTools[sid];
-          supersededAt[sid] = sizeCurrent(sid); persistSuperseded();   // hidden unless the desk grows it again
-          persistLinks();
-          if (PRUNE_MODE === 'delete') await deleteForumTopic(chatId, threadId);
-          else await closeForumTopic(chatId, threadId);
-          console.log(`[Exit] closed topic ${threadId} for session ${sid.slice(0, 8)}`);
+          await closeSessionTopic(sid, chatId, threadId);
           continue;
         }
         // /sessions or bare /resume — list recent sessions.
         if (text === '/sessions' || text === '/resume') {
           const sessions = await listSessions(REPO_MAPPINGS[chatId]);
-          sendPlain(chatId, threadId, sessions.length
-            ? `🗂 Recent sessions:\n\n${formatSessionList(sessions)}\n\nReply /resume <id> to link this topic to one.`
-            : "No past Claude sessions found for this repo yet.");
+          if (!sessions.length) { sendPlain(chatId, threadId, "No past Claude sessions found for this repo yet."); continue; }
+          const kb = BUTTONS ? buildSessionPickerKeyboard(sessions) : null;
+          if (kb) {
+            await telegramRequest('sendMessage', { chat_id: chatId, message_thread_id: threadId,
+              text: '🗂 Recent sessions · tap to link this topic:', reply_markup: kb }).catch(() => {});
+          } else {
+            sendPlain(chatId, threadId, `🗂 Recent sessions:\n\n${formatSessionList(sessions)}\n\nReply /resume <id> to link this topic to one.`);
+          }
           continue;
         }
         // /resume <uuid | search text>
@@ -1679,6 +1819,161 @@ async function pollUpdates() {
     await new Promise((r) => setTimeout(r, 5000));
   }
   pollUpdates();
+}
+
+// ---------------------------------------------------------------------------
+// Group auto-config: pure helpers + boot-time apply
+// ---------------------------------------------------------------------------
+function sha256(bufOrString) { return crypto.createHash('sha256').update(bufOrString).digest('hex'); }
+function appearanceHash(obj) { return sha256(JSON.stringify(obj)); }
+
+// The bot's command menu — identical for every mapped chat.
+function buildCommandList() {
+  return [
+    { command: 'new',      description: 'Fresh session in its own topic' },
+    { command: 'sessions', description: 'List recent sessions in this repo' },
+    { command: 'desk',     description: 'Open this session in the editor on the Mac' },
+    { command: 'rename',   description: 'Rename this topic (bare = regenerate from content)' },
+    { command: 'exit',     description: 'Close this topic and stop mirroring' },
+    { command: 'resume',   description: 'Link this topic to an existing session' },
+  ];
+}
+
+// Bot-global profile. Each field is null unless APPEARANCE overrides it, so an unset field is never
+// pushed (setMyName/etc. skipped) and the live bot identity from getMe stays as-is.
+function resolveBotProfile(appearance = {}) {
+  return {
+    name: appearance.bot_name ?? null,
+    about: appearance.bot_about ?? null,
+    description: appearance.bot_description ?? null,
+  };
+}
+
+// Per-chat desired appearance (title/description default to null → not pushed). photoSha is passed
+// in so this stays pure; the caller hashes the actual photo bytes.
+function resolveChatAppearance(appearance = {}, chatId, photoSha = '') {
+  const cfg = (appearance.chats || {})[chatId] || {};
+  return {
+    title: cfg.title ?? null,
+    description: cfg.description ?? null,
+    photoSha,
+    commands: buildCommandList(),
+  };
+}
+
+// The photo file to use for a chat: its own override, else the shared default, else none.
+function chatPhotoPath(appearance = {}, chatId) {
+  const cfg = (appearance.chats || {})[chatId] || {};
+  return cfg.photo_path || appearance.default_photo_path || null;
+}
+
+// photo_path may be relative to the install dir (e.g. "assets/claude-logo.png").
+function resolveAssetPath(p) { return path.isAbsolute(p) ? p : path.join(__dirname, p); }
+
+const APPEARANCE_FILE = statePath('appearance.json');
+function loadAppearanceState() {
+  try { const s = JSON.parse(fs.readFileSync(APPEARANCE_FILE, 'utf8')); s.chats = s.chats || {}; return s; }
+  catch (e) { return { botProfile: null, chats: {} }; }
+}
+function saveAppearanceState(s) {
+  try { fs.writeFileSync(APPEARANCE_FILE, JSON.stringify(s, null, 2)); }
+  catch (e) { console.error(`appearance: state write failed (${e.message})`); }
+}
+
+// A wrapped JSON Bot API call for appearance: returns true on ok, logs and returns false otherwise.
+async function tgApply(method, payload) {
+  try {
+    const r = await telegramRequest(method, payload);
+    if (r && r.ok) return true;
+    console.error(`appearance: ${method} failed (${(r && r.description) || 'unknown'})`);
+    return false;
+  } catch (e) { console.error(`appearance: ${method} failed (${e.message})`); return false; }
+}
+
+// setChatPhoto needs multipart/form-data (a file upload), which telegramRequest (JSON) can't do.
+function setChatPhotoFile(chatId, filePath) {
+  return new Promise((resolve) => {
+    let photo;
+    try { photo = fs.readFileSync(filePath); }
+    catch (e) { console.error(`appearance: setChatPhoto read failed (${e.message})`); return resolve(false); }
+    const boundary = `----gwphoto${process.pid}`;
+    const pre = Buffer.from(
+      `--${boundary}\r\nContent-Disposition: form-data; name="chat_id"\r\n\r\n${chatId}\r\n` +
+      `--${boundary}\r\nContent-Disposition: form-data; name="photo"; filename="photo.png"\r\n` +
+      `Content-Type: image/png\r\n\r\n`);
+    const post = Buffer.from(`\r\n--${boundary}--\r\n`);
+    const body = Buffer.concat([pre, photo, post]);
+    const req = https.request({
+      hostname: 'api.telegram.org', port: 443, path: `/bot${BOT_TOKEN}/setChatPhoto`, method: 'POST',
+      headers: { 'Content-Type': `multipart/form-data; boundary=${boundary}`, 'Content-Length': body.length },
+    }, (res) => {
+      let b = ''; res.on('data', (c) => (b += c));
+      res.on('end', () => {
+        try { const j = JSON.parse(b); if (!j.ok) console.error(`appearance: setChatPhoto failed (${j.description})`); resolve(!!j.ok); }
+        catch (e) { resolve(false); }
+      });
+    });
+    req.setTimeout(SOCKET_TIMEOUT_MS, () => req.destroy(new Error('timeout')));
+    req.on('error', (e) => { console.error(`appearance: setChatPhoto failed (${e.message})`); resolve(false); });
+    req.write(body); req.end();
+  });
+}
+
+// Boot-time, idempotent group + bot appearance. Reads live identity (getMe), applies bot-global
+// profile once per value change, then each mapped chat's title/description/photo/commands/menu.
+// A per-scope hash in appearance.json keeps frequent restarts silent; a partial failure leaves the
+// old hash so the next boot retries just that scope.
+async function configureGroup() {
+  if (!AUTO_CONFIGURE_GROUP || !APPEARANCE) return;
+  const state = loadAppearanceState();
+
+  let me = null;
+  try { const r = await telegramRequest('getMe'); if (r && r.ok) me = r.result; } catch (e) { /* */ }
+  if (me) console.log(`[Appearance] configuring as @${me.username || me.first_name}`);
+
+  // Bot-global profile (scoped to this bot; applied once per value change).
+  if (APPEARANCE.set_bot_profile !== false) {
+    const desired = resolveBotProfile(APPEARANCE);
+    const h = appearanceHash(desired);
+    if (h !== state.botProfile) {
+      let ok = true;
+      if (desired.name != null)        ok = (await tgApply('setMyName', { name: desired.name })) && ok;
+      if (desired.about != null)       ok = (await tgApply('setMyShortDescription', { short_description: desired.about })) && ok;
+      if (desired.description != null) ok = (await tgApply('setMyDescription', { description: desired.description })) && ok;
+      if (ok) { state.botProfile = h; console.log('[Appearance] bot profile updated'); }
+    }
+  }
+
+  // Per mapped chat: title / description / photo / commands / menu, keyed by chat id.
+  for (const chatId of Object.keys(REPO_MAPPINGS)) {
+    const cfg = (APPEARANCE.chats || {})[chatId] || {};
+    const photoPath = chatPhotoPath(APPEARANCE, chatId);
+    let photoSha = '';
+    if (photoPath) { try { photoSha = sha256(fs.readFileSync(resolveAssetPath(photoPath))); } catch (e) { photoSha = ''; } }
+    const h = appearanceHash(resolveChatAppearance(APPEARANCE, chatId, photoSha));
+    if (h === state.chats[chatId]) continue;
+
+    // A group photo should be representative of that group; the operator sets those by hand. Check
+    // the live chat first and only set a photo when the group has NONE (bootstrap a fresh group),
+    // unless the chat entry opts in with force_photo. getChat failure is treated as "has a photo"
+    // so an API hiccup never overwrites one.
+    let hasPhoto = true;
+    try { const c = await telegramRequest('getChat', { chat_id: chatId }); if (c && c.ok) hasPhoto = !!(c.result && c.result.photo); } catch (e) { /* keep hasPhoto=true */ }
+
+    let ok = true;
+    if (cfg.title != null)       ok = (await tgApply('setChatTitle', { chat_id: chatId, title: cfg.title })) && ok;
+    if (cfg.description != null) ok = (await tgApply('setChatDescription', { chat_id: chatId, description: cfg.description })) && ok;
+    if (photoPath && photoSha && (!hasPhoto || cfg.force_photo === true)) {
+      ok = (await setChatPhotoFile(chatId, resolveAssetPath(photoPath))) && ok;
+    } else if (photoPath && hasPhoto) {
+      console.log(`[Appearance] chat ${chatId} already has a photo · leaving it`);
+    }
+    ok = (await tgApply('setMyCommands', { commands: buildCommandList(), scope: { type: 'chat', chat_id: Number(chatId) } })) && ok;
+    ok = (await tgApply('setChatMenuButton', { chat_id: chatId, menu_button: { type: 'commands' } })) && ok;
+    if (ok) { state.chats[chatId] = h; console.log(`[Appearance] chat ${chatId} updated`); }
+  }
+
+  saveAppearanceState(state);
 }
 
 // ---------------------------------------------------------------------------
@@ -1731,6 +2026,7 @@ if (require.main === module) {
   console.log(`Mirror: ${MIRROR ? 'on' : 'off'} · auto-topics: ${AUTO_CREATE_TOPICS ? 'on' : 'off'} · prune: ${PRUNE_MODE} after ${PRUNE_AFTER_MS / 86400000}d`);
   console.log(`Restored ${Object.keys(linkBySession).length} linked session(s). Poll ${POLL_MS}ms.`);
   console.log("Listening for Topic messages + mirroring desk sessions...");
+  configureGroup().catch((e) => console.error('appearance:', e.message));
   pollUpdates();
   setInterval(pollTick, POLL_MS);
   pollTick();
@@ -1748,4 +2044,8 @@ module.exports = {
   createModuleRegistry,
   resolveModulePath, loadModules,
   buildSpawnArgs, spawnSession, buildModuleApi,
+  chunkText, parseActionCallback, buildSessionActionBar, buildSessionPickerKeyboard,
+  postWithMarkup, closeSessionTopic,
+  sha256, appearanceHash, buildCommandList, resolveBotProfile, resolveChatAppearance, chatPhotoPath,
+  configureGroup,
 };
