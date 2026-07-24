@@ -1062,6 +1062,62 @@ function loadModules(config, api, log = console.error, gatewayDir = STATE_DIR) {
   return createModuleRegistry(instances, log);
 }
 
+// Args for a detached review/aux session. Pure so it can be unit-tested.
+function buildSpawnArgs(sessionId, mode, model) {
+  const args = ['-p', '--session-id', sessionId, '--permission-mode', mode];
+  if (model) args.push('--model', model);
+  return args;
+}
+
+// Fire-and-forget headless session. Unlike runClaudeTurn (live-streamed, driven,
+// permission-plumbed), this mints a uuid, spawns detached, feeds the prompt on
+// stdin, and returns the id without waiting. The poll loop then discovers the new
+// .jsonl, creates a topic, and mirrors it like any other session.
+function spawnSession({ cwd, prompt, mode }) {
+  const sessionId = crypto.randomUUID();
+  const args = buildSpawnArgs(sessionId, mode || PERM_MODE, MODEL);
+  try {
+    const child = spawn(CLAUDE_BINARY, args, { cwd, env: { ...process.env }, detached: true, stdio: ['pipe', 'ignore', 'ignore'] });
+    child.on('error', (e) => console.error('[Module] spawnSession failed:', e.message));
+    try { child.stdin.write(prompt); child.stdin.end(); } catch (e) { /* child gone */ }
+    child.unref();
+    console.log(`[Module] spawned session ${sessionId.slice(0, 8)} in ${cwd}`);
+  } catch (e) {
+    console.error('[Module] spawnSession error:', e.message);
+  }
+  return sessionId;
+}
+
+// The curated surface modules receive. Everything is a thin wrapper over an existing
+// gateway function — modules never reach into internals.
+function buildModuleApi({ injecting }) {
+  return {
+    injectTurn(sessionId, prompt) { return queueForSession(sessionId, prompt); },
+    spawnSession(opts) { return spawnSession(opts); },
+    postToTopic(sessionId, text) {
+      const l = linkBySession[sessionId];
+      if (!l) return false;
+      return sendPlain(l.chatId, l.threadId, text);
+    },
+    getSessionInfo(sessionId) {
+      const l = linkBySession[sessionId];
+      const file = sessionFileById(sessionId);
+      let cwd = null, mtime = 0;
+      if (file) { cwd = cwdCache.get(file) || null; try { mtime = fs.statSync(file).mtimeMs; } catch (e) { /* */ } }
+      if (!l && !file) return null;
+      return { cwd, chatId: l && l.chatId, threadId: l && l.threadId, label: l && l.label, mtime };
+    },
+    state(name) {
+      const file = statePath('module-' + name);
+      let data = {};
+      try { if (fs.existsSync(file)) data = JSON.parse(fs.readFileSync(file, 'utf8')); } catch (e) { data = {}; }
+      return { data, save() { try { fs.writeFileSync(file, JSON.stringify(data, null, 2)); } catch (e) { console.error('[Module] state save failed:', e.message); } } };
+    },
+    config,
+    log(...a) { console.log('[Module]', ...a); },
+  };
+}
+
 // ---------------------------------------------------------------------------
 // Topic lifecycle
 // ---------------------------------------------------------------------------
@@ -1671,4 +1727,5 @@ module.exports = {
   countUserTurns, dueForRename, RENAME_AFTER_TURNS,
   createModuleRegistry,
   resolveModulePath, loadModules,
+  buildSpawnArgs, spawnSession, buildModuleApi,
 };

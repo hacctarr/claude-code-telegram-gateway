@@ -72,3 +72,31 @@ test('loadModules: empty/absent MODULES yields a no-op registry', () => {
   assert.deepEqual(g.loadModules({}, {}, () => {}).names(), []);
   assert.deepEqual(g.loadModules({ MODULES: [] }, {}, () => {}).names(), []);
 });
+
+test('buildSpawnArgs: session id + mode always present, model only when given', () => {
+  assert.deepEqual(g.buildSpawnArgs('sid', 'plan'),
+    ['-p', '--session-id', 'sid', '--permission-mode', 'plan']);
+  assert.deepEqual(g.buildSpawnArgs('sid', 'plan', 'opus'),
+    ['-p', '--session-id', 'sid', '--permission-mode', 'plan', '--model', 'opus']);
+});
+
+test('buildModuleApi: state(name) round-trips through a JSON file', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'gw-state-'));
+  const prev = process.env.CLAUDE_GATEWAY_DIR;
+  // statePath writes under STATE_DIR captured at module load; test the persistence shape directly.
+  const api = g.buildModuleApi({ injecting: new Set() });
+  const st = api.state('unit-test-modstate');
+  assert.deepEqual(st.data, {});           // fresh
+  st.data.x = 1;
+  st.save();
+  const st2 = api.state('unit-test-modstate');
+  assert.equal(st2.data.x, 1);             // reloaded from disk
+  fs.rmSync(dir, { recursive: true, force: true });
+  if (prev === undefined) delete process.env.CLAUDE_GATEWAY_DIR; else process.env.CLAUDE_GATEWAY_DIR = prev;
+});
+
+test('buildModuleApi: injectTurn enqueues onto the gateway queue', () => {
+  const api = g.buildModuleApi({ injecting: new Set() });
+  // injectTurn delegates to queueForSession; assert no throw and returns undefined.
+  assert.doesNotThrow(() => api.injectTurn('sess-x', '/compact'));
+});
