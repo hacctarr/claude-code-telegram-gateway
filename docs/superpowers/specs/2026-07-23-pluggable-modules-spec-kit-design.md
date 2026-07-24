@@ -69,11 +69,15 @@ module.exports = (api) => ({
   name: 'spec-kit',
   onTranscriptLine(ctx, record) { /* each new transcript record, per session */ },
   onTick(now)                   { /* once per poll tick — settle-window timers */ },
-  onTelegramUpdate(update)      { /* optional; spec-kit does not use it */ },
 });
 ```
 
 Every hook is optional. `ctx = { sessionId, cwd, chatId, threadId }`.
+
+v1 ships two hooks (`onTranscriptLine`, `onTick`). A third, `onTelegramUpdate(update)`, is a
+natural extension for modules that react to inbound Telegram messages, but nothing in v1 uses
+it, so it is deferred — adding it later is an isolated dispatch-point change, not a contract
+break.
 
 ### The api (the only surface modules touch)
 
@@ -106,11 +110,11 @@ topic, and mirrors it.
 4. **Two dispatch points in `pollTick`:**
    - after `readNewLines` (1309), for each parsed record: `emit('transcriptLine', ctx, o)`.
    - once near the end of the tick: `emit('tick', now)`.
-5. **Optional third dispatch:** `emit('telegramUpdate', update)` inside `pollUpdates` — part
-   of the stable interface; spec-kit does not use it, and it can be deferred if it
-   complicates the plan.
-6. **Startup:** call `loadModules()` in `main()` after `loadLinks()` (1594).
-7. **State cleanup:** when the existing session-drop cleanup runs (1351-1361), signal modules
+   A third, `emit('telegramUpdate', update)` inside `pollUpdates`, is deferred — not built in
+   v1 (no module uses it); it slots in as an isolated change when a Telegram-reactive module
+   arrives.
+5. **Startup:** call `loadModules()` in `main()` after `loadLinks()` (1594).
+6. **State cleanup:** when the existing session-drop cleanup runs (1351-1361), signal modules
    (or let them lazily expire `api.state` entries) so per-session state doesn't grow
    unbounded.
 
