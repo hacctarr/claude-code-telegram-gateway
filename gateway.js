@@ -583,23 +583,32 @@ function summarizeToolInput(name, input) {
 }
 
 function createFeed(showTools = true) {
-  let body = '';
+  // Readout separation: tool activity accumulates in toolBody, the assistant's prose in proseBody.
+  // render() stacks tools above prose with a blank line so the response reads as its own block —
+  // the streamed-turn analogue of the mirror path's two-message split.
+  let toolBody = '', proseBody = '';
+  const render = () => {
+    const parts = [];
+    if (toolBody.trim()) parts.push(toolBody.trim());
+    if (proseBody.trim()) parts.push(proseBody.trim());
+    return parts.join('\n\n') || '⚙️ Working…';
+  };
   const feed = {
     sawContent: false, sessionId: null, isError: false, resultText: null,
-    render() { return body.trim() || '⚙️ Working…'; },
+    render,
     handle(o) {
       if (!o || typeof o !== 'object') return false;
       if (o.type === 'stream_event' && o.event && o.event.type === 'content_block_delta'
           && o.event.delta && o.event.delta.type === 'text_delta') {
-        body += o.event.delta.text; feed.sawContent = true; return true;
+        proseBody += o.event.delta.text; feed.sawContent = true; return true;
       }
       if (o.type === 'assistant' && o.message && Array.isArray(o.message.content)) {
         let changed = false;
         for (const block of o.message.content) {
           if (block.type === 'tool_use' && showTools) {
             const summary = summarizeToolInput(block.name, block.input);
-            if (body && !body.endsWith('\n')) body += '\n';
-            body += `🔧 ${block.name}${summary ? ': ' + summary : ''}\n`;
+            if (toolBody && !toolBody.endsWith('\n')) toolBody += '\n';
+            toolBody += `🔧 ${block.name}${summary ? ': ' + summary : ''}\n`;
             feed.sawContent = true; changed = true;
           }
         }
@@ -612,7 +621,7 @@ function createFeed(showTools = true) {
       }
       return false;
     },
-    finish() { if (feed.resultText && !feed.sawContent) body = feed.resultText; return feed.render(); }
+    finish() { if (feed.resultText && !feed.sawContent) proseBody = feed.resultText; return render(); }
   };
   return feed;
 }
@@ -649,6 +658,23 @@ function renderTranscriptLine(o, showTools = true) {
     return [];
   }
   return [];
+}
+
+// Activity markers that renderTranscriptLine (and the flush) can emit: tool step, resumed-tool
+// notice, tool error, desk-input echo, stall notice. Anything without one of these prefixes is the
+// assistant's prose response.
+const ACTIVITY_PREFIXES = ['🔧', '▶️', '⚠️', '🖥️', '⏳'];
+
+// Partition a batch of mirror post-strings into activity vs prose, preserving order within each.
+// The flush posts activity as one Telegram message and prose as a second, so the prose response is
+// the clean, last bubble in the topic — the natural reply-to-steer target.
+function splitReadout(posts) {
+  const activity = [], prose = [];
+  for (const p of posts) {
+    if (ACTIVITY_PREFIXES.some((e) => p.startsWith(e))) activity.push(p);
+    else prose.push(p);
+  }
+  return { activity, prose };
 }
 
 // The last user prompt + assistant response in a transcript, so a freshly-created topic shows where
@@ -1229,8 +1255,16 @@ async function pollTick() {
           posts.push(`▶️ ${r.name} finished — session continuing.`);
         }
         if (posts.length) {
-          const sent = await sendPlain(link.chatId, link.threadId, posts.join('\n\n'));
-          if (!sent) continue;   // network hiccup: keep the offset so these lines retry next tick
+          // Readout separation: tool activity and the prose response post as distinct messages,
+          // prose last, so the response is the clean reply-to-steer target. Advance the offset only
+          // if every message sent — a mid-batch network hiccup retries the whole batch next tick.
+          const { activity, prose } = splitReadout(posts);
+          const messages = [activity, prose].filter((a) => a.length).map((a) => a.join('\n\n'));
+          let allSent = true;
+          for (const m of messages) {
+            if (!(await sendPlain(link.chatId, link.threadId, m))) { allSent = false; break; }
+          }
+          if (!allSent) continue;   // keep the offset so these lines retry next tick
           lastMirrorAt.set(id, now);
         }
         link.userTurns = (link.userTurns || 0) + countUserTurns(lines);
@@ -1515,7 +1549,7 @@ if (require.main === module) {
 }
 
 module.exports = {
-  LiveMessage, summarizeToolInput, createFeed, renderTranscriptLine, readNewLines,
+  LiveMessage, summarizeToolInput, createFeed, renderTranscriptLine, splitReadout, readNewLines,
   listSessions, matchSessions, readSessionInfo, relTime, formatSessionList,
   isActive, shouldPrune, isDeskBusy, invertRepoMappings, splitThreadKey, buildThreadIndex,
   migrateLegacy, topicName, openerText, shouldAutoCreate, loadIgnored, persistIgnored, persisted, deskUrl,

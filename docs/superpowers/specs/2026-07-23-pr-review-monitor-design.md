@@ -1,7 +1,7 @@
 # PR-Review Monitor + readout tool/response separation
 
 **Date:** 2026-07-23
-**Status:** designed, not yet implemented
+**Status:** Component 1 designed, not yet implemented. Component 2 shipped in v1.1.0.
 
 Two related workstreams from one session. Component 1 (PR-Review Monitor) is a new
 standalone tool. Component 2 (readout separation) is a small change inside `gateway.js`.
@@ -150,6 +150,13 @@ config.
 ---
 
 ## Component 2 — Readout: separate tool-use from responses
+
+**Implemented in v1.1.0.** The mirror path got true separate messages (`splitReadout` +
+a two-send flush). The live streamed path got the in-body delimiter this doc sanctions as
+the alternative: `createFeed` keeps a tool buffer and a prose buffer and renders them with
+a blank line between. True two-bubble streaming would mean two `LiveMessage` instances and
+a changed `runClaudeTurn` contract — deferred, not attempted here. It was also built
+*before* the monitor spike rather than after, since the two never touch the same code.
 
 ### Problem
 

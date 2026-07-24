@@ -41,10 +41,19 @@ const EVENTS = [
   { type: 'result', subtype: 'success', is_error: false, session_id: 'sess-1', result: 'Hello world' },
 ];
 
-test('createFeed: builds tool step + streamed text in order', () => {
+test('createFeed: separates tool activity from streamed prose with a blank line', () => {
   const feed = g.createFeed(true);
   for (const e of EVENTS) feed.handle(e);
-  assert.equal(feed.render(), '🔧 Bash: echo hi\nHello world');
+  // Readout separation: tool block above, prose response below, divided by a blank line.
+  assert.equal(feed.render(), '🔧 Bash: echo hi\n\nHello world');
+});
+test('createFeed: prose stays grouped even when a tool arrives mid-stream', () => {
+  const feed = g.createFeed(true);
+  feed.handle({ type: 'stream_event', event: { type: 'content_block_delta', delta: { type: 'text_delta', text: 'Let me check.' } } });
+  feed.handle({ type: 'assistant', message: { content: [{ type: 'tool_use', name: 'Read', input: { file_path: '/a.js' } }] } });
+  feed.handle({ type: 'stream_event', event: { type: 'content_block_delta', delta: { type: 'text_delta', text: ' Done.' } } });
+  // Tools bucket above, all prose below — not interleaved.
+  assert.equal(feed.render(), '🔧 Read: /a.js\n\nLet me check. Done.');
 });
 test('createFeed: captures result session id and error flag', () => {
   const feed = g.createFeed(true);
@@ -263,6 +272,29 @@ test('renderTranscriptLine: mixed text + tool blocks preserve order', () => {
     { type: 'tool_use', name: 'Read', input: { file_path: '/a.js' } },
   ] } };
   assert.deepEqual(g.renderTranscriptLine(o), ['Running now', '🔧 Read: /a.js']);
+});
+
+// ---------------------------------------------------------------------------
+// splitReadout — partition mirror posts into activity vs prose messages
+// ---------------------------------------------------------------------------
+test('splitReadout: tool lines go to activity, prose to prose', () => {
+  assert.deepEqual(
+    g.splitReadout(['🔧 Bash: echo hi', 'Hello there']),
+    { activity: ['🔧 Bash: echo hi'], prose: ['Hello there'] });
+});
+test('splitReadout: desk / error / finished / stall lines are all activity', () => {
+  const posts = ['🖥️ desk: Fix the bug', '⚠️ tool error: boom', '▶️ Read finished — session continuing.', '⏳ Desk session has been on this for 90s'];
+  assert.deepEqual(g.splitReadout(posts), { activity: posts, prose: [] });
+});
+test('splitReadout: order is preserved within each bucket', () => {
+  assert.deepEqual(
+    g.splitReadout(['🔧 Read: /a.js', 'first prose', '🔧 Bash: ls', 'second prose']),
+    { activity: ['🔧 Read: /a.js', '🔧 Bash: ls'], prose: ['first prose', 'second prose'] });
+});
+test('splitReadout: prose-only and activity-only degrade cleanly', () => {
+  assert.deepEqual(g.splitReadout(['just prose']), { activity: [], prose: ['just prose'] });
+  assert.deepEqual(g.splitReadout(['🔧 Bash: ls']), { activity: ['🔧 Bash: ls'], prose: [] });
+  assert.deepEqual(g.splitReadout([]), { activity: [], prose: [] });
 });
 
 // ---------------------------------------------------------------------------
