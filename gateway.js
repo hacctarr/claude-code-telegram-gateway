@@ -83,10 +83,15 @@ const MIRROR = config.MIRROR !== false;
 const AUTO_CREATE_TOPICS = config.AUTO_CREATE_TOPICS !== false;
 const IDLE_INJECT_MS = (config.IDLE_INJECT_SECONDS || 15) * 1000;
 const ACTIVE_WINDOW_MS = (config.ACTIVE_WINDOW_MIN || 30) * 60_000;
-const PRUNE_AFTER_MS = (config.PRUNE_AFTER_DAYS || 7) * 86_400_000;
+const PRUNE_AFTER_MS = (config.PRUNE_AFTER_DAYS || 1) * 86_400_000;
 const PRUNE_MODE = config.PRUNE_MODE || 'close';   // "close" | "delete"
 const POLL_MS = config.POLL_MS || 2000;
 const MIRROR_FLUSH_MS = config.MIRROR_FLUSH_MS || 4000;  // min gap between mirror posts per topic
+// Topic opener — the first message posted into a freshly created topic. In a forum, a topic's
+// first message renders at the very top, so a long opener reads like an auto-pinned banner on
+// every new topic. "minimal" (default) is one identifying line; "full" adds the how-it-works
+// paragraph + a "where it left off" seed; "off" posts nothing and the topic just starts mirroring.
+const TOPIC_OPENER = config.TOPIC_OPENER || 'minimal';   // "off" | "minimal" | "full"
 // How to name topics: "first-message" = the opening prompt (free, the default);
 // "session-name" = Claude's derived name (documents-14); "generated" = a short AI slug.
 // "generated" spawns a real Claude turn per topic-creation ATTEMPT. Even fully isolated
@@ -1272,9 +1277,13 @@ async function resolveTopicName(info) {
   }
   return { name: topicName(info), iconId: pickIcon(info.label).id };
 }
-function openerText(info) {
-  const name = sessionNameById(info.id);
-  return `🤖 Session ${name || info.id.slice(0, 8)}` +
+function openerText(info, mode = TOPIC_OPENER) {
+  const name = sessionNameById(info.id) || info.id.slice(0, 8);
+  if (mode === 'off') return '';
+  if (mode === 'minimal') {
+    return `🤖 ${name}${info.label ? ` · “${info.label}”` : ''} · mirroring live`;
+  }
+  return `🤖 Session ${name}` +
     (info.label ? `\n“${info.label}”` : '') +
     `\nLast active ${relTime(info.mtime)}.\n\n` +
     `This topic mirrors the desk session live. Reply here to steer it — your message runs when the ` +
@@ -1303,12 +1312,16 @@ async function ensureTopicForSession(info) {
   linkBySession[info.id] = { chatId, threadId, label: info.label || '', offset: info.size || 0, closed: false };
   sessionByThread.set(tkey, info.id);
   persistLinks();
-  await sendPlain(chatId, threadId, openerText(info));
-  // Seed the topic with where the session left off (last prompt + last response).
-  const { lastText, lastUser } = lastExchange(info.path);
-  if (lastText) {
-    await sendPlain(chatId, threadId,
-      `— where it left off —${lastUser ? `\n🖥️ desk: ${lastUser.slice(0, 400)}` : ''}\n\n${lastText}`);
+  const opener = openerText(info);
+  if (opener) await sendPlain(chatId, threadId, opener);
+  // Seed the topic with where the session left off (last prompt + last response) — only in the
+  // "full" opener mode; "minimal"/"off" keep new topics from leading with a banner-like block.
+  if (TOPIC_OPENER === 'full') {
+    const { lastText, lastUser } = lastExchange(info.path);
+    if (lastText) {
+      await sendPlain(chatId, threadId,
+        `— where it left off —${lastUser ? `\n🖥️ desk: ${lastUser.slice(0, 400)}` : ''}\n\n${lastText}`);
+    }
   }
   console.log(`[Topic] created for ${info.id.slice(0, 8)} → chat ${chatId} thread ${threadId}`);
   return linkBySession[info.id];

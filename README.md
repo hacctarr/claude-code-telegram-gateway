@@ -17,7 +17,7 @@ It is a transcript **watcher**, not a terminal scraper — it reads Claude's own
       [poll loop, every ~2s]
         ├─ active + no topic  → createForumTopic + opener      (auto-initiate)
         ├─ new transcript lines → mirror to the topic          (🖥️ desk / assistant / 🔧 tool)
-        └─ idle 7 days        → closeForumTopic                 (prune)
+        └─ idle 1 day         → closeForumTopic                 (prune)
                     ▲
   reply in a topic → idle? → claude -p --resume (streams back) │ busy? → queue, run when idle
   /new <msg>       → new topic + independent session
@@ -75,8 +75,9 @@ then `npm run setup` does the rest. Everything below is the manual equivalent.
    ```
    Optional keys (defaults shown): `MIRROR` (true), `AUTO_CREATE_TOPICS` (true),
    `SHOW_TOOL_ACTIVITY` (true), `PERMISSION_MODE` ("bypassPermissions"), `MODEL`,
-   `IDLE_INJECT_SECONDS` (15), `ACTIVE_WINDOW_MIN` (30), `PRUNE_AFTER_DAYS` (7),
-   `PRUNE_MODE` ("close" | "delete"), `POLL_MS` (2000).
+   `IDLE_INJECT_SECONDS` (15), `ACTIVE_WINDOW_MIN` (30), `PRUNE_AFTER_DAYS` (1),
+   `PRUNE_MODE` ("close" | "delete"), `POLL_MS` (2000),
+   `TOPIC_OPENER` ("minimal" | "off" | "full" — the first message posted into a new topic).
 
 > **Permissions — two ways to run it:**
 > - **`bypassPermissions`** (default): phone-injected turns run tools without prompts. Anyone

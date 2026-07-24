@@ -336,12 +336,12 @@ test('readNewLines: multi-byte content keeps byte offsets correct', () => {
 // ---------------------------------------------------------------------------
 // Activity windows
 // ---------------------------------------------------------------------------
-test('isActive / shouldPrune / isDeskBusy boundaries (defaults 30m / 7d / 15s)', () => {
+test('isActive / shouldPrune / isDeskBusy boundaries (defaults 30m / 1d / 15s)', () => {
   const now = Date.now();
   assert.equal(g.isActive(now - 60_000, now), true);           // 1m ago -> active
   assert.equal(g.isActive(now - 40 * 60_000, now), false);      // 40m ago -> not
-  assert.equal(g.shouldPrune(now - 3 * 86400_000, now), false); // 3d -> keep
-  assert.equal(g.shouldPrune(now - 8 * 86400_000, now), true);  // 8d -> prune
+  assert.equal(g.shouldPrune(now - 12 * 3600_000, now), false); // 12h -> keep
+  assert.equal(g.shouldPrune(now - 2 * 86400_000, now), true);  // 2d -> prune
   assert.equal(g.isDeskBusy(now - 5_000, now), true);           // 5s -> busy
   assert.equal(g.isDeskBusy(now - 60_000, now), false);         // 60s -> idle
 });
@@ -394,11 +394,22 @@ test('pickIcon: keyword match wins with a real custom-emoji id, 🤖 default oth
   assert.equal(g.pickIcon('').emoji, '🤖');
   assert.equal(g.pickEmoji('fix the login crash'), '🦠');   // back-compat shim
 });
-test('openerText: mentions the session id and the cr resume hint', () => {
+test('openerText: minimal (default) is one identifying line, no how-it-works paragraph', () => {
   const t = g.openerText({ id: 'abcdef12-3456', label: 'Fix login', mtime: Date.now() });
   assert.match(t, /abcdef12/);
-  assert.match(t, /cr/);
   assert.match(t, /Fix login/);
+  assert.match(t, /mirroring live/);
+  assert.doesNotMatch(t, /\bcr\b/);        // no resume paragraph in minimal
+  assert.ok(!t.includes('\n'), 'minimal opener is a single line');
+});
+test('openerText: full mode keeps the how-it-works paragraph and cr hint', () => {
+  const t = g.openerText({ id: 'abcdef12-3456', label: 'Fix login', mtime: Date.now() }, 'full');
+  assert.match(t, /abcdef12/);
+  assert.match(t, /cr/);
+  assert.match(t, /mirrors the desk session live/);
+});
+test('openerText: off mode posts nothing', () => {
+  assert.equal(g.openerText({ id: 'abcdef12-3456', label: 'x', mtime: Date.now() }, 'off'), '');
 });
 
 // ---------------------------------------------------------------------------
