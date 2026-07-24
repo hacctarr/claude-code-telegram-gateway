@@ -165,7 +165,11 @@ Bot-global (guarded by `set_bot_profile`, default `true`): `setMyName`, `setMySh
 Per mapped chat (`REPO_MAPPINGS`), using that chat's `APPEARANCE.chats[chatId]`:
 - `setChatTitle` — `.title`
 - `setChatDescription` — `.description`
-- `setChatPhoto` — `.photo_path` (or `default_photo_path`)
+- `setChatPhoto` — `.photo_path` (or `default_photo_path`), **only when the group has no photo**.
+  A group photo should be representative of that group and the operator sets those by hand, so
+  `configureGroup()` calls `getChat` first and skips the photo when `chat.photo` is present. A
+  `getChat` failure is treated as "has a photo" so an API hiccup never overwrites one. Set
+  `force_photo: true` on a chat entry to replace an existing photo deliberately.
 - `setMyCommands` (scope `{type:'chat', chat_id}`) — the command list below
 - `setChatMenuButton` (`{type:'commands'}`)
 
