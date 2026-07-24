@@ -1369,6 +1369,10 @@ async function reviveTopic(sessionId) {
 const RESTART_FLAGS = [path.join(STATE_DIR, 'restart.flag'), path.join(__dirname, 'restart.flag')];
 function seenRestartFlag() { return RESTART_FLAGS.find((f) => { try { return fs.existsSync(f); } catch (e) { return false; } }); }
 
+// Loaded at boot from config.MODULES; a no-op registry until then so the mirror
+// loop can call moduleRegistry.emit() unconditionally with zero overhead.
+let moduleRegistry = createModuleRegistry([], console.error);
+
 let polling = false;
 async function pollTick() {
   if (polling) return;
@@ -1415,6 +1419,10 @@ async function pollTick() {
       if (MIRROR && !injecting.has(id) && st.size > link.offset) {
         if (now - (lastMirrorAt.get(id) || 0) < MIRROR_FLUSH_MS) continue;  // retry next poll; offset unchanged
         const { lines, newOffset } = readNewLines(file, link.offset);
+        // Feed each new record to modules (spec-kit arming, etc.). ctx carries the
+        // session's identity so a module needs no gateway internals.
+        const modCtx = { sessionId: id, cwd, chatId: link.chatId, threadId: link.threadId };
+        for (const o of lines) moduleRegistry.emit('transcriptLine', modCtx, o);
         const posts = [];
         for (const o of lines) posts.push(...renderTranscriptLine(o, SHOW_TOOLS));
         // Track unresolved tool calls; announce completion of any we'd flagged as stalled.
@@ -1477,6 +1485,8 @@ async function pollTick() {
       if (isDeskBusy(mtime, now)) continue;
       scheduleDrive(l.chatId, l.threadId, prompts.shift(), sessionId);
     }
+    // Per-tick module hook: settle-window timers, deferred reactions.
+    moduleRegistry.emit('tick', now);
   } catch (err) {
     console.error('pollTick error:', err.message);
   } finally {
@@ -1702,6 +1712,8 @@ if (require.main === module) {
   loadLinks();
   loadIgnored();
   loadSuperseded();
+  moduleRegistry = loadModules(config, buildModuleApi({ injecting }), console.error);
+  if (moduleRegistry.names().length) console.log(`Modules: ${moduleRegistry.names().join(', ')}`);
   snapshotBaseline();   // record current sizes so a restart doesn't mass-create topics
   console.log("=============================================");
   console.log("🚀 CLAUDE CODE MULTI-SESSION TELEGRAM GATEWAY");
