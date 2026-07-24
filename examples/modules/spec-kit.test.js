@@ -51,3 +51,55 @@ test('decideReaction: review does not re-fire once reviewFired', () => {
   const s = { ...base(), armedStep: '/implement', reviewFired: true };
   assert.equal(m.decideReaction(s, CFG, 100000, 0).action, null);
 });
+
+// A fake api that records calls and holds state in memory.
+function fakeApi(overrides = {}) {
+  const store = {};
+  const calls = { inject: [], spawn: [], post: [] };
+  return {
+    calls,
+    _store: store,
+    injectTurn: (sid, p) => calls.inject.push([sid, p]),
+    spawnSession: (o) => { calls.spawn.push(o); return 'new-review-id'; },
+    postToTopic: (sid, t) => calls.post.push([sid, t]),
+    getSessionInfo: (sid) => overrides.info || { cwd: '/repo', chatId: '1', threadId: 2, mtime: 0 },
+    state: () => ({ data: store, save() {} }),
+    config: overrides.config || {},
+    log() {},
+  };
+}
+
+test('spec-kit: /plan arms the session, then a settled tick compacts once', () => {
+  const api = fakeApi({ info: { cwd: '/repo', mtime: 0 } });
+  const mod = require('./spec-kit.js')(api);
+  mod.onTranscriptLine({ sessionId: 'S', cwd: '/repo', chatId: '1', threadId: 2 },
+    { type: 'user', message: { content: '<command-name>/plan</command-name>' } });
+  mod.onTick(9_999_999);                             // now ≫ settle; mtime 0 → very idle
+  assert.deepEqual(api.calls.inject, [['S', '/compact']]);
+  assert.equal(api.calls.post.length, 1);
+  assert.match(api.calls.post[0][1], /plan/);
+  mod.onTick(9_999_999);                             // second tick must NOT re-fire
+  assert.equal(api.calls.inject.length, 1);
+});
+
+test('spec-kit: /implement spawns exactly one review session', () => {
+  const api = fakeApi({ info: { cwd: '/repo', mtime: 0 } });
+  const mod = require('./spec-kit.js')(api);
+  mod.onTranscriptLine({ sessionId: 'S', cwd: '/repo' },
+    { type: 'user', message: { content: '<command-name>/implement</command-name>' } });
+  mod.onTick(9_999_999);
+  assert.equal(api.calls.spawn.length, 1);
+  assert.equal(api.calls.spawn[0].cwd, '/repo');
+  assert.equal(api.calls.spawn[0].prompt, '/code-review');
+  mod.onTick(9_999_999);
+  assert.equal(api.calls.spawn.length, 1);           // reviewFired dedup
+});
+
+test('spec-kit: /compact and /code-review never arm a step', () => {
+  const api = fakeApi();
+  const mod = require('./spec-kit.js')(api);
+  mod.onTranscriptLine({ sessionId: 'S' }, { type: 'user', message: { content: '<command-name>/compact</command-name>' } });
+  mod.onTick(9_999_999);
+  assert.equal(api.calls.inject.length, 0);
+  assert.equal(api.calls.spawn.length, 0);
+});

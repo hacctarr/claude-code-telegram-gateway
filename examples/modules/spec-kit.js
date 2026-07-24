@@ -37,6 +37,56 @@ function decideReaction(sessionState, cfg, now, mtime) {
   return isTerminal ? { action: 'review', step: s.armedStep } : { action: 'compact', step: s.armedStep };
 }
 
-module.exports = () => ({ name: 'spec-kit' });   // real factory assembled in Task 7
+const DEFAULT_STEPS = ['/specify', '/clarify', '/plan', '/tasks', '/analyze', '/implement'];
+
+function factory(api) {
+  const cfgSrc = (api && api.config) || {};
+  const STEP_COMMANDS = Array.isArray(cfgSrc.STEP_COMMANDS) ? cfgSrc.STEP_COMMANDS.map((c) => c.toLowerCase()) : DEFAULT_STEPS;
+  const cfg = {
+    terminalCommand: (cfgSrc.TERMINAL_COMMAND || '/implement').toLowerCase(),
+    settleMs: (cfgSrc.SPEC_KIT_SETTLE_SECONDS || 30) * 1000,
+    reviewSettleMs: (cfgSrc.SPEC_KIT_REVIEW_SETTLE_SECONDS || 90) * 1000,
+  };
+  const store = api.state('spec-kit');   // { data, save() }
+
+  return {
+    name: 'spec-kit',
+    onTranscriptLine(ctx, record) {
+      const cmd = extractCommand(record);
+      if (!cmd || !STEP_COMMANDS.includes(cmd)) return;   // /compact & /code-review excluded → no re-arm
+      const prev = store.data[ctx.sessionId] || {};
+      store.data[ctx.sessionId] = {
+        armedStep: cmd,
+        armedAt: Date.now(),
+        firedSteps: prev.firedSteps || [],
+        reviewFired: prev.reviewFired || false,
+      };
+      store.save();
+    },
+    onTick(now) {
+      let changed = false;
+      for (const sessionId of Object.keys(store.data)) {
+        const s = store.data[sessionId];
+        const info = api.getSessionInfo(sessionId);
+        if (!info) continue;
+        const { action, step } = decideReaction(s, cfg, now, info.mtime || 0);
+        if (action === 'compact') {
+          api.injectTurn(sessionId, '/compact');
+          api.postToTopic(sessionId, `✅ spec-kit: ${step} done → compacting`);
+          s.firedSteps = (s.firedSteps || []).concat(step);
+          changed = true;
+        } else if (action === 'review') {
+          api.spawnSession({ cwd: info.cwd, prompt: '/code-review', mode: undefined });
+          api.postToTopic(sessionId, '🔍 implementation complete → launching review');
+          s.reviewFired = true;
+          changed = true;
+        }
+      }
+      if (changed) store.save();
+    },
+  };
+}
+
+module.exports = factory;
 module.exports.extractCommand = extractCommand;
 module.exports.decideReaction = decideReaction;
