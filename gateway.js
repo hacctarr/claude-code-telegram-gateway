@@ -986,6 +986,13 @@ async function driveTurn(chatId, threadId, prompt, resolveSession) {
       persistLinks();
       if (result.ok && !ephemeral) writeResumeMarker(repoDir, finalSid);
       if (!reserved.includes(finalSid)) reserved.push(finalSid);
+
+      // The gateway drove this turn on the user's behalf, so it already holds the prompt.
+      // Injected turns are suppressed from the transcript mirror (the offset jumped past them
+      // just above), so the transcriptLine tap never sees them — hand the prompt to modules
+      // directly. This is how a module arms on a command texted in from Telegram, without
+      // reaching into a stream the gateway deliberately hides.
+      moduleRegistry.emit('injectedTurn', { sessionId: finalSid, cwd: repoDir, chatId, threadId }, prompt);
     }
     console.log(`[Drive → thread ${threadId}] ok=${result.ok} session=${finalSid || '—'}${ephemeral ? ' (held/ephemeral)' : ''}`);
   } catch (err) {
@@ -1008,6 +1015,115 @@ function scheduleDrive(chatId, threadId, prompt, resolveSession) {
 function queueForSession(sessionId, prompt) {
   if (!queues.has(sessionId)) queues.set(sessionId, []);
   queues.get(sessionId).push(prompt);
+}
+
+// ---------------------------------------------------------------------------
+// Module system: external files named in config.MODULES extend the gateway
+// against a curated api. Empty/absent MODULES → pure no-op (OSS-safety).
+// ---------------------------------------------------------------------------
+// A registry over already-instantiated modules ({ name, hooks }). emit() maps a
+// hook key to on<Hook> and calls it per module inside try/catch, so one module's
+// bug can never crash pollTick or affect another module/install.
+function createModuleRegistry(instances, log = console.error) {
+  const list = Array.isArray(instances) ? instances : [];
+  const method = (hook) => 'on' + hook.charAt(0).toUpperCase() + hook.slice(1);
+  return {
+    emit(hook, ...args) {
+      const fn = method(hook);
+      for (const m of list) {
+        const h = m.hooks && m.hooks[fn];
+        if (typeof h !== 'function') continue;
+        try { h(...args); }
+        catch (e) { log(`[Module ${m.name}] ${fn} threw: ${e.stack || e.message}`); }
+      }
+    },
+    names() { return list.map((m) => m.name); },
+  };
+}
+
+// Resolve a MODULES entry to an absolute path: ~ expands, absolute passes through,
+// anything else is relative to the gateway state dir (default ~/.claude-gateway).
+function resolveModulePath(entry, gatewayDir) {
+  const p = resolveHome(entry);
+  return path.isAbsolute(p) ? p : path.join(gatewayDir, p);
+}
+
+// Require each module file and instantiate its factory with the curated api.
+// A module that fails to load is logged and skipped — one bad module never
+// stops the gateway or the others.
+function loadModules(config, api, log = console.error, gatewayDir = STATE_DIR) {
+  const entries = Array.isArray(config && config.MODULES) ? config.MODULES : [];
+  const instances = [];
+  for (const entry of entries) {
+    const file = resolveModulePath(entry, gatewayDir);
+    try {
+      const factory = require(file);
+      if (typeof factory !== 'function') throw new Error('module does not export a factory function');
+      const hooks = factory(api);
+      const name = (hooks && hooks.name) || path.basename(file, '.js');
+      instances.push({ name, hooks: hooks || {} });
+      log(`[Module] loaded ${name} from ${file}`);
+    } catch (e) {
+      log(`[Module] failed to load ${file}: ${e.message}`);
+    }
+  }
+  return createModuleRegistry(instances, log);
+}
+
+// Args for a detached review/aux session. Pure so it can be unit-tested.
+function buildSpawnArgs(sessionId, mode, model) {
+  const args = ['-p', '--session-id', sessionId, '--permission-mode', mode];
+  if (model) args.push('--model', model);
+  return args;
+}
+
+// Fire-and-forget headless session. Unlike runClaudeTurn (live-streamed, driven,
+// permission-plumbed), this mints a uuid, spawns detached, feeds the prompt on
+// stdin, and returns the id without waiting. The poll loop then discovers the new
+// .jsonl, creates a topic, and mirrors it like any other session.
+function spawnSession({ cwd, prompt, mode }) {
+  const sessionId = crypto.randomUUID();
+  const args = buildSpawnArgs(sessionId, mode || PERM_MODE, MODEL);
+  try {
+    const child = spawn(CLAUDE_BINARY, args, { cwd, env: { ...process.env }, detached: true, stdio: ['pipe', 'ignore', 'ignore'] });
+    child.on('error', (e) => console.error('[Module] spawnSession failed:', e.message));
+    try { child.stdin.write(prompt); child.stdin.end(); } catch (e) { /* child gone */ }
+    child.unref();
+    console.log(`[Module] spawned session ${sessionId.slice(0, 8)} in ${cwd}`);
+  } catch (e) {
+    console.error('[Module] spawnSession error:', e.message);
+  }
+  return sessionId;
+}
+
+// The curated surface modules receive. Everything is a thin wrapper over an existing
+// gateway function — modules never reach into internals.
+function buildModuleApi() {
+  return {
+    injectTurn(sessionId, prompt) { return queueForSession(sessionId, prompt); },
+    spawnSession(opts) { return spawnSession(opts); },
+    postToTopic(sessionId, text) {
+      const l = linkBySession[sessionId];
+      if (!l) return false;
+      return sendPlain(l.chatId, l.threadId, text).catch((e) => { console.error('[Module] postToTopic failed:', e.message); return false; });
+    },
+    getSessionInfo(sessionId) {
+      const l = linkBySession[sessionId];
+      const file = sessionFileById(sessionId);
+      let cwd = null, mtime = 0;
+      if (file) { cwd = cwdCache.get(file) || null; try { mtime = fs.statSync(file).mtimeMs; } catch (e) { /* */ } }
+      if (!l && !file) return null;
+      return { cwd, chatId: l && l.chatId, threadId: l && l.threadId, label: l && l.label, mtime };
+    },
+    state(name) {
+      const file = statePath('module-' + name);
+      let data = {};
+      try { if (fs.existsSync(file)) data = JSON.parse(fs.readFileSync(file, 'utf8')); } catch (e) { data = {}; }
+      return { data, save() { try { fs.writeFileSync(file, JSON.stringify(data, null, 2)); } catch (e) { console.error('[Module] state save failed:', e.message); } } };
+    },
+    config,
+    log(...a) { console.log('[Module]', ...a); },
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -1261,6 +1377,10 @@ async function reviveTopic(sessionId) {
 const RESTART_FLAGS = [path.join(STATE_DIR, 'restart.flag'), path.join(__dirname, 'restart.flag')];
 function seenRestartFlag() { return RESTART_FLAGS.find((f) => { try { return fs.existsSync(f); } catch (e) { return false; } }); }
 
+// Loaded at boot from config.MODULES; a no-op registry until then so the mirror
+// loop can call moduleRegistry.emit() unconditionally with zero overhead.
+let moduleRegistry = createModuleRegistry([], console.error);
+
 let polling = false;
 async function pollTick() {
   if (polling) return;
@@ -1307,6 +1427,10 @@ async function pollTick() {
       if (MIRROR && !injecting.has(id) && st.size > link.offset) {
         if (now - (lastMirrorAt.get(id) || 0) < MIRROR_FLUSH_MS) continue;  // retry next poll; offset unchanged
         const { lines, newOffset } = readNewLines(file, link.offset);
+        // Feed each new record to modules (spec-kit arming, etc.). ctx carries the
+        // session's identity so a module needs no gateway internals.
+        const modCtx = { sessionId: id, cwd, chatId: link.chatId, threadId: link.threadId };
+        for (const o of lines) moduleRegistry.emit('transcriptLine', modCtx, o);
         const posts = [];
         for (const o of lines) posts.push(...renderTranscriptLine(o, SHOW_TOOLS));
         // Track unresolved tool calls; announce completion of any we'd flagged as stalled.
@@ -1369,6 +1493,8 @@ async function pollTick() {
       if (isDeskBusy(mtime, now)) continue;
       scheduleDrive(l.chatId, l.threadId, prompts.shift(), sessionId);
     }
+    // Per-tick module hook: settle-window timers, deferred reactions.
+    moduleRegistry.emit('tick', now);
   } catch (err) {
     console.error('pollTick error:', err.message);
   } finally {
@@ -1594,6 +1720,8 @@ if (require.main === module) {
   loadLinks();
   loadIgnored();
   loadSuperseded();
+  moduleRegistry = loadModules(config, buildModuleApi(), console.error);
+  if (moduleRegistry.names().length) console.log(`Modules: ${moduleRegistry.names().join(', ')}`);
   snapshotBaseline();   // record current sizes so a restart doesn't mass-create topics
   console.log("=============================================");
   console.log("🚀 CLAUDE CODE MULTI-SESSION TELEGRAM GATEWAY");
@@ -1617,4 +1745,7 @@ module.exports = {
   titleArgs, createTopicCooldown, parseRetryAfter, updateSocketTimeoutMs, UPDATE_POLL_TIMEOUT_S,
   STATE_DIR, STATE_FILES, migrateStateFiles, statePath,
   countUserTurns, dueForRename, RENAME_AFTER_TURNS,
+  createModuleRegistry,
+  resolveModulePath, loadModules,
+  buildSpawnArgs, spawnSession, buildModuleApi,
 };
