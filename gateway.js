@@ -1027,7 +1027,7 @@ function createModuleRegistry(instances, log = console.error) {
         const h = m.hooks && m.hooks[fn];
         if (typeof h !== 'function') continue;
         try { h(...args); }
-        catch (e) { log(`[Module ${m.name}] ${fn} threw: ${e.message}`); }
+        catch (e) { log(`[Module ${m.name}] ${fn} threw: ${e.stack || e.message}`); }
       }
     },
     names() { return list.map((m) => m.name); },
@@ -1053,8 +1053,9 @@ function loadModules(config, api, log = console.error, gatewayDir = STATE_DIR) {
       const factory = require(file);
       if (typeof factory !== 'function') throw new Error('module does not export a factory function');
       const hooks = factory(api);
-      instances.push({ name: (hooks && hooks.name) || path.basename(file, '.js'), hooks: hooks || {} });
-      log(`[Module] loaded ${(hooks && hooks.name) || path.basename(file, '.js')} from ${file}`);
+      const name = (hooks && hooks.name) || path.basename(file, '.js');
+      instances.push({ name, hooks: hooks || {} });
+      log(`[Module] loaded ${name} from ${file}`);
     } catch (e) {
       log(`[Module] failed to load ${file}: ${e.message}`);
     }
@@ -1090,14 +1091,14 @@ function spawnSession({ cwd, prompt, mode }) {
 
 // The curated surface modules receive. Everything is a thin wrapper over an existing
 // gateway function — modules never reach into internals.
-function buildModuleApi({ injecting }) {
+function buildModuleApi() {
   return {
     injectTurn(sessionId, prompt) { return queueForSession(sessionId, prompt); },
     spawnSession(opts) { return spawnSession(opts); },
     postToTopic(sessionId, text) {
       const l = linkBySession[sessionId];
       if (!l) return false;
-      return sendPlain(l.chatId, l.threadId, text);
+      return sendPlain(l.chatId, l.threadId, text).catch((e) => { console.error('[Module] postToTopic failed:', e.message); return false; });
     },
     getSessionInfo(sessionId) {
       const l = linkBySession[sessionId];
@@ -1712,7 +1713,7 @@ if (require.main === module) {
   loadLinks();
   loadIgnored();
   loadSuperseded();
-  moduleRegistry = loadModules(config, buildModuleApi({ injecting }), console.error);
+  moduleRegistry = loadModules(config, buildModuleApi(), console.error);
   if (moduleRegistry.names().length) console.log(`Modules: ${moduleRegistry.names().join(', ')}`);
   snapshotBaseline();   // record current sizes so a restart doesn't mass-create topics
   console.log("=============================================");

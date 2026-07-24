@@ -81,22 +81,24 @@ test('buildSpawnArgs: session id + mode always present, model only when given', 
 });
 
 test('buildModuleApi: state(name) round-trips through a JSON file', () => {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'gw-state-'));
-  const prev = process.env.CLAUDE_GATEWAY_DIR;
-  // statePath writes under STATE_DIR captured at module load; test the persistence shape directly.
-  const api = g.buildModuleApi({ injecting: new Set() });
-  const st = api.state('unit-test-modstate');
-  assert.deepEqual(st.data, {});           // fresh
-  st.data.x = 1;
-  st.save();
-  const st2 = api.state('unit-test-modstate');
-  assert.equal(st2.data.x, 1);             // reloaded from disk
-  fs.rmSync(dir, { recursive: true, force: true });
-  if (prev === undefined) delete process.env.CLAUDE_GATEWAY_DIR; else process.env.CLAUDE_GATEWAY_DIR = prev;
+  const file = g.statePath('module-unit-test-modstate');
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  fs.rmSync(file, { force: true });                 // no stale artifact from a prior run
+  try {
+    const api = g.buildModuleApi();
+    const st = api.state('unit-test-modstate');
+    assert.deepEqual(st.data, {});                  // fresh
+    st.data.x = 1;
+    st.save();
+    const st2 = api.state('unit-test-modstate');
+    assert.equal(st2.data.x, 1);                    // reloaded from disk
+  } finally {
+    fs.rmSync(file, { force: true });               // leave no artifact behind
+  }
 });
 
 test('buildModuleApi: injectTurn enqueues onto the gateway queue', () => {
-  const api = g.buildModuleApi({ injecting: new Set() });
+  const api = g.buildModuleApi();
   // injectTurn delegates to queueForSession; assert no throw and returns undefined.
   assert.doesNotThrow(() => api.injectTurn('sess-x', '/compact'));
 });
