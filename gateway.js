@@ -1969,7 +1969,9 @@ async function configureGroup() {
       console.log(`[Appearance] chat ${chatId} already has a photo · leaving it`);
     }
     ok = (await tgApply('setMyCommands', { commands: buildCommandList(), scope: { type: 'chat', chat_id: Number(chatId) } })) && ok;
-    ok = (await tgApply('setChatMenuButton', { chat_id: chatId, menu_button: { type: 'commands' } })) && ok;
+    // Note: setChatMenuButton is a private-chat-only setting (per-user); calling it with a supergroup
+    // chat_id returns "invalid chat_id specified". The command list in a group surfaces via
+    // setMyCommands (above), so there is nothing more to do here.
     if (ok) { state.chats[chatId] = h; console.log(`[Appearance] chat ${chatId} updated`); }
   }
 

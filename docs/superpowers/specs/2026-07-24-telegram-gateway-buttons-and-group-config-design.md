@@ -170,8 +170,9 @@ Per mapped chat (`REPO_MAPPINGS`), using that chat's `APPEARANCE.chats[chatId]`:
   `configureGroup()` calls `getChat` first and skips the photo when `chat.photo` is present. A
   `getChat` failure is treated as "has a photo" so an API hiccup never overwrites one. Set
   `force_photo: true` on a chat entry to replace an existing photo deliberately.
-- `setMyCommands` (scope `{type:'chat', chat_id}`) — the command list below
-- `setChatMenuButton` (`{type:'commands'}`)
+- `setMyCommands` (scope `{type:'chat', chat_id}`) — the command list below. (No `setChatMenuButton`:
+  that is a private-chat-only setting and returns "invalid chat_id specified" for a supergroup; the
+  command list surfaces in the group via `setMyCommands` alone.)
 
 ### Command list
 
