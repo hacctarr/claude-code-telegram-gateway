@@ -179,3 +179,16 @@ From a source checkout: `git pull && npm test && touch ~/.claude-gateway/restart
   A clarifying question in Claude's reply just streams to you; answer in the topic to continue.
 - A single-instance lock prevents two gateways from fighting over `getUpdates`. Linux users: a
   `systemd --user` unit is in `systemd/` (macOS uses the bundled launchd installer).
+
+---
+
+## Modules (optional)
+
+The gateway can load external modules that extend it against a stable `api`
+without modifying the package. List them in `config.json`:
+
+    "MODULES": ["~/.claude-gateway/modules/spec-kit.js"]
+
+Empty or absent = no-op. See `examples/modules/` for the contract and the
+bundled `spec-kit` module (compacts a spec-kit session between steps and spawns
+a `/code-review` session when `/implement` finishes).
