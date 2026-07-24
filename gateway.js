@@ -87,6 +87,10 @@ const PRUNE_AFTER_MS = (config.PRUNE_AFTER_DAYS || 1) * 86_400_000;
 const PRUNE_MODE = config.PRUNE_MODE || 'close';   // "close" | "delete"
 const POLL_MS = config.POLL_MS || 2000;
 const MIRROR_FLUSH_MS = config.MIRROR_FLUSH_MS || 4000;  // min gap between mirror posts per topic
+// Inline action buttons: attach a per-session action bar (Desk / Rename / Close) to each mirrored
+// prose message, and render /sessions as a tap-to-link picker. false → no reply_markup is attached
+// and the act: callback router answers "buttons disabled" (slash commands still work).
+const BUTTONS = config.BUTTONS !== false;
 // Topic opener — the first message posted into a freshly created topic. In a forum, a topic's
 // first message renders at the very top, so a long opener reads like an auto-pinned banner on
 // every new topic. "minimal" (default) is one identifying line; "full" adds the how-it-works
@@ -1438,6 +1442,53 @@ async function reviveTopic(sessionId) {
   console.log(`[Topic] reopened session ${sessionId.slice(0, 8)}`);
 }
 
+// The /exit teardown, shared by the /exit command and the ❌ Close button. Closes (or deletes) the
+// topic, unbinds the session, and marks it superseded so the mirror won't re-topic it until the
+// desk grows the transcript again.
+async function closeSessionTopic(sid, chatId, threadId) {
+  await sendPlain(chatId, threadId, `👋 Session ${sid.slice(0, 8)} closed. It stays resumable on disk ` +
+    `(/sessions in another topic, or \`cr\` at the Mac); fresh desk activity will re-open a topic for it.`);
+  sessionByThread.delete(`${chatId}_${threadId}`);
+  delete linkBySession[sid];
+  queues.delete(sid);
+  delete pendingTools[sid];
+  lastBar.delete(sid);
+  supersededAt[sid] = sizeCurrent(sid); persistSuperseded();
+  persistLinks();
+  if (PRUNE_MODE === 'delete') await deleteForumTopic(chatId, threadId);
+  else await closeForumTopic(chatId, threadId);
+  console.log(`[Exit] closed topic ${threadId} for session ${sid.slice(0, 8)}`);
+}
+
+// Dispatch an act: button press. cb is the raw callback_query (for chat/thread + answering).
+async function handleActionCallback(act, cb) {
+  const { action, sid } = act;
+  const answer = (text) => telegramRequest('answerCallbackQuery', { callback_query_id: cb.id, text }).catch(() => {});
+  if (action === 'desk') {
+    return void answer(openOnDesk(sid) ? '🖥️ Opening on your Mac' : '⚠️ Could not open it on the Mac');
+  }
+  if (action === 'resume') {
+    const chatId = String(cb.message.chat.id);
+    const threadId = cb.message.message_thread_id;
+    await upsertLink(sid, chatId, threadId); persistLinks();
+    await answer('🔗 Linked · send a message to continue it');
+    return void sendPlain(chatId, threadId, `🔗 Topic linked to session ${sid.slice(0, 8)}. Send a message to continue it.`);
+  }
+  const link = linkBySession[sid];
+  if (!link) return void answer('That session is no longer linked.');
+  if (action === 'rename') {
+    if (TITLE_MODE !== 'generated') return void answer('Set TITLE_MODE=generated, or use /rename <name>.');
+    await answer('✏️ Regenerating name…');
+    const name = await renameTopicFromContent(sid, link, sessionFileById(sid));
+    if (name) await sendPlain(link.chatId, link.threadId, `✏️ Renamed to ${name}`);
+    return;
+  }
+  if (action === 'exit') {
+    await answer('❌ Closing…');
+    await closeSessionTopic(sid, link.chatId, link.threadId);
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Poll loop: discover new sessions, mirror activity, prune, flush queues.
 // ---------------------------------------------------------------------------
@@ -1516,10 +1567,18 @@ async function pollTick() {
           // prose last, so the response is the clean reply-to-steer target. Advance the offset only
           // if every message sent — a mid-batch network hiccup retries the whole batch next tick.
           const { activity, prose } = splitReadout(posts);
-          const messages = [activity, prose].filter((a) => a.length).map((a) => a.join('\n\n'));
           let allSent = true;
-          for (const m of messages) {
-            if (!(await sendPlain(link.chatId, link.threadId, m))) { allSent = false; break; }
+          if (activity.length) {
+            if (!(await sendPlain(link.chatId, link.threadId, activity.join('\n\n')))) allSent = false;
+          }
+          if (allSent && prose.length) {
+            const bar = BUTTONS ? buildSessionActionBar(id) : null;
+            const res = await postWithMarkup(link.chatId, link.threadId, prose.join('\n\n'), bar);
+            if (!res.allSent) allSent = false;
+            else if (bar && res.lastMessageId) {
+              await clearPrevBar(id);
+              lastBar.set(id, { chatId: link.chatId, messageId: res.lastMessageId });
+            }
           }
           if (!allSent) continue;   // keep the offset so these lines retry next tick
           lastMirrorAt.set(id, now);
@@ -1607,6 +1666,14 @@ async function pollUpdates() {
               }).catch(() => {});
             }
           }
+          const act = parseActionCallback(cb.data);
+          if (act) {
+            if (!BUTTONS) {
+              telegramRequest('answerCallbackQuery', { callback_query_id: cb.id, text: 'Buttons are disabled.' }).catch(() => {});
+            } else {
+              await handleActionCallback(act, cb);
+            }
+          }
           continue;
         }
 
@@ -1689,25 +1756,20 @@ async function pollUpdates() {
         if (text === '/exit' || text === '/close') {
           const sid = sessionByThread.get(key);
           if (!sid) { sendPlain(chatId, threadId, "This topic isn't bound to a session — nothing to close."); continue; }
-          await sendPlain(chatId, threadId, `👋 Session ${sid.slice(0, 8)} closed. It stays resumable on disk ` +
-            `(/sessions in another topic, or \`cr\` at the Mac); fresh desk activity will re-open a topic for it.`);
-          sessionByThread.delete(key);
-          delete linkBySession[sid];
-          queues.delete(sid);
-          delete pendingTools[sid];
-          supersededAt[sid] = sizeCurrent(sid); persistSuperseded();   // hidden unless the desk grows it again
-          persistLinks();
-          if (PRUNE_MODE === 'delete') await deleteForumTopic(chatId, threadId);
-          else await closeForumTopic(chatId, threadId);
-          console.log(`[Exit] closed topic ${threadId} for session ${sid.slice(0, 8)}`);
+          await closeSessionTopic(sid, chatId, threadId);
           continue;
         }
         // /sessions or bare /resume — list recent sessions.
         if (text === '/sessions' || text === '/resume') {
           const sessions = await listSessions(REPO_MAPPINGS[chatId]);
-          sendPlain(chatId, threadId, sessions.length
-            ? `🗂 Recent sessions:\n\n${formatSessionList(sessions)}\n\nReply /resume <id> to link this topic to one.`
-            : "No past Claude sessions found for this repo yet.");
+          if (!sessions.length) { sendPlain(chatId, threadId, "No past Claude sessions found for this repo yet."); continue; }
+          const kb = BUTTONS ? buildSessionPickerKeyboard(sessions) : null;
+          if (kb) {
+            await telegramRequest('sendMessage', { chat_id: chatId, message_thread_id: threadId,
+              text: '🗂 Recent sessions · tap to link this topic:', reply_markup: kb }).catch(() => {});
+          } else {
+            sendPlain(chatId, threadId, `🗂 Recent sessions:\n\n${formatSessionList(sessions)}\n\nReply /resume <id> to link this topic to one.`);
+          }
           continue;
         }
         // /resume <uuid | search text>
@@ -1822,4 +1884,5 @@ module.exports = {
   resolveModulePath, loadModules,
   buildSpawnArgs, spawnSession, buildModuleApi,
   chunkText, parseActionCallback, buildSessionActionBar, buildSessionPickerKeyboard,
+  postWithMarkup, closeSessionTopic,
 };
