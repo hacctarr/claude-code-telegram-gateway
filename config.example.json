@@ -21,6 +21,21 @@
   "MIRROR_FLUSH_MS": 4000,
   "_TOPIC_OPENER": "first message posted into a new topic: off | minimal (one line) | full (paragraph + where-it-left-off seed)",
   "TOPIC_OPENER": "minimal",
+  "BUTTONS": true,
+  "AUTO_CONFIGURE_GROUP": true,
+  "_APPEARANCE": "boot-time group + bot appearance; carries only what should differ from the live objects. Unset fields are left untouched. Photo is only set when the group has NONE (representative per-group icons you set by hand are never overwritten; add force_photo:true on a chat to override). Photo paths are relative to the install dir.",
+  "APPEARANCE": {
+    "set_bot_profile": true,
+    "bot_about": "Bridges the Claude Code sessions running on my computer, over Telegram topics.",
+    "bot_description": "Private, local-first gateway for the Claude Code sessions running on my computer. Every active session gets its own topic and mirrors live; reply in a topic to steer it, or /new to start a fresh one. Allowlisted users only.",
+    "default_photo_path": "assets/claude-logo.png",
+    "chats": {
+      "-1001654782309": {
+        "title": "Claude Code",
+        "description": "Live mirror of Claude Code sessions on my computer. Reply in a topic to steer a session; /new for a fresh one. Private, allowlisted."
+      }
+    }
+  },
   "DESK_URL_TEMPLATE": "vscode://anthropic.claude-code/open?session={session}",
   "DESK_OPEN_CMD": "open",
   "_TITLE_MODE": "first-message (free) | session-name | generated — 'generated' spawns a Claude turn per topic-creation attempt, ~25k tokens each",

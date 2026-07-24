@@ -77,7 +77,9 @@ then `npm run setup` does the rest. Everything below is the manual equivalent.
    `SHOW_TOOL_ACTIVITY` (true), `PERMISSION_MODE` ("bypassPermissions"), `MODEL`,
    `IDLE_INJECT_SECONDS` (15), `ACTIVE_WINDOW_MIN` (30), `PRUNE_AFTER_DAYS` (1),
    `PRUNE_MODE` ("close" | "delete"), `POLL_MS` (2000),
-   `TOPIC_OPENER` ("minimal" | "off" | "full" — the first message posted into a new topic).
+   `TOPIC_OPENER` ("minimal" | "off" | "full" — the first message posted into a new topic),
+   `BUTTONS` (true — inline action bar on each mirrored reply + a /sessions picker),
+   `AUTO_CONFIGURE_GROUP` (true — apply group/bot appearance from `APPEARANCE` on boot).
 
 > **Permissions — two ways to run it:**
 > - **`bypassPermissions`** (default): phone-injected turns run tools without prompts. Anyone
@@ -180,6 +182,18 @@ From a source checkout: `git pull && npm test && touch ~/.claude-gateway/restart
   A clarifying question in Claude's reply just streams to you; answer in the topic to continue.
 - A single-instance lock prevents two gateways from fighting over `getUpdates`. Linux users: a
   `systemd --user` unit is in `systemd/` (macOS uses the bundled launchd installer).
+
+### Appearance (optional)
+
+With `AUTO_CONFIGURE_GROUP` on (default), the gateway configures its own group + bot identity on
+boot from the `APPEARANCE` block: group title/description/photo, the bot's global name/about/
+description, and the command menu. It is idempotent — a per-scope hash in
+`~/.claude-gateway/appearance.json` means it only acts on first run or when a value changes, so
+frequent restarts stay silent. `APPEARANCE` carries only what should differ from the live group/bot;
+unset fields are left untouched. **A group photo is only set when the group has none** — a
+representative icon you set by hand is never overwritten (add `"force_photo": true` to a chat entry
+to override). The bot must be a group Admin with **Change Group Info**. Chat wallpaper is not
+settable via the Bot API — it stays a manual in-app choice.
 
 ---
 

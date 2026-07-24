@@ -74,6 +74,37 @@ bot's rights in the group (Admin → Manage Topics) and re-run.
 
 ---
 
+## Test F — Inline action buttons
+
+**Why:** buttons ride the live callback plumbing; only a real Telegram round-trip exercises them.
+
+1. From the Mac, run a session in a mapped repo so a topic appears and a prose reply mirrors in.
+2. Confirm the reply carries a **🖥️ Desk · ✏️ Rename · ❌ Close** bar. Send another desk turn;
+   confirm the bar moves to the newest reply and the previous one loses its buttons.
+3. Tap **🖥️ Desk** → the session opens in your editor on the Mac; the toast says "Opening on your Mac".
+4. Tap **❌ Close** → the topic closes and the session unbinds (same as `/exit`).
+5. In another topic, send `/sessions` → a tappable list appears; tap one → "Linked", then send a
+   message and confirm it continues that session.
+6. Set `"BUTTONS": false`, restart, and confirm replies have no bar and `/sessions` falls back to text.
+
+---
+
+## Test G — Group auto-config
+
+**Why:** appearance calls hit setChat*/setMy* once; verify they apply and then stay silent.
+
+1. With `APPEARANCE` set and the bot an Admin with **Change Group Info**, start the gateway.
+2. Confirm the log shows `[Appearance] configuring as @<bot>` and one or more `updated` lines, and
+   that the group title/description and the bot's about/description changed in Telegram. A group that
+   **already has a photo** keeps it (log: `already has a photo · leaving it`); a group with no photo
+   gets `default_photo_path`. To force-replace one, add `"force_photo": true` to that chat entry.
+3. `touch ~/.claude-gateway/restart.flag`. On relaunch, confirm **no** `updated` lines appear
+   (hash match → silent). Change `APPEARANCE.chats.<id>.title`, restart, and confirm only that chat
+   re-applies.
+4. Confirm `~/.claude-gateway/appearance.json` holds a `botProfile` hash and a per-chat hash.
+
+---
+
 ## Quick reference
 
 | Check | Command |
