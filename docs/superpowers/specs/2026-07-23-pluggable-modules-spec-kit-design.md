@@ -68,16 +68,29 @@ A module is a **factory** that receives the curated `api` and returns a hooks ob
 module.exports = (api) => ({
   name: 'spec-kit',
   onTranscriptLine(ctx, record) { /* each new transcript record, per session */ },
+  onInjectedTurn(ctx, prompt)   { /* a turn the gateway drove on the user's behalf */ },
   onTick(now)                   { /* once per poll tick — settle-window timers */ },
 });
 ```
 
 Every hook is optional. `ctx = { sessionId, cwd, chatId, threadId }`.
 
-v1 ships two hooks (`onTranscriptLine`, `onTick`). A third, `onTelegramUpdate(update)`, is a
-natural extension for modules that react to inbound Telegram messages, but nothing in v1 uses
-it, so it is deferred — adding it later is an isolated dispatch-point change, not a contract
-break.
+v1 ships three hooks (`onTranscriptLine`, `onInjectedTurn`, `onTick`). A fourth,
+`onTelegramUpdate(update)`, is a natural extension for modules that react to inbound Telegram
+messages, but nothing in v1 uses it, so it is deferred — adding it later is an isolated
+dispatch-point change, not a contract break.
+
+**Why `onInjectedTurn` exists (two arming paths).** A module watches Claude *output* via
+`onTranscriptLine`, which sees the mirrored transcript stream. But when the user texts a
+command from Telegram, the gateway *injects* that turn on their behalf (`driveTurn`) and
+deliberately suppresses the whole turn from the mirror — the read offset jumps past it so the
+gateway never echoes back what it just sent. A module keyed only off the transcript would
+therefore never see a texted-in command (nor its output). The fix is not to fish the command
+out of a stream the gateway is hiding: for an injected turn the gateway *already holds* the
+exact prompt, so it hands it to modules directly via `onInjectedTurn(ctx, prompt)`. Result:
+desk-typed commands arm through `onTranscriptLine`; texted-in commands arm through
+`onInjectedTurn`; the settle-driven reaction (`onTick`, keyed purely on the transcript file's
+idle time) is identical for both. This is a general gateway capability, not spec-kit-specific.
 
 ### The api (the only surface modules touch)
 
@@ -138,17 +151,22 @@ is load-bearing, not optional.
 { armedStep: '/plan'|null, armedAt: <ms>, firedSteps: ['/specify', ...], reviewFired: false }
 ```
 
-### Detection (`onTranscriptLine`)
+### Detection (two arming paths → one `arm()`)
 
-Slash commands appear as a `type:'user'` record whose content string contains
-`<command-name>/X</command-name>` (verified against real transcripts —
-`renderTranscriptLine` already filters these `<...>` records out of the mirror at
-gateway.js:657, so the raw content is where the command name lives).
+A spec-kit command reaches the module one of two ways, and both funnel into the same internal
+`arm(sessionId, cmd)`:
 
-- Extract `/X` via regex from user records.
-- If `/X` ∈ `STEP_COMMANDS` (default `/specify /clarify /plan /tasks /analyze /implement`,
-  configurable) → set `armedStep = /X`, `armedAt = now`. This auto-arms any session in any
-  repo the instant a spec-kit command appears.
+- **Desk-typed** (`onTranscriptLine`): slash commands appear as a `type:'user'` record whose
+  content string contains `<command-name>/X</command-name>` (verified against real transcripts
+  — `renderTranscriptLine` already filters these `<...>` records out of the mirror, so the raw
+  content is where the command name lives). `extractCommand(record)` pulls `/X`.
+- **Texted-in** (`onInjectedTurn`): the gateway drove the turn, so the raw prompt (e.g. `/plan`
+  or `/plan do the thing`) is handed over directly. `commandFromText(prompt)` pulls the leading
+  `/X`.
+
+`arm()`: if `/X` ∈ `STEP_COMMANDS` (default `/specify /clarify /plan /tasks /analyze
+/implement`, configurable) → set `armedStep = /X`, `armedAt = now`. This auto-arms any session
+in any repo the instant a spec-kit command appears, whether typed at the desk or texted in.
 
 ### Reaction (settle-driven, in `onTick`)
 

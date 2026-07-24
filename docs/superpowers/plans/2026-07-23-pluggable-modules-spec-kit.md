@@ -955,6 +955,161 @@ git commit -m "docs(modules): config key, module authoring guide, test wiring"
 
 ---
 
+## Task 9: General `onInjectedTurn` hook — arm on texted-in commands
+
+Added after the final whole-branch review: the `onTranscriptLine` tap never sees a command the
+user texts from Telegram, because `driveTurn` suppresses the injected turn from the mirror and
+jumps the read offset past it (gateway.js:985). A module watching only the transcript would
+never arm on the primary remote path. The gateway already holds the injected prompt, so it
+hands it to modules directly via a new **general** hook `onInjectedTurn(ctx, prompt)`. spec-kit
+consumes it; the desk path (`onTranscriptLine`) is unchanged; the reaction (`onTick`, keyed on
+file idle time) is unchanged. This is a generic gateway capability, not a spec-kit special case.
+
+**Files:**
+- Modify: `gateway.js` (emit `injectedTurn` from `driveTurn`, inside the `if (finalSid)` block)
+- Modify: `examples/modules/spec-kit.js` (add `commandFromText`, share an `arm()` internal, add `onInjectedTurn`; also tighten `recordText` to `b.type === 'text'`)
+- Test: `examples/modules/spec-kit.test.js`
+
+**Interfaces:**
+- Consumes: `moduleRegistry` (Task 4), `repoDir`/`chatId`/`threadId`/`prompt`/`finalSid` (all in scope in `driveTurn`).
+- Produces:
+  - Generic hook `onInjectedTurn(ctx, prompt)` — `emit('injectedTurn', ctx, prompt)` maps to it via the existing registry (no registry change). `ctx = { sessionId, cwd, chatId, threadId }`.
+  - `commandFromText(text)` → `'/x'` | `null` (leading slash command of a raw prompt, lowercased).
+
+- [ ] **Step 1: Write the failing tests**
+
+Add to `examples/modules/spec-kit.test.js`:
+
+```js
+test('commandFromText: leading slash command of a raw prompt, lowercased', () => {
+  assert.equal(m.commandFromText('/plan'), '/plan');
+  assert.equal(m.commandFromText('/plan do the thing'), '/plan');
+  assert.equal(m.commandFromText('  /Implement'), '/implement');
+  assert.equal(m.commandFromText('hello there'), null);
+  assert.equal(m.commandFromText(null), null);
+});
+
+test('spec-kit: onInjectedTurn arms a texted-in command, then a settled tick compacts', () => {
+  const api = fakeApi({ info: { cwd: '/repo', mtime: 0 } });
+  const mod = require('./spec-kit.js')(api);
+  mod.onInjectedTurn({ sessionId: 'S', cwd: '/repo', chatId: '1', threadId: 2 }, '/plan do it');
+  mod.onTick(9_999_999);
+  assert.deepEqual(api.calls.inject, [['S', '/compact']]);
+  assert.match(api.calls.post[0][1], /plan/);
+});
+
+test('spec-kit: onInjectedTurn ignores /compact (loop-safety)', () => {
+  const api = fakeApi();
+  const mod = require('./spec-kit.js')(api);
+  mod.onInjectedTurn({ sessionId: 'S' }, '/compact');
+  mod.onTick(9_999_999);
+  assert.equal(api.calls.inject.length, 0);
+  assert.equal(api.calls.spawn.length, 0);
+});
+
+test('extractCommand: a non-text block carrying a command string is ignored', () => {
+  const rec = { type: 'user', message: { content: [{ type: 'tool_result', text: '<command-name>/plan</command-name>' }] } };
+  assert.equal(m.extractCommand(rec), null);
+});
+```
+
+- [ ] **Step 2: Run to verify failure**
+
+Run: `node --test examples/modules/spec-kit.test.js`
+Expected: FAIL — `m.commandFromText is not a function`, and `onInjectedTurn` is not a function on the module.
+
+- [ ] **Step 3: Implement**
+
+In `examples/modules/spec-kit.js`:
+
+Tighten `recordText`'s array branch to text blocks only:
+```js
+  if (Array.isArray(c)) return c.map((b) => (b && b.type === 'text' && typeof b.text === 'string' ? b.text : '')).join(' ');
+```
+
+Add `commandFromText` after `extractCommand`:
+```js
+// A texted-in command arrives as the raw prompt the user sent (e.g. "/plan" or "/plan foo").
+function commandFromText(text) {
+  const mtch = /^\s*(\/[a-z0-9:_-]+)/i.exec(typeof text === 'string' ? text : '');
+  return mtch ? mtch[1].toLowerCase() : null;
+}
+```
+
+In `factory`, replace the inline arm logic in `onTranscriptLine` with a shared `arm()` and add `onInjectedTurn`:
+```js
+  const store = api.state('spec-kit');   // { data, save() }
+
+  // Desk-typed (onTranscriptLine) and texted-in (onInjectedTurn) commands both funnel here.
+  function arm(sessionId, cmd) {
+    if (!cmd || !STEP_COMMANDS.includes(cmd)) return;   // /compact & /code-review excluded → no re-arm
+    const prev = store.data[sessionId] || {};
+    store.data[sessionId] = {
+      armedStep: cmd,
+      armedAt: Date.now(),
+      firedSteps: prev.firedSteps || [],
+      reviewFired: prev.reviewFired || false,
+    };
+    store.save();
+  }
+
+  return {
+    name: 'spec-kit',
+    onTranscriptLine(ctx, record) { arm(ctx.sessionId, extractCommand(record)); },
+    onInjectedTurn(ctx, prompt) { arm(ctx.sessionId, commandFromText(prompt)); },
+    onTick(now) {
+      // ...unchanged...
+    },
+  };
+```
+
+At the end of the file, export the new helper (after `module.exports = factory;`):
+```js
+module.exports.commandFromText = commandFromText;
+```
+
+In `gateway.js`, inside `driveTurn`'s `if (finalSid) { ... }` block, immediately after `if (!reserved.includes(finalSid)) reserved.push(finalSid);`:
+```js
+      // The gateway drove this turn on the user's behalf, so it already holds the prompt.
+      // Injected turns are suppressed from the transcript mirror (the offset jumped past them
+      // just above), so the transcriptLine tap never sees them — hand the prompt to modules
+      // directly. This is how a module arms on a command texted in from Telegram, without
+      // reaching into a stream the gateway deliberately hides.
+      moduleRegistry.emit('injectedTurn', { sessionId: finalSid, cwd: repoDir, chatId, threadId }, prompt);
+```
+
+- [ ] **Step 4: Run to verify pass**
+
+Run: `node --test examples/modules/spec-kit.test.js` then `node --test test/*.test.js examples/modules/*.test.js`
+Expected: PASS (all green; the new spec-kit tests plus the unchanged core/gateway tests).
+
+Also confirm the boot guard still holds:
+Run: `node -e "require('./gateway.js'); console.log('require OK — no boot')"`
+Expected: prints `require OK — no boot`.
+
+- [ ] **Step 5: Update the module docs**
+
+In `examples/modules/README.md`, add `onInjectedTurn` to the module contract and note the two arming paths + that hooks are synchronous:
+
+```markdown
+    module.exports = (api) => ({
+      name: 'spec-kit',
+      onTranscriptLine(ctx, record) { /* each new transcript record */ },
+      onInjectedTurn(ctx, prompt)   { /* a turn the gateway drove on the user's behalf */ },
+      onTick(now)                   { /* once per poll tick */ },
+    });
+```
+Add prose: `onInjectedTurn` fires when the gateway drives a turn for the user (e.g. a command texted in from Telegram); such turns are suppressed from the transcript mirror, so `onTranscriptLine` never sees them — react to `onInjectedTurn` for the texted-in path and `onTranscriptLine` for desk-typed activity. Hooks are called synchronously; a hook that returns a rejected promise is outside the per-module try/catch, so keep hook bodies synchronous.
+
+- [ ] **Step 6: Commit**
+
+```bash
+git add gateway.js examples/modules/spec-kit.js examples/modules/spec-kit.test.js examples/modules/README.md
+git commit -m "feat(modules): general onInjectedTurn hook — spec-kit arms on texted-in commands"
+```
+
+---
+
 ## Manual / integration acceptance (post-implementation)
 
 Not a unit test — the live run is the real acceptance, as with auto-approve:
