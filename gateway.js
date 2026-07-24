@@ -85,6 +85,10 @@ const IDLE_INJECT_MS = (config.IDLE_INJECT_SECONDS || 15) * 1000;
 const ACTIVE_WINDOW_MS = (config.ACTIVE_WINDOW_MIN || 30) * 60_000;
 const PRUNE_AFTER_MS = (config.PRUNE_AFTER_DAYS || 1) * 86_400_000;
 const PRUNE_MODE = config.PRUNE_MODE || 'close';   // "close" | "delete"
+// Bound the prune network calls one tick issues so a large idle backlog (e.g. dozens of restored
+// sessions on boot) can't monopolize a tick — the remainder catches up on the next ticks, keeping
+// each tick short and the restart flag responsive. Mirrors the topics-per-tick=1 create cap.
+const PRUNES_PER_TICK = config.PRUNES_PER_TICK || 5;
 const POLL_MS = config.POLL_MS || 2000;
 const MIRROR_FLUSH_MS = config.MIRROR_FLUSH_MS || 4000;  // min gap between mirror posts per topic
 // Inline action buttons: attach a per-session action bar (Desk / Rename / Close) to each mirrored
@@ -1506,6 +1510,24 @@ async function handleActionCallback(act, cb) {
 const RESTART_FLAGS = [path.join(STATE_DIR, 'restart.flag'), path.join(__dirname, 'restart.flag')];
 function seenRestartFlag() { return RESTART_FLAGS.find((f) => { try { return fs.existsSync(f); } catch (e) { return false; } }); }
 
+// Honor a restart only when the flag is present AND no phone-injected turn is mid-flight, so
+// `touch restart.flag` never kills a session mid-reply. Pure so the gate is unit-tested.
+function restartReady(flagPresent, injectingSize) { return Boolean(flagPresent) && injectingSize === 0; }
+
+// Checked at the top of the tick AND inside the per-session loop: one tick can iterate dozens of
+// sessions with a network call each (prune/mirror), so a top-of-tick-only check made a
+// `touch restart.flag` wait out the whole slow tick. Bailing mid-loop keeps restarts responsive
+// even under a large prune backlog. Returns true (after exiting) when it honors the flag.
+function honorRestartIfReady() {
+  const flag = seenRestartFlag();
+  if (!restartReady(flag, injecting.size)) return false;
+  try { fs.unlinkSync(flag); } catch (e) { /* */ }
+  console.log('[Restart] restart.flag seen and no turns in flight — exiting for launchd relaunch.');
+  persistLinks();
+  process.exit(1);   // non-zero → KeepAlive relaunches
+  return true;       // unreachable under a real process.exit; kept for test stubs
+}
+
 // Loaded at boot from config.MODULES; a no-op registry until then so the mirror
 // loop can call moduleRegistry.emit() unconditionally with zero overhead.
 let moduleRegistry = createModuleRegistry([], console.error);
@@ -1515,19 +1537,15 @@ async function pollTick() {
   if (polling) return;
   polling = true;
   try {
-    const flag = seenRestartFlag();
-    if (flag && injecting.size === 0) {
-      try { fs.unlinkSync(flag); } catch (e) { /* */ }
-      console.log('[Restart] restart.flag seen and no turns in flight — exiting for launchd relaunch.');
-      persistLinks();
-      process.exit(1);   // non-zero → KeepAlive relaunches
-    }
+    if (honorRestartIfReady()) return;
     const now = Date.now();
     let topicsThisTick = 0;
+    let prunesThisTick = 0;
     const files = allSessionFiles();
     const existingIds = new Set(files.map((f) => path.basename(f, '.jsonl')));
 
     for (const file of files) {
+      if (honorRestartIfReady()) return;   // bail promptly even mid-backlog
       const id = path.basename(file, '.jsonl');
       let st; try { st = fs.statSync(file); } catch (e) { continue; }
       const cwd = await getCwd(file);
@@ -1549,7 +1567,10 @@ async function pollTick() {
         }
         continue;
       }
-      if (!link.closed && shouldPrune(st.mtimeMs, now)) { await pruneTopic(id); continue; }
+      if (!link.closed && shouldPrune(st.mtimeMs, now)) {
+        if (prunesThisTick >= PRUNES_PER_TICK) continue;   // over the per-tick cap → catch up next tick
+        await pruneTopic(id); prunesThisTick++; continue;
+      }
       if (link.closed) { if (isActive(st.mtimeMs, now)) await reviveTopic(id); else continue; }
 
       // Mirror new lines, throttled per topic so a busy desk session can't exceed Telegram limits.
@@ -2054,4 +2075,5 @@ module.exports = {
   postWithMarkup, closeSessionTopic,
   sha256, appearanceHash, buildCommandList, resolveBotProfile, resolveChatAppearance, chatPhotoPath,
   configureGroup,
+  restartReady,
 };

@@ -76,7 +76,8 @@ then `npm run setup` does the rest. Everything below is the manual equivalent.
    Optional keys (defaults shown): `MIRROR` (true), `AUTO_CREATE_TOPICS` (true),
    `SHOW_TOOL_ACTIVITY` (true), `PERMISSION_MODE` ("bypassPermissions"), `MODEL`,
    `IDLE_INJECT_SECONDS` (15), `ACTIVE_WINDOW_MIN` (30), `PRUNE_AFTER_DAYS` (1),
-   `PRUNE_MODE` ("close" | "delete"), `POLL_MS` (2000),
+   `PRUNE_MODE` ("close" | "delete"), `PRUNES_PER_TICK` (5 — cap on prune calls per poll so a
+   large idle backlog can't stall a tick or delay a `restart.flag`), `POLL_MS` (2000),
    `TOPIC_OPENER` ("minimal" | "off" | "full" — the first message posted into a new topic),
    `BUTTONS` (true — inline action bar on each mirrored reply + a /sessions picker),
    `AUTO_CONFIGURE_GROUP` (true — apply group/bot appearance from `APPEARANCE` on boot).

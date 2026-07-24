@@ -17,6 +17,7 @@
   "ACTIVE_WINDOW_MIN": 30,
   "PRUNE_AFTER_DAYS": 1,
   "PRUNE_MODE": "close",
+  "PRUNES_PER_TICK": 5,
   "POLL_MS": 2000,
   "MIRROR_FLUSH_MS": 4000,
   "_TOPIC_OPENER": "first message posted into a new topic: off | minimal (one line) | full (paragraph + where-it-left-off seed)",
