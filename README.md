@@ -108,6 +108,27 @@ tail -f gateway.log       # watch it live
 
 ---
 
+## Updating
+
+```bash
+npm i -g claude-code-telegram-gateway@latest
+touch ~/.claude-gateway/restart.flag
+```
+
+The second line matters: installing new files doesn't touch the gateway already running — it
+keeps the old code in memory until it restarts. `restart.flag` is watched in both
+`~/.claude-gateway/` and the install dir; the gateway waits for any in-flight turn to finish,
+then exits so launchd (or systemd) relaunches it on the new version. Unlike
+`launchctl kickstart`, it's safe to run from a phone-driven turn — the gateway won't kill the
+session that asked for the restart mid-reply.
+
+You don't need to re-run setup or reinstall the service: the plist points at a stable path, and
+config + state live in `~/.claude-gateway/`, outside the install dir, so an update can't wipe them.
+
+From a source checkout: `git pull && npm test && touch ~/.claude-gateway/restart.flag`.
+
+---
+
 ## Using it
 
 - **From the Mac:** just run `claude` in a mapped repo. Within ~30 min of activity a topic appears
