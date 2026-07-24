@@ -1011,6 +1011,30 @@ function queueForSession(sessionId, prompt) {
 }
 
 // ---------------------------------------------------------------------------
+// Module system: external files named in config.MODULES extend the gateway
+// against a curated api. Empty/absent MODULES → pure no-op (OSS-safety).
+// ---------------------------------------------------------------------------
+// A registry over already-instantiated modules ({ name, hooks }). emit() maps a
+// hook key to on<Hook> and calls it per module inside try/catch, so one module's
+// bug can never crash pollTick or affect another module/install.
+function createModuleRegistry(instances, log = console.error) {
+  const list = Array.isArray(instances) ? instances : [];
+  const method = (hook) => 'on' + hook.charAt(0).toUpperCase() + hook.slice(1);
+  return {
+    emit(hook, ...args) {
+      const fn = method(hook);
+      for (const m of list) {
+        const h = m.hooks && m.hooks[fn];
+        if (typeof h !== 'function') continue;
+        try { h(...args); }
+        catch (e) { log(`[Module ${m.name}] ${fn} threw: ${e.message}`); }
+      }
+    },
+    names() { return list.map((m) => m.name); },
+  };
+}
+
+// ---------------------------------------------------------------------------
 // Topic lifecycle
 // ---------------------------------------------------------------------------
 // Claude Code's own session name (e.g. "documents-f7"), from ~/.claude/sessions/*.json, so a topic
@@ -1617,4 +1641,5 @@ module.exports = {
   titleArgs, createTopicCooldown, parseRetryAfter, updateSocketTimeoutMs, UPDATE_POLL_TIMEOUT_S,
   STATE_DIR, STATE_FILES, migrateStateFiles, statePath,
   countUserTurns, dueForRename, RENAME_AFTER_TURNS,
+  createModuleRegistry,
 };
