@@ -972,3 +972,15 @@ test('chatPhotoPath: per-chat overrides default, null when neither set', () => {
   assert.equal(g.chatPhotoPath({ default_photo_path: 'd.png', chats: { '-1': { photo_path: 'c.png' } } }, '-1'), 'c.png');
   assert.equal(g.chatPhotoPath({ chats: {} }, '-1'), null);
 });
+
+test('restartReady: honors the flag only when no injected turn is in flight', () => {
+  assert.equal(g.restartReady('/x/restart.flag', 0), true);
+  assert.equal(g.restartReady('/x/restart.flag', 1), false);   // a phone turn is mid-reply — wait
+  assert.equal(g.restartReady('/x/restart.flag', 3), false);
+});
+
+test('restartReady: no flag means no restart, regardless of injection count', () => {
+  assert.equal(g.restartReady(null, 0), false);
+  assert.equal(g.restartReady(undefined, 0), false);
+  assert.equal(g.restartReady('', 0), false);
+});
