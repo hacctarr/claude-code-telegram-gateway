@@ -133,6 +133,11 @@ const AUTO_APPROVE = config.AUTO_APPROVE === true;
 // Default targets the Claude Code VS Code extension; Cursor/Windsurf users can swap the scheme.
 const DESK_URL_TEMPLATE = config.DESK_URL_TEMPLATE || 'vscode://anthropic.claude-code/open?session={session}';
 const DESK_OPEN_CMD = config.DESK_OPEN_CMD || 'open';   // macOS `open`; Linux users: "xdg-open"
+// Group auto-config: on boot, apply the group's title/description/photo, the bot's global
+// name/about/description, and the command menu, idempotently (per-scope hash in appearance.json).
+// APPEARANCE carries only what should differ from the live objects; unset fields are left untouched.
+const AUTO_CONFIGURE_GROUP = config.AUTO_CONFIGURE_GROUP !== false;
+const APPEARANCE = config.APPEARANCE || null;
 
 // repoDir (resolved) -> chatId, so a session's cwd tells us which supergroup owns it.
 function invertRepoMappings(mappings) {
@@ -1817,6 +1822,161 @@ async function pollUpdates() {
 }
 
 // ---------------------------------------------------------------------------
+// Group auto-config: pure helpers + boot-time apply
+// ---------------------------------------------------------------------------
+function sha256(bufOrString) { return crypto.createHash('sha256').update(bufOrString).digest('hex'); }
+function appearanceHash(obj) { return sha256(JSON.stringify(obj)); }
+
+// The bot's command menu — identical for every mapped chat.
+function buildCommandList() {
+  return [
+    { command: 'new',      description: 'Fresh session in its own topic' },
+    { command: 'sessions', description: 'List recent sessions in this repo' },
+    { command: 'desk',     description: 'Open this session in the editor on the Mac' },
+    { command: 'rename',   description: 'Rename this topic (bare = regenerate from content)' },
+    { command: 'exit',     description: 'Close this topic and stop mirroring' },
+    { command: 'resume',   description: 'Link this topic to an existing session' },
+  ];
+}
+
+// Bot-global profile. Each field is null unless APPEARANCE overrides it, so an unset field is never
+// pushed (setMyName/etc. skipped) and the live bot identity from getMe stays as-is.
+function resolveBotProfile(appearance = {}) {
+  return {
+    name: appearance.bot_name ?? null,
+    about: appearance.bot_about ?? null,
+    description: appearance.bot_description ?? null,
+  };
+}
+
+// Per-chat desired appearance (title/description default to null → not pushed). photoSha is passed
+// in so this stays pure; the caller hashes the actual photo bytes.
+function resolveChatAppearance(appearance = {}, chatId, photoSha = '') {
+  const cfg = (appearance.chats || {})[chatId] || {};
+  return {
+    title: cfg.title ?? null,
+    description: cfg.description ?? null,
+    photoSha,
+    commands: buildCommandList(),
+  };
+}
+
+// The photo file to use for a chat: its own override, else the shared default, else none.
+function chatPhotoPath(appearance = {}, chatId) {
+  const cfg = (appearance.chats || {})[chatId] || {};
+  return cfg.photo_path || appearance.default_photo_path || null;
+}
+
+// photo_path may be relative to the install dir (e.g. "assets/claude-logo.png").
+function resolveAssetPath(p) { return path.isAbsolute(p) ? p : path.join(__dirname, p); }
+
+const APPEARANCE_FILE = statePath('appearance.json');
+function loadAppearanceState() {
+  try { const s = JSON.parse(fs.readFileSync(APPEARANCE_FILE, 'utf8')); s.chats = s.chats || {}; return s; }
+  catch (e) { return { botProfile: null, chats: {} }; }
+}
+function saveAppearanceState(s) {
+  try { fs.writeFileSync(APPEARANCE_FILE, JSON.stringify(s, null, 2)); }
+  catch (e) { console.error(`appearance: state write failed (${e.message})`); }
+}
+
+// A wrapped JSON Bot API call for appearance: returns true on ok, logs and returns false otherwise.
+async function tgApply(method, payload) {
+  try {
+    const r = await telegramRequest(method, payload);
+    if (r && r.ok) return true;
+    console.error(`appearance: ${method} failed (${(r && r.description) || 'unknown'})`);
+    return false;
+  } catch (e) { console.error(`appearance: ${method} failed (${e.message})`); return false; }
+}
+
+// setChatPhoto needs multipart/form-data (a file upload), which telegramRequest (JSON) can't do.
+function setChatPhotoFile(chatId, filePath) {
+  return new Promise((resolve) => {
+    let photo;
+    try { photo = fs.readFileSync(filePath); }
+    catch (e) { console.error(`appearance: setChatPhoto read failed (${e.message})`); return resolve(false); }
+    const boundary = `----gwphoto${process.pid}`;
+    const pre = Buffer.from(
+      `--${boundary}\r\nContent-Disposition: form-data; name="chat_id"\r\n\r\n${chatId}\r\n` +
+      `--${boundary}\r\nContent-Disposition: form-data; name="photo"; filename="photo.png"\r\n` +
+      `Content-Type: image/png\r\n\r\n`);
+    const post = Buffer.from(`\r\n--${boundary}--\r\n`);
+    const body = Buffer.concat([pre, photo, post]);
+    const req = https.request({
+      hostname: 'api.telegram.org', port: 443, path: `/bot${BOT_TOKEN}/setChatPhoto`, method: 'POST',
+      headers: { 'Content-Type': `multipart/form-data; boundary=${boundary}`, 'Content-Length': body.length },
+    }, (res) => {
+      let b = ''; res.on('data', (c) => (b += c));
+      res.on('end', () => {
+        try { const j = JSON.parse(b); if (!j.ok) console.error(`appearance: setChatPhoto failed (${j.description})`); resolve(!!j.ok); }
+        catch (e) { resolve(false); }
+      });
+    });
+    req.setTimeout(SOCKET_TIMEOUT_MS, () => req.destroy(new Error('timeout')));
+    req.on('error', (e) => { console.error(`appearance: setChatPhoto failed (${e.message})`); resolve(false); });
+    req.write(body); req.end();
+  });
+}
+
+// Boot-time, idempotent group + bot appearance. Reads live identity (getMe), applies bot-global
+// profile once per value change, then each mapped chat's title/description/photo/commands/menu.
+// A per-scope hash in appearance.json keeps frequent restarts silent; a partial failure leaves the
+// old hash so the next boot retries just that scope.
+async function configureGroup() {
+  if (!AUTO_CONFIGURE_GROUP || !APPEARANCE) return;
+  const state = loadAppearanceState();
+
+  let me = null;
+  try { const r = await telegramRequest('getMe'); if (r && r.ok) me = r.result; } catch (e) { /* */ }
+  if (me) console.log(`[Appearance] configuring as @${me.username || me.first_name}`);
+
+  // Bot-global profile (scoped to this bot; applied once per value change).
+  if (APPEARANCE.set_bot_profile !== false) {
+    const desired = resolveBotProfile(APPEARANCE);
+    const h = appearanceHash(desired);
+    if (h !== state.botProfile) {
+      let ok = true;
+      if (desired.name != null)        ok = (await tgApply('setMyName', { name: desired.name })) && ok;
+      if (desired.about != null)       ok = (await tgApply('setMyShortDescription', { short_description: desired.about })) && ok;
+      if (desired.description != null) ok = (await tgApply('setMyDescription', { description: desired.description })) && ok;
+      if (ok) { state.botProfile = h; console.log('[Appearance] bot profile updated'); }
+    }
+  }
+
+  // Per mapped chat: title / description / photo / commands / menu, keyed by chat id.
+  for (const chatId of Object.keys(REPO_MAPPINGS)) {
+    const cfg = (APPEARANCE.chats || {})[chatId] || {};
+    const photoPath = chatPhotoPath(APPEARANCE, chatId);
+    let photoSha = '';
+    if (photoPath) { try { photoSha = sha256(fs.readFileSync(resolveAssetPath(photoPath))); } catch (e) { photoSha = ''; } }
+    const h = appearanceHash(resolveChatAppearance(APPEARANCE, chatId, photoSha));
+    if (h === state.chats[chatId]) continue;
+
+    // A group photo should be representative of that group; the operator sets those by hand. Check
+    // the live chat first and only set a photo when the group has NONE (bootstrap a fresh group),
+    // unless the chat entry opts in with force_photo. getChat failure is treated as "has a photo"
+    // so an API hiccup never overwrites one.
+    let hasPhoto = true;
+    try { const c = await telegramRequest('getChat', { chat_id: chatId }); if (c && c.ok) hasPhoto = !!(c.result && c.result.photo); } catch (e) { /* keep hasPhoto=true */ }
+
+    let ok = true;
+    if (cfg.title != null)       ok = (await tgApply('setChatTitle', { chat_id: chatId, title: cfg.title })) && ok;
+    if (cfg.description != null) ok = (await tgApply('setChatDescription', { chat_id: chatId, description: cfg.description })) && ok;
+    if (photoPath && photoSha && (!hasPhoto || cfg.force_photo === true)) {
+      ok = (await setChatPhotoFile(chatId, resolveAssetPath(photoPath))) && ok;
+    } else if (photoPath && hasPhoto) {
+      console.log(`[Appearance] chat ${chatId} already has a photo · leaving it`);
+    }
+    ok = (await tgApply('setMyCommands', { commands: buildCommandList(), scope: { type: 'chat', chat_id: Number(chatId) } })) && ok;
+    ok = (await tgApply('setChatMenuButton', { chat_id: chatId, menu_button: { type: 'commands' } })) && ok;
+    if (ok) { state.chats[chatId] = h; console.log(`[Appearance] chat ${chatId} updated`); }
+  }
+
+  saveAppearanceState(state);
+}
+
+// ---------------------------------------------------------------------------
 // Boot
 // ---------------------------------------------------------------------------
 const LOCK_FILE = path.join(STATE_DIR, '.gateway.lock');
@@ -1866,6 +2026,7 @@ if (require.main === module) {
   console.log(`Mirror: ${MIRROR ? 'on' : 'off'} · auto-topics: ${AUTO_CREATE_TOPICS ? 'on' : 'off'} · prune: ${PRUNE_MODE} after ${PRUNE_AFTER_MS / 86400000}d`);
   console.log(`Restored ${Object.keys(linkBySession).length} linked session(s). Poll ${POLL_MS}ms.`);
   console.log("Listening for Topic messages + mirroring desk sessions...");
+  configureGroup().catch((e) => console.error('appearance:', e.message));
   pollUpdates();
   setInterval(pollTick, POLL_MS);
   pollTick();
@@ -1885,4 +2046,6 @@ module.exports = {
   buildSpawnArgs, spawnSession, buildModuleApi,
   chunkText, parseActionCallback, buildSessionActionBar, buildSessionPickerKeyboard,
   postWithMarkup, closeSessionTopic,
+  sha256, appearanceHash, buildCommandList, resolveBotProfile, resolveChatAppearance, chatPhotoPath,
+  configureGroup,
 };

@@ -928,3 +928,47 @@ test('buildSessionPickerKeyboard: caps at max rows and returns null when empty',
   assert.equal(g.buildSessionPickerKeyboard(many, 12).inline_keyboard.length, 12);
   assert.equal(g.buildSessionPickerKeyboard([]), null);
 });
+
+// --- Group auto-config: pure helpers (Task 3) ------------------------------
+test('buildCommandList: six commands, lowercase names, non-empty descriptions', () => {
+  const cmds = g.buildCommandList();
+  assert.equal(cmds.length, 6);
+  assert.deepEqual(cmds.map((c) => c.command), ['new', 'sessions', 'desk', 'rename', 'exit', 'resume']);
+  for (const c of cmds) {
+    assert.match(c.command, /^[a-z]+$/);
+    assert.ok(c.description.length > 0 && c.description.length <= 256);
+  }
+});
+
+test('appearanceHash: stable for same input, changes when any field changes', () => {
+  const a = g.appearanceHash({ title: 'x', description: 'y', photoSha: 'z', commands: g.buildCommandList() });
+  const b = g.appearanceHash({ title: 'x', description: 'y', photoSha: 'z', commands: g.buildCommandList() });
+  const c = g.appearanceHash({ title: 'x', description: 'CHANGED', photoSha: 'z', commands: g.buildCommandList() });
+  assert.equal(a, b);
+  assert.notEqual(a, c);
+});
+
+test('resolveBotProfile: nulls when unset, values when set', () => {
+  assert.deepEqual(g.resolveBotProfile({}), { name: null, about: null, description: null });
+  assert.deepEqual(
+    g.resolveBotProfile({ bot_name: 'N', bot_about: 'A', bot_description: 'D' }),
+    { name: 'N', about: 'A', description: 'D' });
+});
+
+test('resolveChatAppearance: pulls the per-chat entry, defaults title/description to null', () => {
+  const appearance = { chats: { '-100': { title: 'T', description: 'D' } } };
+  const r = g.resolveChatAppearance(appearance, '-100', 'sha123');
+  assert.equal(r.title, 'T');
+  assert.equal(r.description, 'D');
+  assert.equal(r.photoSha, 'sha123');
+  assert.equal(r.commands.length, 6);
+  const missing = g.resolveChatAppearance(appearance, '-999', '');
+  assert.equal(missing.title, null);
+  assert.equal(missing.description, null);
+});
+
+test('chatPhotoPath: per-chat overrides default, null when neither set', () => {
+  assert.equal(g.chatPhotoPath({ default_photo_path: 'd.png', chats: {} }, '-1'), 'd.png');
+  assert.equal(g.chatPhotoPath({ default_photo_path: 'd.png', chats: { '-1': { photo_path: 'c.png' } } }, '-1'), 'c.png');
+  assert.equal(g.chatPhotoPath({ chats: {} }, '-1'), null);
+});
