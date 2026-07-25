@@ -210,3 +210,22 @@ test('formatStats renders a compact summary from a snapshot', () => {
 test('buildCommandList includes /stats', () => {
   assert.ok(gw.buildCommandList().some(c => c.command === 'stats'));
 });
+
+test('config.example.json documents the otlp block', () => {
+  const fs = require('node:fs');
+  const path = require('node:path');
+  const cfg = JSON.parse(fs.readFileSync(path.join(__dirname, '..', 'config.example.json'), 'utf8'));
+  assert.ok(cfg.otlp, 'otlp key present');
+  assert.ok('endpoint' in cfg.otlp && 'auth' in cfg.otlp && 'enabled' in cfg.otlp);
+  assert.strictEqual(cfg.otlp.enabled, false, 'example ships disabled so the gateway is a no-op out of the box');
+});
+
+test('grafana dashboard JSON is valid and targets normalized metric names', () => {
+  const fs = require('node:fs');
+  const path = require('node:path');
+  const dash = JSON.parse(fs.readFileSync(path.join(__dirname, '..', 'grafana', 'gateway-dashboard.json'), 'utf8'));
+  const blob = JSON.stringify(dash);
+  assert.match(blob, /gateway_claude_turn_total/);
+  assert.match(blob, /gateway_topic_create_failed_total/);
+  assert.ok(Array.isArray(dash.panels) && dash.panels.length >= 3);
+});
