@@ -85,12 +85,119 @@ function createTelemetry(opts = {}) {
     };
   }
 
-  // Placeholder stubs filled in Task 2.
-  function buildOtlpPayload() { return { resourceMetrics: [] }; }
-  function exportOtlp() { return Promise.resolve({ skipped: true }); }
-  async function flush() { persist(); }
-  function start() { loadPersisted(); }
-  async function stop() { await flush(); }
+  function kvAttrs(attrs) {
+    return Object.entries(attrs).map(([k, v]) => ({
+      key: k,
+      value: typeof v === 'number' ? { asInt: String(v) } : { stringValue: String(v) },
+    }));
+  }
+
+  function buildOtlpPayload(snap, nowNano, resourceAttrs = {}) {
+    const startNano = String(BigInt(snap.startMs) * 1000000n);
+    const tNano = String(nowNano);
+    const metrics = [];
+
+    for (const c of snap.counters) {
+      metrics.push({
+        name: c.name,
+        sum: {
+          aggregationTemporality: 2, // CUMULATIVE
+          isMonotonic: true,
+          dataPoints: [{
+            asDouble: c.value,
+            startTimeUnixNano: startNano,
+            timeUnixNano: tNano,
+            attributes: kvAttrs(c.attrs),
+          }],
+        },
+      });
+    }
+
+    for (const g of snap.gauges) {
+      metrics.push({
+        name: g.name,
+        gauge: { dataPoints: [{ asDouble: g.value, timeUnixNano: tNano, attributes: kvAttrs(g.attrs) }] },
+      });
+    }
+
+    for (const [name, value] of Object.entries(snap.observables)) {
+      if (value == null) continue;
+      metrics.push({
+        name,
+        gauge: { dataPoints: [{ asDouble: value, timeUnixNano: tNano, attributes: [] }] },
+      });
+    }
+
+    for (const h of snap.histos) {
+      metrics.push({
+        name: h.name,
+        histogram: {
+          aggregationTemporality: 2,
+          dataPoints: [{
+            count: String(h.count),
+            sum: h.sum,
+            min: h.min,
+            max: h.max,
+            bucketCounts: [String(h.count)], // single implicit bucket
+            explicitBounds: [],
+            startTimeUnixNano: startNano,
+            timeUnixNano: tNano,
+            attributes: kvAttrs(h.attrs),
+          }],
+        },
+      });
+    }
+
+    return {
+      resourceMetrics: [{
+        resource: { attributes: kvAttrs({ 'service.name': 'telegram-gateway', ...resourceAttrs }) },
+        scopeMetrics: [{ scope: { name: 'gateway' }, metrics }],
+      }],
+    };
+  }
+
+  function exportOtlp() {
+    if (!otlp.enabled || !otlp.endpoint || !otlp.auth) return Promise.resolve({ skipped: true });
+    const body = JSON.stringify(buildOtlpPayload(snapshot(), BigInt(now()) * 1000000n));
+    const url = new URL(otlp.endpoint.replace(/\/$/, '') + '/v1/metrics');
+    return new Promise((resolve) => {
+      const req = httpsMod.request({
+        method: 'POST',
+        hostname: url.hostname,
+        path: url.pathname,
+        port: url.port || 443,
+        headers: {
+          'Content-Type': 'application/json',
+          'Content-Length': Buffer.byteLength(body),
+          'Authorization': `Basic ${otlp.auth}`,
+        },
+      }, (res) => {
+        res.resume();
+        res.on('end', () => resolve({ status: res.statusCode }));
+      });
+      req.on('error', (e) => resolve({ error: e.message }));
+      req.write(body);
+      req.end();
+    });
+  }
+
+  async function flush() {
+    try { await exportOtlp(); } catch (e) { /* never let telemetry break the gateway */ }
+    persist();
+  }
+
+  function start() {
+    loadPersisted();
+    if (!timer) {
+      timer = setInterval(() => { flush().catch(() => {}); }, flushIntervalMs);
+      if (timer.unref) timer.unref();
+    }
+  }
+
+  async function stop() {
+    if (timer) { clearInterval(timer); timer = null; }
+    await flush();
+  }
 
   return {
     count, gauge, record, registerObservable, snapshot,
