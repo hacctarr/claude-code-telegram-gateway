@@ -1932,6 +1932,12 @@ async function pollUpdates() {
           continue;
         }
 
+        // /stats: gateway usage and reliability summary from the local metric mirror.
+        if (text === '/stats') {
+          sendPlain(chatId, threadId, formatStats(telemetry.snapshot(), Date.now() - telemetry._startMs));
+          continue;
+        }
+
         // /new <message> — brand-new session in its own new topic.
         if (text.startsWith('/new ')) {
           const firstMsg = text.substring(5).trim();
@@ -2019,6 +2025,32 @@ async function pollUpdates() {
 function sha256(bufOrString) { return crypto.createHash('sha256').update(bufOrString).digest('hex'); }
 function appearanceHash(obj) { return sha256(JSON.stringify(obj)); }
 
+function humanizeMs(ms) {
+  const h = Math.floor(ms / 3600000);
+  const m = Math.floor((ms % 3600000) / 60000);
+  return h ? `${h}h ${m}m` : `${m}m`;
+}
+
+function formatStats(snap, uptimeMs) {
+  const sum = (name, match = {}) => snap.counters
+    .filter((c) => c.name === name && Object.entries(match).every(([k, v]) => c.attrs[k] === v))
+    .reduce((a, c) => a + c.value, 0);
+  const turns = sum('gateway.claude.turn');
+  const inj = sum('gateway.drive.injection');
+  const created = sum('gateway.topic.created');
+  const pruned = sum('gateway.topic.pruned');
+  const failed = sum('gateway.topic.create_failed');
+  const rl = sum('gateway.topic.create_failed', { reason: 'rate_limited' });
+  const blocked = sum('gateway.access.blocked');
+  const active = snap.observables['gateway.sessions.active'] ?? 'n/a';
+  return [
+    `📊 Gateway (up ${humanizeMs(uptimeMs)})`,
+    `Turns ${turns} · Injections ${inj} · Topics +${created} / pruned ${pruned}`,
+    `Topic failures ${failed}${rl ? ` (${rl} rate-limited)` : ''}${failed ? ' ⚠️' : ''}`,
+    `Active sessions ${active} · Blocked ${blocked}`,
+  ].join('\n');
+}
+
 // The bot's command menu — identical for every mapped chat.
 function buildCommandList() {
   return [
@@ -2029,6 +2061,7 @@ function buildCommandList() {
     { command: 'exit',     description: 'Close this topic and stop mirroring' },
     { command: 'tools',    description: 'Show or set tool-step mirroring (on|off [all])' },
     { command: 'resume',   description: 'Link this topic to an existing session' },
+    { command: 'stats',    description: 'Gateway usage & reliability stats' },
   ];
 }
 
@@ -2257,4 +2290,5 @@ module.exports = {
   configureGroup,
   restartReady,
   repoOf,
+  formatStats, humanizeMs,
 };

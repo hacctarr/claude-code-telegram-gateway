@@ -182,3 +182,31 @@ test('repoOf maps a cwd under a mapped repo to its basename', () => {
   assert.strictEqual(gw.repoOf('/tmp/whatever', mappings), 'whatever');
   assert.strictEqual(gw.repoOf('', mappings), 'unknown');
 });
+
+test('formatStats renders a compact summary from a snapshot', () => {
+  const snap = {
+    startMs: 0,
+    counters: [
+      { name: 'gateway.claude.turn', attrs: { repo: 'a', mode: 'new' }, value: 5 },
+      { name: 'gateway.claude.turn', attrs: { repo: 'a', mode: 'resume' }, value: 7 },
+      { name: 'gateway.drive.injection', attrs: { ok: 'true' }, value: 4 },
+      { name: 'gateway.topic.created', attrs: { repo: 'a' }, value: 6 },
+      { name: 'gateway.topic.pruned', attrs: { mode: 'close' }, value: 3 },
+      { name: 'gateway.topic.create_failed', attrs: { reason: 'rate_limited' }, value: 23 },
+      { name: 'gateway.access.blocked', attrs: {}, value: 1 },
+    ],
+    histos: [], gauges: [],
+    observables: { 'gateway.sessions.active': 5 },
+  };
+  const out = gw.formatStats(snap, 4 * 3600000 + 5 * 60000);
+  assert.match(out, /up 4h 5m/);
+  assert.match(out, /Turns 12/);
+  assert.match(out, /Injections 4/);
+  assert.match(out, /Topics \+6 \/ pruned 3/);
+  assert.match(out, /Topic failures 23 \(23 rate-limited\)/);
+  assert.match(out, /Active sessions 5 · Blocked 1/);
+});
+
+test('buildCommandList includes /stats', () => {
+  assert.ok(gw.buildCommandList().some(c => c.command === 'stats'));
+});
