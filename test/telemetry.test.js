@@ -229,3 +229,21 @@ test('grafana dashboard JSON is valid and targets normalized metric names', () =
   assert.match(blob, /gateway_topic_create_failed_total/);
   assert.ok(Array.isArray(dash.panels) && dash.panels.length >= 3);
 });
+
+test('restart counter advances across a persist/reload cycle when start() precedes count()', () => {
+  const fs = require('node:fs');
+  const os = require('node:os');
+  const path = require('node:path');
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'tel-restart-'));
+  const a = createTelemetry({ dir });   // boot 1: load (empty) then increment
+  a.start();
+  a.count('gateway.restart');
+  return a.flush().then(() => {
+    const b = createTelemetry({ dir }); // boot 2: load persisted (1) then increment -> 2
+    b.start();
+    b.count('gateway.restart');
+    const v = b.snapshot().counters.find((c) => c.name === 'gateway.restart').value;
+    assert.strictEqual(v, 2, 'restart accumulates across boots (start loads, then count increments)');
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+});

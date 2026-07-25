@@ -2246,10 +2246,10 @@ if (require.main === module) {
 
   acquireLock();
   loadLinks();
+  telemetry.start();   // load persisted counters BEFORE incrementing, so restart isn't overwritten
   telemetry.count('gateway.restart');
   telemetry.registerObservable('gateway.sessions.active', () => Object.keys(linkBySession).length);
   telemetry.registerObservable('gateway.up', () => 1);
-  telemetry.start();
   loadIgnored();
   loadSuperseded();
   loadToolPrefs();
