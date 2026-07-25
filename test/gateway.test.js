@@ -973,8 +973,8 @@ test('buildSessionPickerKeyboard: caps at max rows and returns null when empty',
 // --- Group auto-config: pure helpers (Task 3) ------------------------------
 test('buildCommandList: seven commands, lowercase names, non-empty descriptions', () => {
   const cmds = g.buildCommandList();
-  assert.equal(cmds.length, 7);
-  assert.deepEqual(cmds.map((c) => c.command), ['new', 'sessions', 'desk', 'rename', 'exit', 'tools', 'resume']);
+  assert.equal(cmds.length, 8);
+  assert.deepEqual(cmds.map((c) => c.command), ['new', 'sessions', 'desk', 'rename', 'exit', 'tools', 'resume', 'stats']);
   for (const c of cmds) {
     assert.match(c.command, /^[a-z]+$/);
     assert.ok(c.description.length > 0 && c.description.length <= 256);
@@ -1002,7 +1002,7 @@ test('resolveChatAppearance: pulls the per-chat entry, defaults title/descriptio
   assert.equal(r.title, 'T');
   assert.equal(r.description, 'D');
   assert.equal(r.photoSha, 'sha123');
-  assert.equal(r.commands.length, 7);
+  assert.equal(r.commands.length, 8);
   const missing = g.resolveChatAppearance(appearance, '-999', '');
   assert.equal(missing.title, null);
   assert.equal(missing.description, null);
