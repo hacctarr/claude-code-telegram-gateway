@@ -1063,3 +1063,19 @@ test('resumeCursor: resets once the batch advances or when there is no cursor', 
   assert.deepEqual(g.resumeCursor({ offset: 500, activity: 2, prose: 1 }, 900), { offset: 900, activity: 0, prose: 0 });
   assert.deepEqual(g.resumeCursor(undefined, 900), { offset: 900, activity: 0, prose: 0 });
 });
+
+test('linkCursor: a cursor restored from links.json resumes the batch it belongs to', () => {
+  // The in-memory cursor is worthless across the restart it most needs to survive, so it rides the
+  // link record into links.json. JSON round-trip stands in for persist + reload.
+  const stored = { chatId: '-1', threadId: 7, offset: 500, mirrorCursor: { offset: 900, activity: 2, prose: 1 } };
+  const restored = JSON.parse(JSON.stringify({ s: stored })).s;
+  assert.deepEqual(g.linkCursor(restored, 900), { offset: 900, activity: 2, prose: 1 },
+    'same batch: resume after the 2 activity and 1 prose chunks already delivered');
+  assert.deepEqual(g.linkCursor(restored, 1200), { offset: 1200, activity: 0, prose: 0 },
+    'the session wrote more, so this is a different batch and the counts reset');
+});
+
+test('linkCursor: a link with no stored cursor starts the batch from zero', () => {
+  assert.deepEqual(g.linkCursor({}, 900), { offset: 900, activity: 0, prose: 0 });
+  assert.deepEqual(g.linkCursor(undefined, 900), { offset: 900, activity: 0, prose: 0 });
+});

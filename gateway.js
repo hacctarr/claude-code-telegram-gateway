@@ -243,7 +243,6 @@ const threadChains = new Map();
 const injecting = new Set();             // sessionIds the gateway is currently driving (suppress mirror)
 const queues = new Map();                // sessionId -> [prompt] awaiting an idle desk session
 const lastMirrorAt = new Map();          // sessionId -> ts of last mirror post (rate-limit coalescing)
-const mirrorCursor = new Map();          // sessionId -> resumeCursor() state for a partially-sent batch
 const mirrorRetryAt = new Map();         // sessionId -> earliest ts to retry a failed batch (429 backoff)
 
 // Growth baseline: a session only earns a topic once its transcript grows PAST its size when the
@@ -452,6 +451,13 @@ async function postWithMarkup(chatId, threadId, text, replyMarkup) {
 // and the counts reset. Pure so the resume rule is unit-tested.
 function resumeCursor(cursor, offset) {
   return cursor && cursor.offset === offset ? cursor : { offset, activity: 0, prose: 0 };
+}
+
+// The cursor rides the link record so it persists to links.json with the rest of the link. An
+// in-memory cursor would be dropped by the one event it most needs to survive: a restart between
+// the failed attempt and the retry, which would re-post the chunks that had already landed.
+function linkCursor(link, offset) {
+  return resumeCursor(link && link.mirrorCursor, offset);
 }
 
 // --- Inline action buttons: pure builders + parser --------------------------
@@ -1610,7 +1616,7 @@ async function pollTick() {
           // Resume where the last attempt stopped. Without this the whole batch re-posts every tick,
           // and a batch big enough to trip Telegram's flood limit can never finish, which is exactly
           // how one topic collected thousands of duplicates.
-          const cursor = resumeCursor(mirrorCursor.get(id), newOffset);
+          const cursor = linkCursor(link, newOffset);
           let allSent = true, backoffMs = 0;
           if (activity.length) {
             const res = await sendChunked(link.chatId, link.threadId, activity.join('\n\n'), { skip: cursor.activity });
@@ -1632,11 +1638,12 @@ async function pollTick() {
           if (!allSent) {
             // Keep the offset so the rest of the batch retries, but only what has NOT been sent,
             // and not before Telegram's retry_after (falling back to the normal flush gap).
-            mirrorCursor.set(id, cursor);
+            link.mirrorCursor = cursor;
+            persistLinks();       // survive a restart between this attempt and the retry
             mirrorRetryAt.set(id, now + Math.max(backoffMs, MIRROR_FLUSH_MS));
             continue;
           }
-          mirrorCursor.delete(id);
+          delete link.mirrorCursor;
           mirrorRetryAt.delete(id);
           lastMirrorAt.set(id, now);
         }
@@ -1668,7 +1675,6 @@ async function pollTick() {
       if (l) sessionByThread.delete(`${l.chatId}_${l.threadId}`);
       delete linkBySession[id];
       lastMirrorAt.delete(id);
-      mirrorCursor.delete(id);
       mirrorRetryAt.delete(id);
       delete pendingTools[id];
       persistLinks();
@@ -2105,7 +2111,7 @@ module.exports = {
   resolveModulePath, loadModules,
   buildSpawnArgs, spawnSession, buildModuleApi,
   chunkText, parseActionCallback, buildSessionActionBar, buildSessionPickerKeyboard,
-  postWithMarkup, sendChunked, resumeCursor, closeSessionTopic,
+  postWithMarkup, sendChunked, resumeCursor, linkCursor, closeSessionTopic,
   sha256, appearanceHash, buildCommandList, resolveBotProfile, resolveChatAppearance, chatPhotoPath,
   configureGroup,
   restartReady,
