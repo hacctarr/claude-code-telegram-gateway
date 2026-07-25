@@ -98,6 +98,7 @@ test('exportOtlp POSTs to /v1/metrics with basic auth; skips when disabled', asy
       const res = { statusCode: 200, resume() {}, on(ev, fn) { if (ev === 'end') fn(); } };
       return {
         on() {},
+        setTimeout() {},
         write(body) { captured.body = body; },
         end() { cb(res); },
       };
@@ -119,4 +120,55 @@ test('exportOtlp POSTs to /v1/metrics with basic auth; skips when disabled', asy
   assert.strictEqual(captured.options.headers.Authorization, 'Basic QUJDOnRvaw==');
   const parsed = JSON.parse(captured.body);
   assert.ok(parsed.resourceMetrics[0].scopeMetrics[0].metrics.length >= 1);
+});
+
+test('buildOtlpPayload encodes numeric attribute values as intValue', () => {
+  const t = createTelemetry();
+  t.gauge('gateway.sessions.active', 3, { shard: 2 });
+  const payload = t.buildOtlpPayload(t.snapshot(), 1700000000000000000n);
+  const m = payload.resourceMetrics[0].scopeMetrics[0].metrics.find(x => x.name === 'gateway.sessions.active');
+  const attr = m.gauge.dataPoints[0].attributes.find(a => a.key === 'shard');
+  assert.deepStrictEqual(attr.value, { intValue: '2' });
+});
+
+test('buildOtlpPayload encodes non-integer numeric attribute values as doubleValue', () => {
+  const t = createTelemetry();
+  t.gauge('gateway.load.factor', 1, { ratio: 0.5 });
+  const payload = t.buildOtlpPayload(t.snapshot(), 1700000000000000000n);
+  const m = payload.resourceMetrics[0].scopeMetrics[0].metrics.find(x => x.name === 'gateway.load.factor');
+  const attr = m.gauge.dataPoints[0].attributes.find(a => a.key === 'ratio');
+  assert.deepStrictEqual(attr.value, { doubleValue: 0.5 });
+});
+
+test('exportOtlp sets a request timeout so a hung endpoint still settles the promise', async () => {
+  let timeoutMs;
+  let timeoutCb;
+  const fakeHttps = {
+    request(options, cb) {
+      const req = {
+        _errorHandler: null,
+        on(ev, fn) { if (ev === 'error') req._errorHandler = fn; },
+        setTimeout(ms, fn) { timeoutMs = ms; timeoutCb = fn; },
+        write() {},
+        end() {},
+        destroy(err) { if (req._errorHandler) req._errorHandler(err); },
+      };
+      return req;
+    },
+  };
+
+  const t = createTelemetry({
+    httpsMod: fakeHttps,
+    otlpTimeoutMs: 10000,
+    otlp: { enabled: true, endpoint: 'https://otlp-gateway-prod.grafana.net/otlp', auth: 'QUJDOnRvaw==' },
+  });
+  t.count('gateway.access.blocked');
+
+  const pending = t.exportOtlp();
+  assert.strictEqual(timeoutMs, 10000);
+  // Simulate the hung endpoint firing its timeout: destroy() should trigger
+  // the existing error handler, which resolves the promise instead of hanging it.
+  timeoutCb();
+  const r = await pending;
+  assert.ok(r.error);
 });

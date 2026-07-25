@@ -14,6 +14,7 @@ function createTelemetry(opts = {}) {
     dir = null,
     otlp = {},
     flushIntervalMs = 30000,
+    otlpTimeoutMs = 10000,
     now = () => Date.now(),
     httpsMod = https,
   } = opts;
@@ -88,7 +89,10 @@ function createTelemetry(opts = {}) {
   function kvAttrs(attrs) {
     return Object.entries(attrs).map(([k, v]) => ({
       key: k,
-      value: typeof v === 'number' ? { asInt: String(v) } : { stringValue: String(v) },
+      value:
+        typeof v === 'number'
+          ? (Number.isInteger(v) ? { intValue: String(v) } : { doubleValue: v })
+          : { stringValue: String(v) },
     }));
   }
 
@@ -176,6 +180,7 @@ function createTelemetry(opts = {}) {
         res.on('end', () => resolve({ status: res.statusCode }));
       });
       req.on('error', (e) => resolve({ error: e.message }));
+      req.setTimeout(otlpTimeoutMs, () => req.destroy(new Error('otlp request timeout')));
       req.write(body);
       req.end();
     });
