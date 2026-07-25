@@ -3,6 +3,7 @@
 const https = require('https');
 const fs = require('fs');
 const path = require('path');
+const os = require('os');
 
 function attrKey(name, attrs) {
   const parts = Object.keys(attrs).sort().map((k) => `${k}=${attrs[k]}`);
@@ -17,7 +18,18 @@ function createTelemetry(opts = {}) {
     otlpTimeoutMs = 10000,
     now = () => Date.now(),
     httpsMod = https,
+    hostname = os.hostname(),
   } = opts;
+
+  // Device tag. In Grafana Cloud's OTLP->Prometheus mapping, `service.instance.id`
+  // becomes the `instance` label on every series (so two machines' metrics stay
+  // separate and their cumulative counters don't collide), while `host.name` lands
+  // in target_info. Default the instance to the hostname; `otlp.instance` overrides
+  // it with a friendly label (e.g. "personal-mac").
+  const resourceAttrs = {
+    'host.name': hostname,
+    'service.instance.id': otlp.instance ? String(otlp.instance) : hostname,
+  };
 
   const counters = new Map();
   const gauges = new Map();
@@ -162,7 +174,7 @@ function createTelemetry(opts = {}) {
 
   function exportOtlp() {
     if (!otlp.enabled || !otlp.endpoint || !otlp.auth) return Promise.resolve({ skipped: true });
-    const body = JSON.stringify(buildOtlpPayload(snapshot(), BigInt(now()) * 1000000n));
+    const body = JSON.stringify(buildOtlpPayload(snapshot(), BigInt(now()) * 1000000n, resourceAttrs));
     const url = new URL(otlp.endpoint.replace(/\/$/, '') + '/v1/metrics');
     return new Promise((resolve) => {
       const req = httpsMod.request({

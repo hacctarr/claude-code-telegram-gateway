@@ -239,3 +239,10 @@ underscores, counters gain `_total`), so the dashboard queries
 `gateway_claude_turn_total`, `gateway_topic_create_failed_total`, and friends.
 A useful alert: `sum(rate(gateway_topic_create_failed_total{reason="rate_limited"}[5m])) > 0`
 catches Telegram topic-creation rate-limit storms.
+
+Every series is tagged by machine. `service.instance.id` becomes the Prometheus
+`instance` label, defaulting to the host's `hostname`; set `otlp.instance` to a
+friendly per-machine label (e.g. `"personal-mac"`, `"alkami-laptop"`) when more
+than one gateway reports to the same Grafana stack, so their metrics stay
+separate rather than colliding. Filter or group any query by it, for example
+`sum by (instance) (rate(gateway_claude_turn_total[15m]))`.

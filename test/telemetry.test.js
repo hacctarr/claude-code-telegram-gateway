@@ -247,3 +247,45 @@ test('restart counter advances across a persist/reload cycle when start() preced
     fs.rmSync(dir, { recursive: true, force: true });
   });
 });
+
+test('exportOtlp tags every payload with a device instance (friendly label overrides hostname)', async () => {
+  const captured = {};
+  const fakeHttps = {
+    request(o, cb) {
+      const res = { statusCode: 200, resume() {}, on(e, f) { if (e === 'end') f(); } };
+      return { on() {}, setTimeout() {}, write(b) { captured.body = b; }, end() { cb(res); } };
+    },
+  };
+  const t = createTelemetry({
+    httpsMod: fakeHttps,
+    hostname: 'raw-host',
+    otlp: { enabled: true, endpoint: 'https://x.grafana.net/otlp', auth: 'QQ==', instance: 'personal-mac' },
+  });
+  t.count('gateway.access.blocked');
+  await t.exportOtlp();
+  const attrs = JSON.parse(captured.body).resourceMetrics[0].resource.attributes;
+  const byKey = Object.fromEntries(attrs.map((a) => [a.key, a.value]));
+  assert.deepStrictEqual(byKey['service.name'], { stringValue: 'telegram-gateway' });
+  assert.deepStrictEqual(byKey['host.name'], { stringValue: 'raw-host' });
+  assert.deepStrictEqual(byKey['service.instance.id'], { stringValue: 'personal-mac' });
+});
+
+test('service.instance.id defaults to the hostname when otlp.instance is unset', async () => {
+  const captured = {};
+  const fakeHttps = {
+    request(o, cb) {
+      const res = { statusCode: 200, resume() {}, on(e, f) { if (e === 'end') f(); } };
+      return { on() {}, setTimeout() {}, write(b) { captured.body = b; }, end() { cb(res); } };
+    },
+  };
+  const t = createTelemetry({
+    httpsMod: fakeHttps,
+    hostname: 'raw-host',
+    otlp: { enabled: true, endpoint: 'https://x.grafana.net/otlp', auth: 'QQ==' },
+  });
+  t.count('gateway.access.blocked');
+  await t.exportOtlp();
+  const attrs = JSON.parse(captured.body).resourceMetrics[0].resource.attributes;
+  const byKey = Object.fromEntries(attrs.map((a) => [a.key, a.value]));
+  assert.deepStrictEqual(byKey['service.instance.id'], { stringValue: 'raw-host' });
+});
