@@ -685,6 +685,7 @@ test('gateway.js is requirable without config.json (CI has no config — it is g
   const os = require('os');
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'gw-noconfig-'));
   fs.copyFileSync(path.join(__dirname, '..', 'gateway.js'), path.join(tmp, 'gateway.js'));
+  fs.copyFileSync(path.join(__dirname, '..', 'telemetry.js'), path.join(tmp, 'telemetry.js'));
   const r = require('child_process').spawnSync(
     process.execPath, ['-e', `require(${JSON.stringify(path.join(tmp, 'gateway.js'))})`],
     { encoding: 'utf8' });

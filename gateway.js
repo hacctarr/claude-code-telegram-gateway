@@ -61,6 +61,20 @@ if (!HAS_CONFIG && IS_GATEWAY) {
   process.exit(1);
 }
 const config = HAS_CONFIG ? JSON.parse(fs.readFileSync(CONFIG_PATH, 'utf8')) : {};
+
+const { createTelemetry } = require('./telemetry');
+const ANALYTICS_DIR = path.join(STATE_DIR, 'analytics');
+const telemetry = createTelemetry({ dir: ANALYTICS_DIR, otlp: config.otlp || {} });
+
+// Low-cardinality repo label from a cwd (or a repo dir), matched against REPO_MAPPINGS values.
+function repoOf(cwd, mappings) {
+  if (!cwd) return 'unknown';
+  for (const dir of Object.values(mappings || {})) {
+    if (cwd === dir || cwd.startsWith(dir + path.sep)) return path.basename(dir);
+  }
+  return path.basename(cwd);
+}
+
 const {
   BOT_TOKEN,
   ALLOWED_USER_IDS,
@@ -590,6 +604,7 @@ async function createForumTopic(chatId, name, iconId = null) {
     .catch((e) => ({ ok: false, description: e.message }));
   if (!r.ok) {
     console.error(`[Topic] createForumTopic failed (${r.description || 'unknown'}). Bot needs admin + Manage Topics.`);
+    telemetry.count('gateway.topic.create_failed', { reason: /too many requests|retry after/i.test(r.description || '') ? 'rate_limited' : 'other' });
     return { threadId: null, retryAfterMs: parseRetryAfter(r.description) };
   }
   return { threadId: r.result.message_thread_id, retryAfterMs: 0 };
@@ -944,6 +959,7 @@ function runClaudeTurn(prompt, cwd, sessionId, live, createId, forkId, onPermiss
     args.push(...EXTRA);
 
     console.log(`[Claude] ${sessionId ? 'resume ' + sessionId : 'new session'} in ${cwd}`);
+    telemetry.count('gateway.claude.turn', { repo: repoOf(cwd, REPO_MAPPINGS), mode: sessionId ? 'resume' : 'new' });
     const child = spawn(CLAUDE_BINARY, args, { cwd, env: { ...process.env }, stdio: ['pipe', 'pipe', 'pipe'] });
     // The live message already knows which topic it posts to, so the turn honors that topic's
     // /tools setting without threading yet another argument through this signature.
@@ -1148,11 +1164,13 @@ async function driveTurn(chatId, threadId, prompt, resolveSession) {
         await live.finalize(`${body}\n\n↪️ Desk session was open, so this continued in a saved phone branch. ` +
           `This topic now follows the branch; your desk copy is untouched (it gets its own topic if you keep working it there).`);
         console.log(`[Drive → thread ${threadId}] forked ${sessionId.slice(0, 8)} → ${forkId.slice(0, 8)} (desk held open)`);
+        telemetry.count('gateway.session.forked', { ok: 'true' });
       } else {
         // Fork didn't take — DON'T touch the binding; the reply above still had full context.
         await live.finalize(`${body}\n\n⚠️ The desk session is open and the branch didn't persist — ` +
           `this reply used full context but wasn't saved. Close the desk session and resend to persist.`);
         console.log(`[Drive → thread ${threadId}] fork failed for ${sessionId.slice(0, 8)}; binding unchanged`);
+        telemetry.count('gateway.session.forked', { ok: 'false' });
       }
       return;
     }
@@ -1181,6 +1199,7 @@ async function driveTurn(chatId, threadId, prompt, resolveSession) {
       moduleRegistry.emit('injectedTurn', { sessionId: finalSid, cwd: repoDir, chatId, threadId }, prompt);
     }
     console.log(`[Drive → thread ${threadId}] ok=${result.ok} session=${finalSid || '—'}${ephemeral ? ' (held/ephemeral)' : ''}`);
+    telemetry.count('gateway.drive.injection', { repo: repoOf(REPO_MAPPINGS[chatId], REPO_MAPPINGS), ok: String(result.ok) });
   } catch (err) {
     clearInterval(typing);
     console.error('driveTurn error:', err);
@@ -1482,6 +1501,7 @@ async function ensureTopicForSession(info) {
   if (!threadId) {
     const { fails, until } = topicCooldown.fail(info.id, retryAfterMs);
     console.error(`[Topic] backing off ${info.id.slice(0, 8)} for ${Math.round((until - Date.now()) / 1000)}s (failure #${fails})`);
+    telemetry.record('gateway.topic.backoff_seconds', Math.round((until - Date.now()) / 1000));
     return null;
   }
   topicCooldown.clear(info.id);
@@ -1505,6 +1525,7 @@ async function ensureTopicForSession(info) {
     }
   }
   console.log(`[Topic] created for ${info.id.slice(0, 8)} → chat ${chatId} thread ${threadId}`);
+  telemetry.count('gateway.topic.created', { repo: repoOf(REPO_MAPPINGS[chatId], REPO_MAPPINGS) });
   return linkBySession[info.id];
 }
 
@@ -1548,6 +1569,7 @@ async function pruneTopic(sessionId) {
   delete pendingTools[sessionId];
   persistLinks();
   console.log(`[Topic] pruned (${PRUNE_MODE}) session ${sessionId.slice(0, 8)}`);
+  telemetry.count('gateway.topic.pruned', { mode: PRUNE_MODE });
 }
 
 async function reviveTopic(sessionId) {
@@ -1841,7 +1863,7 @@ async function pollUpdates() {
         const text = message.text;
 
         if (senderId === BOT_ID) continue;   // ignore our own posts / forum service messages
-        if (!ALLOWED_USER_IDS.includes(senderId)) { console.warn(`[Blocked] user ${senderId}`); continue; }
+        if (!ALLOWED_USER_IDS.includes(senderId)) { console.warn(`[Blocked] user ${senderId}`); telemetry.count('gateway.access.blocked'); continue; }
         if (!REPO_MAPPINGS[chatId]) { console.warn(`[Config] chat ${chatId} not mapped`); continue; }
         if (!threadId) {
           telegramRequest('sendMessage', { chat_id: chatId, text: "⚠️ Please send commands inside a topic thread." }).catch(() => {});
@@ -2172,8 +2194,9 @@ function acquireLock() {
 }
 function releaseLock() { try { if (fs.existsSync(LOCK_FILE) && parseInt(fs.readFileSync(LOCK_FILE, 'utf8'), 10) === process.pid) fs.unlinkSync(LOCK_FILE); } catch (e) { /* */ } }
 
-function shutdown() {
+async function shutdown() {
   console.log("\n🛑 [Gateway Shutdown] Exiting. Headless turns are short-lived; no orphaned sessions to kill.");
+  try { await telemetry.stop(); } catch (e) { /* best effort */ }
   persistLinks();
   releaseLock();
   process.exit(0);
@@ -2190,6 +2213,10 @@ if (require.main === module) {
 
   acquireLock();
   loadLinks();
+  telemetry.count('gateway.restart');
+  telemetry.registerObservable('gateway.sessions.active', () => Object.keys(linkBySession).length);
+  telemetry.registerObservable('gateway.up', () => 1);
+  telemetry.start();
   loadIgnored();
   loadSuperseded();
   loadToolPrefs();
@@ -2229,4 +2256,5 @@ module.exports = {
   sha256, appearanceHash, buildCommandList, resolveBotProfile, resolveChatAppearance, chatPhotoPath,
   configureGroup,
   restartReady,
+  repoOf,
 };

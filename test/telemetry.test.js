@@ -172,3 +172,13 @@ test('exportOtlp sets a request timeout so a hung endpoint still settles the pro
   const r = await pending;
   assert.ok(r.error);
 });
+
+const gw = require('../gateway');
+
+test('repoOf maps a cwd under a mapped repo to its basename', () => {
+  const mappings = { '111': '/Users/marc/telegram_gateway', '222': '/Users/marc/Documents' };
+  assert.strictEqual(gw.repoOf('/Users/marc/Documents', mappings), 'Documents');
+  assert.strictEqual(gw.repoOf('/Users/marc/Documents/sub/dir', mappings), 'Documents');
+  assert.strictEqual(gw.repoOf('/tmp/whatever', mappings), 'whatever');
+  assert.strictEqual(gw.repoOf('', mappings), 'unknown');
+});
