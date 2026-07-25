@@ -243,6 +243,8 @@ const threadChains = new Map();
 const injecting = new Set();             // sessionIds the gateway is currently driving (suppress mirror)
 const queues = new Map();                // sessionId -> [prompt] awaiting an idle desk session
 const lastMirrorAt = new Map();          // sessionId -> ts of last mirror post (rate-limit coalescing)
+const mirrorCursor = new Map();          // sessionId -> resumeCursor() state for a partially-sent batch
+const mirrorRetryAt = new Map();         // sessionId -> earliest ts to retry a failed batch (429 backoff)
 
 // Growth baseline: a session only earns a topic once its transcript grows PAST its size when the
 // gateway started. This stops a restart (or a `resume`/read that merely bumps mtime) from
@@ -413,32 +415,43 @@ function chunkText(text, max = 4000) {
   return chunks;
 }
 
-async function sendPlain(chatId, threadId, text) {
-  let allSent = true;
-  for (const c of chunkText(text)) {
-    try {
-      const r = await telegramRequest('sendMessage', { chat_id: chatId, message_thread_id: threadId, text: c });
-      if (!r || !r.ok) allSent = false;
-    } catch (e) { console.error('sendPlain error:', e.code || e.message || String(e)); allSent = false; }
+// Deliver `text` as Telegram-sized chunks. Two properties keep a rate-limited topic from flooding:
+// it STOPS at the first failure (pushing the rest of the batch at a chat that just said "slow down"
+// is what earns the next 429), and it reports how many chunks are now on Telegram so the caller can
+// resume mid-batch instead of re-posting what already landed. `send` is injectable for tests.
+async function sendChunked(chatId, threadId, text, { skip = 0, replyMarkup = null, send = telegramRequest } = {}) {
+  const chunks = chunkText(text);
+  let sent = Math.min(skip, chunks.length), lastMessageId = null, retryAfterMs = 0;
+  for (let i = sent; i < chunks.length; i++) {
+    const payload = { chat_id: chatId, message_thread_id: threadId, text: chunks[i] };
+    if (replyMarkup && i === chunks.length - 1) payload.reply_markup = replyMarkup;
+    let r;
+    try { r = await send('sendMessage', payload); }
+    catch (e) { console.error('sendChunked error:', e.code || e.message || String(e)); break; }
+    if (!r || !r.ok) { retryAfterMs = parseRetryAfter(r && r.description); break; }
+    sent = i + 1;
+    if (r.result) lastMessageId = r.result.message_id;
   }
-  return allSent;   // callers that mirror content use this to avoid advancing past unsent lines
+  return { allSent: sent >= chunks.length, sent, total: chunks.length, lastMessageId, retryAfterMs };
+}
+
+async function sendPlain(chatId, threadId, text) {
+  const r = await sendChunked(chatId, threadId, text);
+  return r.allSent;   // callers that mirror content use this to avoid advancing past unsent lines
 }
 
 // sendPlain's cousin: attaches reply_markup to the LAST chunk and returns that message's id so the
 // caller can strip the markup off it later. Returns { allSent, lastMessageId }.
 async function postWithMarkup(chatId, threadId, text, replyMarkup) {
-  const chunks = chunkText(text);
-  let allSent = true, lastMessageId = null;
-  for (let i = 0; i < chunks.length; i++) {
-    const payload = { chat_id: chatId, message_thread_id: threadId, text: chunks[i] };
-    if (replyMarkup && i === chunks.length - 1) payload.reply_markup = replyMarkup;
-    try {
-      const r = await telegramRequest('sendMessage', payload);
-      if (!r || !r.ok) allSent = false;
-      else if (r.result) lastMessageId = r.result.message_id;
-    } catch (e) { console.error('postWithMarkup error:', e.code || e.message || String(e)); allSent = false; }
-  }
+  const { allSent, lastMessageId } = await sendChunked(chatId, threadId, text, { replyMarkup });
   return { allSent, lastMessageId };
+}
+
+// Per-session record of how much of the in-flight mirror batch is already on Telegram. A batch is
+// identified by the transcript offset it ends at; once the session writes more, the batch changed
+// and the counts reset. Pure so the resume rule is unit-tested.
+function resumeCursor(cursor, offset) {
+  return cursor && cursor.offset === offset ? cursor : { offset, activity: 0, prose: 0 };
 }
 
 // --- Inline action buttons: pure builders + parser --------------------------
@@ -1575,6 +1588,7 @@ async function pollTick() {
 
       // Mirror new lines, throttled per topic so a busy desk session can't exceed Telegram limits.
       if (MIRROR && !injecting.has(id) && st.size > link.offset) {
+        if (now < (mirrorRetryAt.get(id) || 0)) continue;                   // backing off a rate-limited batch
         if (now - (lastMirrorAt.get(id) || 0) < MIRROR_FLUSH_MS) continue;  // retry next poll; offset unchanged
         const { lines, newOffset } = readNewLines(file, link.offset);
         // Feed each new record to modules (spec-kit arming, etc.). ctx carries the
@@ -1593,20 +1607,37 @@ async function pollTick() {
           // prose last, so the response is the clean reply-to-steer target. Advance the offset only
           // if every message sent — a mid-batch network hiccup retries the whole batch next tick.
           const { activity, prose } = splitReadout(posts);
-          let allSent = true;
+          // Resume where the last attempt stopped. Without this the whole batch re-posts every tick,
+          // and a batch big enough to trip Telegram's flood limit can never finish, which is exactly
+          // how one topic collected thousands of duplicates.
+          const cursor = resumeCursor(mirrorCursor.get(id), newOffset);
+          let allSent = true, backoffMs = 0;
           if (activity.length) {
-            if (!(await sendPlain(link.chatId, link.threadId, activity.join('\n\n')))) allSent = false;
+            const res = await sendChunked(link.chatId, link.threadId, activity.join('\n\n'), { skip: cursor.activity });
+            cursor.activity = res.sent;
+            backoffMs = Math.max(backoffMs, res.retryAfterMs);
+            if (!res.allSent) allSent = false;
           }
           if (allSent && prose.length) {
             const bar = BUTTONS ? buildSessionActionBar(id) : null;
-            const res = await postWithMarkup(link.chatId, link.threadId, prose.join('\n\n'), bar);
+            const res = await sendChunked(link.chatId, link.threadId, prose.join('\n\n'), { skip: cursor.prose, replyMarkup: bar });
+            cursor.prose = res.sent;
+            backoffMs = Math.max(backoffMs, res.retryAfterMs);
             if (!res.allSent) allSent = false;
             else if (bar && res.lastMessageId) {
               await clearPrevBar(id);
               lastBar.set(id, { chatId: link.chatId, messageId: res.lastMessageId });
             }
           }
-          if (!allSent) continue;   // keep the offset so these lines retry next tick
+          if (!allSent) {
+            // Keep the offset so the rest of the batch retries, but only what has NOT been sent,
+            // and not before Telegram's retry_after (falling back to the normal flush gap).
+            mirrorCursor.set(id, cursor);
+            mirrorRetryAt.set(id, now + Math.max(backoffMs, MIRROR_FLUSH_MS));
+            continue;
+          }
+          mirrorCursor.delete(id);
+          mirrorRetryAt.delete(id);
           lastMirrorAt.set(id, now);
         }
         link.userTurns = (link.userTurns || 0) + countUserTurns(lines);
@@ -1637,6 +1668,8 @@ async function pollTick() {
       if (l) sessionByThread.delete(`${l.chatId}_${l.threadId}`);
       delete linkBySession[id];
       lastMirrorAt.delete(id);
+      mirrorCursor.delete(id);
+      mirrorRetryAt.delete(id);
       delete pendingTools[id];
       persistLinks();
       console.log(`[Cleanup] dropped link for missing session ${id.slice(0, 8)}`);
@@ -2072,7 +2105,7 @@ module.exports = {
   resolveModulePath, loadModules,
   buildSpawnArgs, spawnSession, buildModuleApi,
   chunkText, parseActionCallback, buildSessionActionBar, buildSessionPickerKeyboard,
-  postWithMarkup, closeSessionTopic,
+  postWithMarkup, sendChunked, resumeCursor, closeSessionTopic,
   sha256, appearanceHash, buildCommandList, resolveBotProfile, resolveChatAppearance, chatPhotoPath,
   configureGroup,
   restartReady,

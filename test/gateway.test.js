@@ -984,3 +984,82 @@ test('restartReady: no flag means no restart, regardless of injection count', ()
   assert.equal(g.restartReady(undefined, 0), false);
   assert.equal(g.restartReady('', 0), false);
 });
+
+// ---------------------------------------------------------------------------
+// Partial-send resume (mirror flood guard)
+// ---------------------------------------------------------------------------
+// A mirror batch that failed partway used to be re-sent whole on the next tick, re-posting every
+// chunk that had already landed. Under Telegram's per-chat flood limit the batch could never
+// complete, so the retry never stopped: one topic took thousands of duplicate posts.
+
+// Fake transport: `outcomes` is consulted per call — true sends, a number 429s with that retry_after.
+function fakeSend(outcomes) {
+  const calls = [];
+  let i = 0;
+  return {
+    calls,
+    send: async (method, payload) => {
+      calls.push(payload.text);
+      const o = outcomes[i++];
+      if (o === true || o === undefined) return { ok: true, result: { message_id: 100 + i } };
+      if (typeof o === 'number') return { ok: false, description: `Too Many Requests: retry after ${o}` };
+      throw new Error('ETIMEDOUT');
+    },
+  };
+}
+
+const CH = (n) => Array.from({ length: n }, (_, i) => `chunk${i}`.padEnd(4000, '.')).join('\n');
+
+test('sendChunked: full success reports every chunk delivered', async () => {
+  const f = fakeSend([true, true, true]);
+  const r = await g.sendChunked('-1', 7, CH(3), { send: f.send });
+  assert.equal(r.allSent, true);
+  assert.equal(r.sent, 3);
+  assert.equal(f.calls.length, 3);
+});
+
+test('sendChunked: stops at the first failure instead of hammering the rest of the batch', async () => {
+  const f = fakeSend([true, 30, true]);
+  const r = await g.sendChunked('-1', 7, CH(3), { send: f.send });
+  assert.equal(r.allSent, false);
+  assert.equal(r.sent, 1, 'only the first chunk landed');
+  assert.equal(f.calls.length, 2, 'aborts after the failure — chunk 3 is never attempted');
+  assert.equal(r.retryAfterMs, 30000, 'surfaces the retry_after so the caller can back off');
+});
+
+test('sendChunked: a retry skips the chunks that already landed', async () => {
+  const first = fakeSend([true, 30]);
+  const r1 = await g.sendChunked('-1', 7, CH(3), { send: first.send });
+  assert.equal(r1.sent, 1);
+  const retry = fakeSend([true, true]);
+  const r2 = await g.sendChunked('-1', 7, CH(3), { skip: r1.sent, send: retry.send });
+  assert.equal(r2.allSent, true);
+  assert.equal(r2.sent, 3);
+  assert.equal(retry.calls.length, 2, 'the delivered chunk is not posted a second time');
+  assert.ok(!retry.calls.some((c) => c.startsWith('chunk0')), 'chunk 0 was already on Telegram');
+});
+
+test('sendChunked: a thrown transport error stops the batch and keeps the delivered count', async () => {
+  const f = fakeSend([true, 'throw']);
+  const r = await g.sendChunked('-1', 7, CH(3), { send: f.send });
+  assert.equal(r.allSent, false);
+  assert.equal(r.sent, 1);
+  assert.equal(r.retryAfterMs, 0);
+});
+
+test('sendChunked: reply markup rides the final chunk only', async () => {
+  const seen = [];
+  const send = async (method, payload) => { seen.push(!!payload.reply_markup); return { ok: true, result: { message_id: 1 } }; };
+  await g.sendChunked('-1', 7, CH(3), { replyMarkup: { inline_keyboard: [] }, send });
+  assert.deepEqual(seen, [false, false, true]);
+});
+
+test('resumeCursor: keeps the delivered counts while the batch is the same', () => {
+  const c = { offset: 500, activity: 2, prose: 1 };
+  assert.deepEqual(g.resumeCursor(c, 500), c);
+});
+
+test('resumeCursor: resets once the batch advances or when there is no cursor', () => {
+  assert.deepEqual(g.resumeCursor({ offset: 500, activity: 2, prose: 1 }, 900), { offset: 900, activity: 0, prose: 0 });
+  assert.deepEqual(g.resumeCursor(undefined, 900), { offset: 900, activity: 0, prose: 0 });
+});
