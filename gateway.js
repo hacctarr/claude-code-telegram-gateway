@@ -490,6 +490,15 @@ function chunkText(text, max = 4000) {
   return chunks;
 }
 
+// Why a send failed, as a low-cardinality metric attribute. The distinction that matters is
+// rate_limited vs the rest: a 429 is Telegram asking us to slow down, and a rising rate of them is
+// the flood signature. A rejection is a non-ok body with no exception thrown, which is exactly why
+// the original flood produced no log output at all.
+function classifySendFailure(response, error) {
+  if (error) return 'error';
+  return parseRetryAfter(response && response.description) ? 'rate_limited' : 'rejected';
+}
+
 // Deliver `text` as Telegram-sized chunks. Two properties keep a rate-limited topic from flooding:
 // it STOPS at the first failure (pushing the rest of the batch at a chat that just said "slow down"
 // is what earns the next 429), and it reports how many chunks are now on Telegram so the caller can
@@ -502,8 +511,17 @@ async function sendChunked(chatId, threadId, text, { skip = 0, replyMarkup = nul
     if (replyMarkup && i === chunks.length - 1) payload.reply_markup = replyMarkup;
     let r;
     try { r = await send('sendMessage', payload); }
-    catch (e) { console.error('sendChunked error:', e.code || e.message || String(e)); break; }
-    if (!r || !r.ok) { retryAfterMs = parseRetryAfter(r && r.description); break; }
+    catch (e) {
+      console.error('sendChunked error:', e.code || e.message || String(e));
+      telemetry.count('gateway.send.failed', { reason: classifySendFailure(null, e) });
+      break;
+    }
+    if (!r || !r.ok) {
+      retryAfterMs = parseRetryAfter(r && r.description);
+      // Counted here because nothing else sees it: a non-ok body throws nothing and logs nothing.
+      telemetry.count('gateway.send.failed', { reason: classifySendFailure(r) });
+      break;
+    }
     sent = i + 1;
     if (r.result) lastMessageId = r.result.message_id;
   }
@@ -1778,7 +1796,12 @@ async function pollTick() {
             // and not before Telegram's retry_after (falling back to the normal flush gap).
             link.mirrorCursor = cursor;
             persistLinks();       // survive a restart between this attempt and the retry
-            mirrorRetryAt.set(id, now + Math.max(backoffMs, MIRROR_FLUSH_MS));
+            const waitMs = Math.max(backoffMs, MIRROR_FLUSH_MS);
+            mirrorRetryAt.set(id, now + waitMs);
+            // A batch that cannot finish is the flood signature. Silence here is what let the
+            // original incident run for hours, so the stall is counted even though it self-heals.
+            telemetry.count('gateway.mirror.batch_stalled');
+            telemetry.record('gateway.mirror.backoff_seconds', Math.round(waitMs / 1000));
             continue;
           }
           delete link.mirrorCursor;
@@ -2069,10 +2092,17 @@ function formatStats(snap, uptimeMs) {
   const rl = sum('gateway.topic.create_failed', { reason: 'rate_limited' });
   const blocked = sum('gateway.access.blocked');
   const active = snap.observables['gateway.sessions.active'] ?? 'n/a';
+  const sendFailed = sum('gateway.send.failed');
+  const sendRl = sum('gateway.send.failed', { reason: 'rate_limited' });
+  const stalled = sum('gateway.mirror.batch_stalled');
   return [
     `📊 Gateway (up ${humanizeMs(uptimeMs)})`,
     `Turns ${turns} · Injections ${inj} · Topics +${created} / pruned ${pruned}`,
     `Topic failures ${failed}${rl ? ` (${rl} rate-limited)` : ''}${failed ? ' ⚠️' : ''}`,
+    // Omitted entirely on a healthy gateway: a row of zeros trains you to stop reading it.
+    ...(sendFailed || stalled
+      ? [`Send failures ${sendFailed}${sendRl ? ` (${sendRl} rate-limited)` : ''} · stalled batches ${stalled} ⚠️`]
+      : []),
     `Active sessions ${active} · Blocked ${blocked}`,
   ].join('\n');
 }
@@ -2311,11 +2341,12 @@ module.exports = {
   resolveModulePath, loadModules,
   buildSpawnArgs, spawnSession, buildModuleApi,
   chunkText, parseActionCallback, buildSessionActionBar, buildSessionPickerKeyboard,
-  postWithMarkup, sendChunked, resumeCursor, linkCursor, closeSessionTopic,
+  postWithMarkup, sendChunked, classifySendFailure, resumeCursor, linkCursor, closeSessionTopic,
   resolveToolActivity, parseToolsCommand, setToolPref, loadToolPrefs, persistToolPrefs,
   sha256, appearanceHash, buildCommandList, resolveBotProfile, resolveChatAppearance, chatPhotoPath,
   configureGroup,
   restartReady,
   repoOf,
   formatStats, humanizeMs,
+  telemetry,   // exported so tests can assert that failures are actually counted, not just classifiable
 };

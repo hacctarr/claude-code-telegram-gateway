@@ -3,49 +3,192 @@
   "uid": "telegram-gateway",
   "schemaVersion": 39,
   "timezone": "browser",
-  "time": { "from": "now-24h", "to": "now" },
+  "time": {
+    "from": "now-24h",
+    "to": "now"
+  },
   "templating": {
     "list": [
-      { "name": "datasource", "type": "datasource", "query": "prometheus", "current": {} }
+      {
+        "name": "datasource",
+        "type": "datasource",
+        "query": "prometheus",
+        "current": {}
+      }
     ]
   },
   "panels": [
     {
-      "id": 1, "title": "Topic create failures (rate-limited)", "type": "timeseries",
-      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 0 },
-      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "id": 1,
+      "title": "Topic create failures (rate-limited)",
+      "type": "timeseries",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 0
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
       "targets": [
-        { "expr": "sum by (reason) (rate(gateway_topic_create_failed_total[5m]))", "legendFormat": "{{reason}}" }
+        {
+          "expr": "sum by (reason) (rate(gateway_topic_create_failed_total[5m]))",
+          "legendFormat": "{{reason}}"
+        }
       ]
     },
     {
-      "id": 2, "title": "Topic backoff seconds", "type": "timeseries",
-      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 0 },
-      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "id": 2,
+      "title": "Topic backoff seconds",
+      "type": "timeseries",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 0
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
       "targets": [
-        { "expr": "gateway_topic_backoff_seconds_max", "legendFormat": "max backoff" }
+        {
+          "expr": "gateway_topic_backoff_seconds_max",
+          "legendFormat": "max backoff"
+        }
       ]
     },
     {
-      "id": 3, "title": "Turns & injections by repo", "type": "timeseries",
-      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 8 },
-      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "id": 3,
+      "title": "Turns & injections by repo",
+      "type": "timeseries",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 8
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
       "targets": [
-        { "expr": "sum by (repo) (rate(gateway_claude_turn_total[15m]))", "legendFormat": "turns {{repo}}" },
-        { "expr": "sum by (repo) (rate(gateway_drive_injection_total[15m]))", "legendFormat": "injections {{repo}}" }
+        {
+          "expr": "sum by (repo) (rate(gateway_claude_turn_total[15m]))",
+          "legendFormat": "turns {{repo}}"
+        },
+        {
+          "expr": "sum by (repo) (rate(gateway_drive_injection_total[15m]))",
+          "legendFormat": "injections {{repo}}"
+        }
       ]
     },
     {
-      "id": 4, "title": "Active sessions", "type": "stat",
-      "gridPos": { "h": 8, "w": 6, "x": 12, "y": 8 },
-      "datasource": { "type": "prometheus", "uid": "${datasource}" },
-      "targets": [ { "expr": "max(gateway_sessions_active)", "legendFormat": "active" } ]
+      "id": 4,
+      "title": "Active sessions",
+      "type": "stat",
+      "gridPos": {
+        "h": 8,
+        "w": 6,
+        "x": 12,
+        "y": 8
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "targets": [
+        {
+          "expr": "max(gateway_sessions_active)",
+          "legendFormat": "active"
+        }
+      ]
     },
     {
-      "id": 5, "title": "Uptime (gateway_up)", "type": "state-timeline",
-      "gridPos": { "h": 8, "w": 6, "x": 18, "y": 8 },
-      "datasource": { "type": "prometheus", "uid": "${datasource}" },
-      "targets": [ { "expr": "max(gateway_up)", "legendFormat": "up" } ]
+      "id": 5,
+      "title": "Uptime (gateway_up)",
+      "type": "state-timeline",
+      "gridPos": {
+        "h": 8,
+        "w": 6,
+        "x": 18,
+        "y": 8
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "targets": [
+        {
+          "expr": "max(gateway_up)",
+          "legendFormat": "up"
+        }
+      ]
+    },
+    {
+      "id": 22,
+      "title": "Send failures by reason",
+      "type": "timeseries",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 16
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "targets": [
+        {
+          "expr": "sum by (reason) (rate(gateway_send_failed_total[5m]))",
+          "legendFormat": "{{reason}}"
+        }
+      ]
+    },
+    {
+      "id": 39,
+      "title": "Stalled mirror batches",
+      "type": "timeseries",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 16
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "targets": [
+        {
+          "expr": "sum(rate(gateway_mirror_batch_stalled_total[5m]))",
+          "legendFormat": ""
+        }
+      ]
+    },
+    {
+      "id": 64,
+      "title": "Mirror backoff seconds",
+      "type": "timeseries",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 24
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "targets": [
+        {
+          "expr": "gateway_mirror_backoff_seconds_max",
+          "legendFormat": ""
+        }
+      ]
     }
   ]
 }
