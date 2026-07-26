@@ -77,14 +77,34 @@ const CLAUDE_BINARY = CLAUDE_PATH || 'claude';
 const PERM_MODE = PERMISSION_MODE || 'bypassPermissions';
 const EXTRA = Array.isArray(EXTRA_ARGS) ? EXTRA_ARGS : [];
 // Default only: /tools in a topic overrides it per topic or per chat at runtime (see toolPrefs).
-const SHOW_TOOLS = SHOW_TOOL_ACTIVITY !== false;
+// Off unless asked for. One line per tool call is what turns a long desk session into hundreds of
+// mirrored posts, and the prose response is what a phone reader is actually there for.
+function resolveShowTools(cfg = {}) { return cfg.SHOW_TOOL_ACTIVITY === true; }
+const SHOW_TOOLS = resolveShowTools(config);
 
 // Mirroring / auto-topic behavior (all optional, sensible defaults).
 const MIRROR = config.MIRROR !== false;
 const AUTO_CREATE_TOPICS = config.AUTO_CREATE_TOPICS !== false;
 const IDLE_INJECT_MS = (config.IDLE_INJECT_SECONDS || 15) * 1000;
 const ACTIVE_WINDOW_MS = (config.ACTIVE_WINDOW_MIN || 30) * 60_000;
-const PRUNE_AFTER_MS = (config.PRUNE_AFTER_DAYS || 1) * 86_400_000;
+// Idle window before a topic is pruned. Hours is the unit the decision is actually made in: a
+// session that went quiet at breakfast should not still be holding a slot at dinner. The pre-hours
+// PRUNE_AFTER_DAYS spelling still works so an existing config keeps the window it asked for.
+// A non-positive or unparseable value would prune every topic on sight, so it falls back instead.
+function resolvePruneMs(cfg = {}) {
+  const DEFAULT_MS = 2 * 3_600_000;
+  const scaled = (v, unitMs) => {
+    const n = Number(v);
+    return Number.isFinite(n) && n > 0 ? n * unitMs : null;
+  };
+  return scaled(cfg.PRUNE_AFTER_HOURS, 3_600_000) ?? scaled(cfg.PRUNE_AFTER_DAYS, 86_400_000) ?? DEFAULT_MS;
+}
+const PRUNE_AFTER_MS = resolvePruneMs(config);
+
+// The boot banner should echo the window in a unit that matches how it was configured.
+function formatPruneWindow(ms) {
+  return ms < 3_600_000 ? `${Math.round(ms / 60_000)}m` : `${Math.round(ms / 3_600_000)}h`;
+}
 const PRUNE_MODE = config.PRUNE_MODE || 'close';   // "close" | "delete"
 // Bound the prune network calls one tick issues so a large idle backlog (e.g. dozens of restored
 // sessions on boot) can't monopolize a tick — the remainder catches up on the next ticks, keeping
@@ -376,7 +396,8 @@ function formatSessionList(sessions, max = 12) {
 
 // --- Activity windows (pure) ----------------------------------------------
 function isActive(mtime, now = Date.now()) { return (now - mtime) <= ACTIVE_WINDOW_MS; }
-function shouldPrune(mtime, now = Date.now()) { return (now - mtime) > PRUNE_AFTER_MS; }
+// windowMs is injectable so the boundary is testable without depending on the host's own config.
+function shouldPrune(mtime, now = Date.now(), windowMs = PRUNE_AFTER_MS) { return (now - mtime) > windowMs; }
 function isDeskBusy(mtime, now = Date.now()) { return (now - mtime) <= IDLE_INJECT_MS; }
 
 // ---------------------------------------------------------------------------
@@ -2180,7 +2201,7 @@ if (require.main === module) {
   console.log("=============================================");
   console.log(`Allowed admins: ${ALLOWED_USER_IDS.length} · repos: ${Object.keys(REPO_MAPPINGS).length}`);
   console.log(`Permission mode: ${PERM_MODE}${AUTO_APPROVE ? ' · auto-approve: ON' : ''}${MODEL ? ` · model: ${MODEL}` : ''} · tools: ${SHOW_TOOLS ? 'on' : 'off'} (${Object.keys(toolPrefs.chats).length + Object.keys(toolPrefs.threads).length} /tools override(s))`);
-  console.log(`Mirror: ${MIRROR ? 'on' : 'off'} · auto-topics: ${AUTO_CREATE_TOPICS ? 'on' : 'off'} · prune: ${PRUNE_MODE} after ${PRUNE_AFTER_MS / 86400000}d`);
+  console.log(`Mirror: ${MIRROR ? 'on' : 'off'} · auto-topics: ${AUTO_CREATE_TOPICS ? 'on' : 'off'} · prune: ${PRUNE_MODE} after ${formatPruneWindow(PRUNE_AFTER_MS)}`);
   console.log(`Restored ${Object.keys(linkBySession).length} linked session(s). Poll ${POLL_MS}ms.`);
   console.log("Listening for Topic messages + mirroring desk sessions...");
   configureGroup().catch((e) => console.error('appearance:', e.message));
@@ -2192,7 +2213,8 @@ if (require.main === module) {
 module.exports = {
   LiveMessage, summarizeToolInput, createFeed, renderTranscriptLine, splitReadout, readNewLines,
   listSessions, matchSessions, readSessionInfo, relTime, formatSessionList,
-  isActive, shouldPrune, isDeskBusy, invertRepoMappings, splitThreadKey, buildThreadIndex,
+  isActive, shouldPrune, isDeskBusy, resolvePruneMs, formatPruneWindow, resolveShowTools,
+  invertRepoMappings, splitThreadKey, buildThreadIndex,
   migrateLegacy, topicName, pickEmoji, pickIcon, openerText, shouldAutoCreate, loadIgnored, persistIgnored, persisted, deskUrl,
   lastExchange, sessionNameById, heldByOtherPids, updatePendingTools, dueStallNotices, createApprovalRegistry,
   titleArgs, createTopicCooldown, parseRetryAfter, updateSocketTimeoutMs, UPDATE_POLL_TIMEOUT_S,

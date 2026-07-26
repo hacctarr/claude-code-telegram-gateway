@@ -74,9 +74,11 @@ then `npm run setup` does the rest. Everything below is the manual equivalent.
    }
    ```
    Optional keys (defaults shown): `MIRROR` (true), `AUTO_CREATE_TOPICS` (true),
-   `SHOW_TOOL_ACTIVITY` (true — the *default* for 🔧 tool steps; `/tools` overrides it per topic
-   or per chat at runtime), `PERMISSION_MODE` ("bypassPermissions"), `MODEL`,
-   `IDLE_INJECT_SECONDS` (15), `ACTIVE_WINDOW_MIN` (30), `PRUNE_AFTER_DAYS` (1),
+   `SHOW_TOOL_ACTIVITY` (false), the *default* for 🔧 tool steps, off because one line per tool
+   call buries the prose response on a long session; `/tools` overrides it per topic or per chat
+   at runtime. Also `PERMISSION_MODE` ("bypassPermissions"), `MODEL`,
+   `IDLE_INJECT_SECONDS` (15), `ACTIVE_WINDOW_MIN` (30), `PRUNE_AFTER_HOURS` (2; the older
+   `PRUNE_AFTER_DAYS` spelling is still honored),
    `PRUNE_MODE` ("close" | "delete"), `PRUNES_PER_TICK` (5 — cap on prune calls per poll so a
    large idle backlog can't stall a tick or delay a `restart.flag`), `POLL_MS` (2000),
    `TOPIC_OPENER` ("minimal" | "off" | "full" — the first message posted into a new topic),

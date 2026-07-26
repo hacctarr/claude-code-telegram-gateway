@@ -336,14 +336,54 @@ test('readNewLines: multi-byte content keeps byte offsets correct', () => {
 // ---------------------------------------------------------------------------
 // Activity windows
 // ---------------------------------------------------------------------------
-test('isActive / shouldPrune / isDeskBusy boundaries (defaults 30m / 1d / 15s)', () => {
+test('isActive / shouldPrune / isDeskBusy boundaries (defaults 30m / 2h / 15s)', () => {
   const now = Date.now();
   assert.equal(g.isActive(now - 60_000, now), true);           // 1m ago -> active
   assert.equal(g.isActive(now - 40 * 60_000, now), false);      // 40m ago -> not
-  assert.equal(g.shouldPrune(now - 12 * 3600_000, now), false); // 12h -> keep
-  assert.equal(g.shouldPrune(now - 2 * 86400_000, now), true);  // 2d -> prune
+  const win = g.resolvePruneMs({});                             // the default window, not the host's
+  assert.equal(g.shouldPrune(now - 30 * 60_000, now, win), false); // 30m -> keep
+  assert.equal(g.shouldPrune(now - 3 * 3600_000, now, win), true); // 3h -> prune
   assert.equal(g.isDeskBusy(now - 5_000, now), true);           // 5s -> busy
   assert.equal(g.isDeskBusy(now - 60_000, now), false);         // 60s -> idle
+});
+
+// ---------------------------------------------------------------------------
+// Prune window resolution
+// ---------------------------------------------------------------------------
+// Days was the wrong unit: a topic whose session went idle in the morning sat in the list all day.
+// Hours is what the decision is actually made in, and 2h idle is a comfortable "this one is done".
+const H = 3_600_000, D = 86_400_000;
+
+test('resolvePruneMs: defaults to 2 hours when nothing is configured', () => {
+  assert.equal(g.resolvePruneMs({}), 2 * H);
+  assert.equal(g.resolvePruneMs(), 2 * H);
+});
+
+test('resolvePruneMs: honors PRUNE_AFTER_HOURS', () => {
+  assert.equal(g.resolvePruneMs({ PRUNE_AFTER_HOURS: 6 }), 6 * H);
+  assert.equal(g.resolvePruneMs({ PRUNE_AFTER_HOURS: 0.5 }), 0.5 * H);
+});
+
+test('resolvePruneMs: still honors the pre-hours PRUNE_AFTER_DAYS spelling', () => {
+  assert.equal(g.resolvePruneMs({ PRUNE_AFTER_DAYS: 1 }), D, 'an existing config keeps its window');
+  assert.equal(g.resolvePruneMs({ PRUNE_AFTER_DAYS: 7 }), 7 * D);
+});
+
+test('resolvePruneMs: hours wins when a config carries both spellings', () => {
+  assert.equal(g.resolvePruneMs({ PRUNE_AFTER_HOURS: 2, PRUNE_AFTER_DAYS: 7 }), 2 * H);
+});
+
+test('resolvePruneMs: a nonsensical window falls back to the default rather than pruning everything', () => {
+  for (const bad of [0, -3, 'soon', null, NaN, Infinity]) {
+    assert.equal(g.resolvePruneMs({ PRUNE_AFTER_HOURS: bad }), 2 * H, `PRUNE_AFTER_HOURS=${String(bad)}`);
+    assert.equal(g.resolvePruneMs({ PRUNE_AFTER_DAYS: bad }), 2 * H, `PRUNE_AFTER_DAYS=${String(bad)}`);
+  }
+});
+
+test('formatPruneWindow: reads in the unit it was configured in', () => {
+  assert.equal(g.formatPruneWindow(2 * H), '2h');
+  assert.equal(g.formatPruneWindow(D), '24h');
+  assert.equal(g.formatPruneWindow(0.5 * H), '30m');
 });
 
 // ---------------------------------------------------------------------------
@@ -1137,4 +1177,16 @@ test('setToolPref: writes and clears at both scopes without disturbing the other
   assert.deepEqual(prefs, { chats: { '-100': false }, threads: {} });
   g.setToolPref(prefs, { action: 'clear', scope: 'chat' }, '-100', 7);
   assert.deepEqual(prefs, { chats: {}, threads: {} });
+});
+
+// ---------------------------------------------------------------------------
+// Tool-activity readout default
+// ---------------------------------------------------------------------------
+// One line per tool call turned a long desk session into hundreds of posts. Prose is what a phone
+// reader actually wants, so the readout is opt-in now rather than opt-out.
+test('SHOW_TOOL_ACTIVITY: off unless a config turns it on', () => {
+  assert.equal(g.resolveShowTools({}), false, 'default is off');
+  assert.equal(g.resolveShowTools({ SHOW_TOOL_ACTIVITY: true }), true, 'explicit opt-in');
+  assert.equal(g.resolveShowTools({ SHOW_TOOL_ACTIVITY: false }), false);
+  assert.equal(g.resolveShowTools(), false);
 });

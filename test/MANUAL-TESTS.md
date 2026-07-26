@@ -69,7 +69,7 @@ bot's rights in the group (Admin → Manage Topics) and re-run.
 4. From the phone, reply in that topic while the desk session is **idle** → the turn runs and streams
    back once (no duplicate from the mirror).
 5. From the phone, `/new draft a haiku` → a brand-new topic + independent session appears.
-6. **Prune:** temporarily set `PRUNE_AFTER_DAYS` very low (e.g. via a quick config edit + restart) and
+6. **Prune:** temporarily set `PRUNE_AFTER_HOURS` very low (e.g. via a quick config edit + restart) and
    confirm an idle session's topic gets closed; revive the session and confirm it reopens.
 
 ---
