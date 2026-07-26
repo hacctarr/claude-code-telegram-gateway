@@ -955,6 +955,62 @@ test('doctor: no drift warning when the loaded version matches on disk', () => {
   } finally { child.kill('SIGKILL'); }
 });
 
+// Version drift only fires when package.json moved. During active development a `git pull` changes
+// gateway.js and leaves the version alone, which is the case that actually bit: the live gateway ran
+// pre-fix code for an hour while the checkout was several merges ahead, versions identical
+// throughout. Hashing the loaded file closes that blind spot.
+function markerFor(stateDir, { version, pid, dir, sha }) {
+  fs.mkdirSync(stateDir, { recursive: true });
+  const m = { version, pid, dir, startedAt: '2026-07-24T00:00:00.000Z' };
+  if (sha !== undefined) m.sha = sha;
+  fs.writeFileSync(path.join(stateDir, 'running.json'), JSON.stringify(m));
+}
+const sha256of = (f) => require('crypto').createHash('sha256').update(fs.readFileSync(f)).digest('hex');
+
+test('writeRunningMarker: records a hash of the gateway.js it loaded', () => {
+  const stateDir = fs.mkdtempSync(path.join(os.tmpdir(), 'gw-state-'));
+  const m = g.writeRunningMarker(stateDir);
+  assert.equal(m.sha, sha256of(require.resolve('../gateway.js')), 'hashes the file this process loaded');
+});
+
+test('doctor: flags code drift when gateway.js changed but the version did not', () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'gw-home-'));
+  const dir = fakeInstall(path.join(home, 'telegram_gateway'), '1.2.1', '');
+  fs.writeFileSync(path.join(dir, 'gateway.js'), 'setTimeout(()=>{},60000)');
+  const child = require('child_process').spawn(process.execPath, [path.join(dir, 'gateway.js')], { stdio: 'ignore' });
+  // same version on both sides; the loaded hash is from a gateway.js that has since been edited
+  markerFor(path.join(home, '.claude-gateway'), { version: '1.2.1', pid: child.pid, dir, sha: 'a'.repeat(64) });
+  try {
+    const out = runDoctor({ home, npmRoot: '' });
+    assert.match(out, /restart to load/, 'names the gap even though the versions agree');
+    assert.match(out, /gateway\.js on disk differs/, 'says it is the code, not the version');
+  } finally { child.kill('SIGKILL'); }
+});
+
+test('doctor: no code-drift warning when the loaded hash still matches disk', () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'gw-home-'));
+  const dir = fakeInstall(path.join(home, 'telegram_gateway'), '1.2.1', '');
+  fs.writeFileSync(path.join(dir, 'gateway.js'), 'setTimeout(()=>{},60000)');
+  const child = require('child_process').spawn(process.execPath, [path.join(dir, 'gateway.js')], { stdio: 'ignore' });
+  markerFor(path.join(home, '.claude-gateway'),
+    { version: '1.2.1', pid: child.pid, dir, sha: sha256of(path.join(dir, 'gateway.js')) });
+  try {
+    assert.ok(!/restart to load/.test(runDoctor({ home, npmRoot: '' })), 'nothing drifted');
+  } finally { child.kill('SIGKILL'); }
+});
+
+test('doctor: a marker predating the hash field reports no code drift', () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'gw-home-'));
+  const dir = fakeInstall(path.join(home, 'telegram_gateway'), '1.2.1', '');
+  fs.writeFileSync(path.join(dir, 'gateway.js'), 'setTimeout(()=>{},60000)');
+  const child = require('child_process').spawn(process.execPath, [path.join(dir, 'gateway.js')], { stdio: 'ignore' });
+  markerFor(path.join(home, '.claude-gateway'), { version: '1.2.1', pid: child.pid, dir });   // no sha
+  try {
+    assert.ok(!/restart to load/.test(runDoctor({ home, npmRoot: '' })),
+      'an older marker cannot prove drift, so it must not claim any');
+  } finally { child.kill('SIGKILL'); }
+});
+
 test('doctor: ignores a stale running.json whose pid is not the live gateway', () => {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), 'gw-home-'));
   const dir = fakeInstall(path.join(home, 'telegram_gateway'), '1.2.1', '');

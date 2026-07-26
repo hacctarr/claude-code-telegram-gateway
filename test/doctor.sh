@@ -65,9 +65,9 @@ for d in "${INSTALLS[@]}"; do
   # trusted only when both its pid and its install dir match the process we just found: a marker
   # left by a dead process, or by the other install on a two-install machine, proves nothing.
   if [ -n "$pid" ] && [ -f "$STATE/running.json" ]; then
-    loaded=$(python3 - "$STATE/running.json" "$pid" "$d" <<'PY' 2>/dev/null
-import json, os, sys
-marker, pid, install = sys.argv[1], sys.argv[2], sys.argv[3]
+    drift=$(python3 - "$STATE/running.json" "$pid" "$d" "$ver" <<'PY' 2>/dev/null
+import hashlib, json, os, sys
+marker, pid, install, disk_ver = sys.argv[1:5]
 try:
     m = json.load(open(marker))
 except Exception:
@@ -76,12 +76,25 @@ if str(m.get('pid')) != pid:
     sys.exit(0)
 if os.path.normcase(str(m.get('dir', ''))) != os.path.normcase(install):
     sys.exit(0)
-print(m.get('version', ''))
+
+loaded = m.get('version', '')
+if loaded and loaded != disk_ver:
+    print(f"process loaded v{loaded}, disk has v{disk_ver}. restart to load it")
+    sys.exit(0)
+
+# Same version on both sides still leaves the development case: a pull that edited gateway.js
+# without touching package.json. A marker written before the hash existed cannot speak to it.
+sha = m.get('sha')
+if sha:
+    try:
+        disk = hashlib.sha256(open(os.path.join(install, 'gateway.js'), 'rb').read()).hexdigest()
+    except OSError:
+        sys.exit(0)
+    if disk != sha:
+        print(f"gateway.js on disk differs from the loaded copy (both v{disk_ver}). restart to load it")
 PY
 )
-    if [ -n "$loaded" ] && [ "$loaded" != "$ver" ]; then
-      echo "      DRIFT: process loaded v$loaded, disk has v$ver. restart to load it"
-    fi
+    if [ -n "$drift" ]; then echo "      DRIFT: $drift"; fi
   fi
   if [ -f "$d/gateway.log" ]; then
     # grep -c prints 0 AND exits 1 on no match, so `|| echo 0` would print it twice.

@@ -46,12 +46,20 @@ if (IS_GATEWAY) {
 // changes the file on disk without touching the live process. package.json then describes a version
 // nobody is running. This records what this process actually loaded, so doctor can name the gap
 // instead of reporting the on-disk version as though it were live.
+//
+// The hash is the part that earns its keep during development: a pull that edits gateway.js and
+// leaves the version alone is the common case, and the version fields agree straight through it.
 function writeRunningMarker(stateDir = STATE_DIR) {
+  const self = path.join(__dirname, 'gateway.js');
+  let sha = null;
+  try { sha = crypto.createHash('sha256').update(fs.readFileSync(self)).digest('hex'); }
+  catch (e) { /* unreadable own source: fall back to version-only drift detection */ }
   const marker = {
     version: require('./package.json').version,
     pid: process.pid,
     dir: __dirname,
     startedAt: new Date().toISOString(),
+    ...(sha ? { sha } : {}),
   };
   try {
     fs.mkdirSync(stateDir, { recursive: true });
