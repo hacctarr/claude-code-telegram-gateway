@@ -122,6 +122,41 @@ const EXTRA = Array.isArray(EXTRA_ARGS) ? EXTRA_ARGS : [];
 function resolveShowTools(cfg = {}) { return cfg.SHOW_TOOL_ACTIVITY === true; }
 const SHOW_TOOLS = resolveShowTools(config);
 
+// MCP surface handed to spawned children. The tools array leads the cached prompt prefix, ahead of
+// the system blocks and every message, so a child that lets its MCP servers connect asynchronously
+// grows that array mid-run and invalidates the whole prefix. The conversation is then re-written to
+// cache at 1h TTL, which bills at twice the base input rate: on a large resumed session that runs
+// to hundreds of thousands of tokens per turn. Pinning the set keeps the prefix byte-stable from one
+// turn to the next, which is what lets the cache actually be reused.
+//   absent      inherit the user's full surface (the behavior before this option existed)
+//   []          no MCP servers at all
+//   ["a","b"]   only these, resolved from the user's own MCP config
+const CHILD_MCP_SERVERS = Array.isArray(config.CHILD_MCP_SERVERS) ? config.CHILD_MCP_SERVERS : null;
+const MCP_POOL_FILE = config.MCP_CONFIG_PATH || path.join(os.homedir(), '.claude.json');
+
+function loadMcpServerPool(file) {
+  try { return JSON.parse(fs.readFileSync(file, 'utf8')).mcpServers || {}; }
+  catch (e) { return {}; }
+}
+
+// Sorted so the serialized config is byte-identical no matter what order the names arrive in;
+// an unstable ordering here would defeat the caching this whole option exists to protect.
+function resolveChildMcp(selection, pool) {
+  if (!Array.isArray(selection)) return { args: [], missing: [] };
+  const mcpServers = {};
+  const missing = [];
+  for (const name of [...selection].sort()) {
+    if (pool && pool[name]) mcpServers[name] = pool[name];
+    else missing.push(name);
+  }
+  return { args: ['--mcp-config', JSON.stringify({ mcpServers }), '--strict-mcp-config'], missing };
+}
+
+const CHILD_MCP = resolveChildMcp(CHILD_MCP_SERVERS, CHILD_MCP_SERVERS ? loadMcpServerPool(MCP_POOL_FILE) : {});
+if (CHILD_MCP.missing.length) {
+  console.warn(`[MCP] CHILD_MCP_SERVERS names no server in ${MCP_POOL_FILE}: ${CHILD_MCP.missing.join(', ')}`);
+}
+
 // Mirroring / auto-topic behavior (all optional, sensible defaults).
 const MIRROR = config.MIRROR !== false;
 const AUTO_CREATE_TOPICS = config.AUTO_CREATE_TOPICS !== false;
@@ -1000,6 +1035,7 @@ function runClaudeTurn(prompt, cwd, sessionId, live, createId, forkId, onPermiss
       // before it ever appears on disk — the poller can never race it into a duplicate topic.
       if (forkId) args.push('--fork-session', '--session-id', forkId);
     } else if (createId) args.push('--session-id', createId);  // deterministic id for a fresh session
+    args.push(...CHILD_MCP.args);
     args.push(...EXTRA);
 
     console.log(`[Claude] ${sessionId ? 'resume ' + sessionId : 'new session'} in ${cwd}`);
@@ -1320,9 +1356,10 @@ function loadModules(config, api, log = console.error, gatewayDir = STATE_DIR) {
 }
 
 // Args for a detached review/aux session. Pure so it can be unit-tested.
-function buildSpawnArgs(sessionId, mode, model) {
+function buildSpawnArgs(sessionId, mode, model, mcp = CHILD_MCP.args) {
   const args = ['-p', '--session-id', sessionId, '--permission-mode', mode];
   if (model) args.push('--model', model);
+  args.push(...mcp);
   return args;
 }
 
@@ -2335,6 +2372,7 @@ module.exports = {
   migrateLegacy, topicName, pickEmoji, pickIcon, openerText, shouldAutoCreate, loadIgnored, persistIgnored, persisted, deskUrl,
   lastExchange, sessionNameById, heldByOtherPids, updatePendingTools, dueStallNotices, createApprovalRegistry,
   titleArgs, createTopicCooldown, parseRetryAfter, updateSocketTimeoutMs, UPDATE_POLL_TIMEOUT_S,
+  loadMcpServerPool, resolveChildMcp,
   STATE_DIR, STATE_FILES, migrateStateFiles, statePath, writeRunningMarker,
   countUserTurns, dueForRename, RENAME_AFTER_TURNS,
   createModuleRegistry,

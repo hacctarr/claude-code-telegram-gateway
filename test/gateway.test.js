@@ -1312,3 +1312,52 @@ test('SHOW_TOOL_ACTIVITY: off unless a config turns it on', () => {
   assert.equal(g.resolveShowTools({ SHOW_TOOL_ACTIVITY: false }), false);
   assert.equal(g.resolveShowTools(), false);
 });
+
+// ---------------------------------------------------------------------------
+// Child MCP surface
+// ---------------------------------------------------------------------------
+// The tools array is the first thing in the cached prompt prefix, ahead of the system blocks and
+// every message. A child that lets MCP servers connect asynchronously grows that array mid-run
+// (measured: 29 tools -> 101 between two requests 15s apart), which invalidates the whole prefix
+// and re-writes it at 1h TTL. Pinning the set is what keeps the prefix byte-stable across turns.
+test('resolveChildMcp: no selection inherits the full surface (previous behavior)', () => {
+  assert.deepEqual(g.resolveChildMcp(null, { a: { command: 'x' } }), { args: [], missing: [] });
+  assert.deepEqual(g.resolveChildMcp(undefined, { a: { command: 'x' } }), { args: [], missing: [] });
+});
+
+test('resolveChildMcp: empty selection pins the child to zero MCP servers', () => {
+  const { args } = g.resolveChildMcp([], { a: { command: 'x' } });
+  assert.deepEqual(args, ['--mcp-config', '{"mcpServers":{}}', '--strict-mcp-config']);
+});
+
+test('resolveChildMcp: selection keeps only the named servers', () => {
+  const pool = { a: { command: 'A' }, b: { command: 'B' }, c: { command: 'C' } };
+  const { args } = g.resolveChildMcp(['a', 'c'], pool);
+  assert.deepEqual(JSON.parse(args[1]), { mcpServers: { a: { command: 'A' }, c: { command: 'C' } } });
+  assert.equal(args[2], '--strict-mcp-config');
+});
+
+test('resolveChildMcp: a name with no definition is reported, never silently dropped', () => {
+  const { args, missing } = g.resolveChildMcp(['a', 'nope'], { a: { command: 'A' } });
+  assert.deepEqual(missing, ['nope']);
+  assert.deepEqual(JSON.parse(args[1]), { mcpServers: { a: { command: 'A' } } });
+});
+
+// The entire point of pinning is a byte-identical prefix on every turn. Object key order in the
+// pool varies with however the config happened to be written, so serialization must sort.
+test('resolveChildMcp: serialization is byte-stable regardless of pool key order', () => {
+  const one = g.resolveChildMcp(['a', 'b'], { b: { command: 'B' }, a: { command: 'A' } }).args[1];
+  const two = g.resolveChildMcp(['b', 'a'], { a: { command: 'A' }, b: { command: 'B' } }).args[1];
+  assert.equal(one, two);
+});
+
+test('loadMcpServerPool: reads mcpServers, tolerates a missing or corrupt file', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'mcp-pool-'));
+  const good = path.join(dir, 'good.json');
+  fs.writeFileSync(good, JSON.stringify({ mcpServers: { a: { command: 'A' } }, other: 1 }));
+  assert.deepEqual(g.loadMcpServerPool(good), { a: { command: 'A' } });
+  const bad = path.join(dir, 'bad.json');
+  fs.writeFileSync(bad, '{not json');
+  assert.deepEqual(g.loadMcpServerPool(bad), {});
+  assert.deepEqual(g.loadMcpServerPool(path.join(dir, 'absent.json')), {});
+});

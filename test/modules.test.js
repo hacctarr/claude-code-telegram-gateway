@@ -73,11 +73,21 @@ test('loadModules: empty/absent MODULES yields a no-op registry', () => {
   assert.deepEqual(g.loadModules({ MODULES: [] }, {}, () => {}).names(), []);
 });
 
+// The mcp argument is passed explicitly here rather than left to default. It defaults to whatever
+// CHILD_MCP_SERVERS resolves to in the config on this machine, so asserting the default would make
+// the test pass or fail depending on who ran it.
 test('buildSpawnArgs: session id + mode always present, model only when given', () => {
-  assert.deepEqual(g.buildSpawnArgs('sid', 'plan'),
+  assert.deepEqual(g.buildSpawnArgs('sid', 'plan', null, []),
     ['-p', '--session-id', 'sid', '--permission-mode', 'plan']);
-  assert.deepEqual(g.buildSpawnArgs('sid', 'plan', 'opus'),
+  assert.deepEqual(g.buildSpawnArgs('sid', 'plan', 'opus', []),
     ['-p', '--session-id', 'sid', '--permission-mode', 'plan', '--model', 'opus']);
+});
+
+test('buildSpawnArgs: a pinned MCP surface is appended to the spawn args', () => {
+  const mcp = g.resolveChildMcp([], {}).args;
+  assert.deepEqual(g.buildSpawnArgs('sid', 'plan', null, mcp),
+    ['-p', '--session-id', 'sid', '--permission-mode', 'plan',
+     '--mcp-config', '{"mcpServers":{}}', '--strict-mcp-config']);
 });
 
 test('buildModuleApi: state(name) round-trips through a JSON file', () => {

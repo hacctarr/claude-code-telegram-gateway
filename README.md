@@ -83,7 +83,22 @@ then `npm run setup` does the rest. Everything below is the manual equivalent.
    large idle backlog can't stall a tick or delay a `restart.flag`), `POLL_MS` (2000),
    `TOPIC_OPENER` ("minimal" | "off" | "full" — the first message posted into a new topic),
    `BUTTONS` (true — inline action bar on each mirrored reply + a /sessions picker),
-   `AUTO_CONFIGURE_GROUP` (true — apply group/bot appearance from `APPEARANCE` on boot).
+   `AUTO_CONFIGURE_GROUP` (true — apply group/bot appearance from `APPEARANCE` on boot),
+   `CHILD_MCP_SERVERS` (unset, see below), `MCP_CONFIG_PATH` (`~/.claude.json`).
+
+> **`CHILD_MCP_SERVERS`, the cost lever.** Every phone turn spawns a fresh Claude child, and by
+> default that child loads your entire MCP surface from cold. Tool definitions lead the cached
+> prompt prefix, ahead of the system blocks and every message, so servers that finish connecting
+> mid-run grow the tools array and invalidate the whole prefix. The conversation is then re-written
+> to cache at 1h TTL, billed at twice the base input rate. Measured on a real install: the tools
+> array went from 29 definitions to 101 between two requests 15 seconds apart, and a single trivial
+> turn cost 74,497 cache-creation tokens.
+>
+> Set `"CHILD_MCP_SERVERS": []` and children run with built-in tools only: the tools array is then
+> byte-identical on every request and the cache is reused across turns. The trade-off is that
+> phone-injected turns lose MCP tools; the desk session keeps its full surface. Naming a subset
+> (`["gmail"]`) is cheaper than inheriting everything, but only `[]` is fully deterministic, since a
+> slow server inside the subset can still shift the array mid-run.
 
 > **Permissions — two ways to run it:**
 > - **`bypassPermissions`** (default): phone-injected turns run tools without prompts. Anyone
