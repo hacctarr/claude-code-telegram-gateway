@@ -49,7 +49,15 @@ hook bodies synchronous.
 | `api.getSessionInfo(sessionId)` | `{ cwd, chatId, threadId, label, mtime }` or null |
 | `api.state(name)` | `{ data, save() }` persisted JSON, namespaced per module |
 | `api.config` | the gateway config (read-only) |
+| `api.telemetry` | `count/gauge/record/registerObservable` onto the gateway's OTLP stream |
 | `api.log(...)` | namespaced logging |
+
+`api.telemetry` records metrics; it cannot start, stop, or flush the exporter, since the
+endpoint and credentials are the gateway's to own. Metrics are exported only when the `otlp`
+block in the config is enabled, so recording from a module is safe either way. Prefix your
+metric names to keep them distinguishable from the gateway's own `gateway.*` series. Use
+`registerObservable(name, fn)` for a value you would rather sample at export time than push;
+a throwing `fn` is isolated and reports null for that cycle.
 
 ## spec-kit
 

@@ -107,6 +107,35 @@ test('buildModuleApi: state(name) round-trips through a JSON file', () => {
   }
 });
 
+test('buildModuleApi: exposes the metric surface, not the whole telemetry object', () => {
+  const api = g.buildModuleApi();
+  assert.equal(typeof api.telemetry.count, 'function');
+  assert.equal(typeof api.telemetry.gauge, 'function');
+  assert.equal(typeof api.telemetry.record, 'function');
+  assert.equal(typeof api.telemetry.registerObservable, 'function');
+  // A module must not be able to reconfigure or stop the exporter the gateway owns.
+  assert.equal(api.telemetry.start, undefined);
+  assert.equal(api.telemetry.stop, undefined);
+  assert.equal(api.telemetry.flush, undefined);
+});
+
+test('buildModuleApi: a module metric reaches the exporter snapshot', () => {
+  const api = g.buildModuleApi();
+  api.telemetry.count('module.unit.test.counter', { unit: 'test' }, 3);
+  api.telemetry.gauge('module.unit.test.gauge', 42, { unit: 'test' });
+  const snap = g.telemetry.snapshot();
+  const counter = snap.counters.find((c) => c.name === 'module.unit.test.counter');
+  const gauge = snap.gauges.find((x) => x.name === 'module.unit.test.gauge');
+  assert.equal(counter && counter.value, 3);
+  assert.equal(gauge && gauge.value, 42);
+});
+
+test('buildModuleApi: a throwing observable is isolated from the exporter', () => {
+  const api = g.buildModuleApi();
+  api.telemetry.registerObservable('module.unit.test.bad', () => { throw new Error('boom'); });
+  assert.doesNotThrow(() => g.telemetry.snapshot());
+});
+
 test('buildModuleApi: injectTurn enqueues onto the gateway queue', () => {
   const api = g.buildModuleApi();
   // injectTurn delegates to queueForSession; assert no throw and returns undefined.

@@ -1441,6 +1441,15 @@ function buildModuleApi() {
       return { data, save() { try { fs.writeFileSync(file, JSON.stringify(data, null, 2)); } catch (e) { console.error('[Module] state save failed:', e.message); } } };
     },
     config,
+    // Metrics only. The exporter's lifecycle (endpoint, credentials, flush cadence, shutdown)
+    // belongs to the gateway, so a module gets the recording surface and nothing that could
+    // redirect or silence the stream the gateway is responsible for.
+    telemetry: {
+      count: (...a) => telemetry.count(...a),
+      gauge: (...a) => telemetry.gauge(...a),
+      record: (...a) => telemetry.record(...a),
+      registerObservable: (...a) => telemetry.registerObservable(...a),
+    },
     log(...a) { console.log('[Module]', ...a); },
   };
 }
