@@ -217,3 +217,32 @@ without modifying the package. List them in `config.json`:
 Empty or absent = no-op. See `examples/modules/` for the contract and the
 bundled `spec-kit` module (compacts a spec-kit session between steps and spawns
 a `/code-review` session when `/implement` finishes).
+
+---
+
+## Analytics (optional)
+
+The gateway can ship usage and reliability metrics to Grafana Cloud via OTLP.
+Add an `otlp` block to `~/.claude-gateway/config.json`:
+
+    "otlp": { "endpoint": "https://otlp-gateway-<zone>.grafana.net/otlp", "auth": "<base64 instanceID:token>", "enabled": true }
+
+`endpoint` and the instance ID / token come from your Grafana Cloud stack's
+OTLP page; `auth` is `base64("<instanceID>:<token>")`. With `enabled: false`
+(or no block) the gateway runs unchanged and records nothing over the network,
+while `/stats` still works from the local mirror at
+`~/.claude-gateway/analytics/stats.json`. Import `grafana/gateway-dashboard.json`
+into your Grafana Cloud instance for the dashboard.
+
+Metric names are OTel-normalized by Grafana's OTLP gateway (dots become
+underscores, counters gain `_total`), so the dashboard queries
+`gateway_claude_turn_total`, `gateway_topic_create_failed_total`, and friends.
+A useful alert: `sum(rate(gateway_topic_create_failed_total{reason="rate_limited"}[5m])) > 0`
+catches Telegram topic-creation rate-limit storms.
+
+Every series is tagged by machine. `service.instance.id` becomes the Prometheus
+`instance` label, defaulting to the host's `hostname`; set `otlp.instance` to a
+friendly per-machine label (e.g. `"personal-mac"`, `"alkami-laptop"`) when more
+than one gateway reports to the same Grafana stack, so their metrics stay
+separate rather than colliding. Filter or group any query by it, for example
+`sum by (instance) (rate(gateway_claude_turn_total[15m]))`.
