@@ -42,6 +42,24 @@ if (IS_GATEWAY) {
   if (moved.length) console.log(`[State] migrated ${moved.join(', ')} → ${STATE_DIR} (survives npm update)`);
 }
 
+// The gateway loads gateway.js once at boot and holds it in memory, so `git pull` or `npm update`
+// changes the file on disk without touching the live process. package.json then describes a version
+// nobody is running. This records what this process actually loaded, so doctor can name the gap
+// instead of reporting the on-disk version as though it were live.
+function writeRunningMarker(stateDir = STATE_DIR) {
+  const marker = {
+    version: require('./package.json').version,
+    pid: process.pid,
+    dir: __dirname,
+    startedAt: new Date().toISOString(),
+  };
+  try {
+    fs.mkdirSync(stateDir, { recursive: true });
+    fs.writeFileSync(path.join(stateDir, 'running.json'), JSON.stringify(marker));
+  } catch (e) { console.warn('Could not write running.json:', e.message); }
+  return marker;
+}
+
 // Reads prefer STATE_DIR but fall back to a legacy in-package file when migration hasn't run
 // (e.g. this module imported by tests). New writes always land in STATE_DIR.
 function statePath(name) {
@@ -2245,6 +2263,7 @@ if (require.main === module) {
   process.on('SIGTERM', shutdown);
 
   acquireLock();
+  writeRunningMarker();   // stamp the version this process loaded, before anything can fail
   loadLinks();
   telemetry.start();   // load persisted counters BEFORE incrementing, so restart isn't overwritten
   telemetry.count('gateway.restart');
@@ -2278,7 +2297,7 @@ module.exports = {
   migrateLegacy, topicName, pickEmoji, pickIcon, openerText, shouldAutoCreate, loadIgnored, persistIgnored, persisted, deskUrl,
   lastExchange, sessionNameById, heldByOtherPids, updatePendingTools, dueStallNotices, createApprovalRegistry,
   titleArgs, createTopicCooldown, parseRetryAfter, updateSocketTimeoutMs, UPDATE_POLL_TIMEOUT_S,
-  STATE_DIR, STATE_FILES, migrateStateFiles, statePath,
+  STATE_DIR, STATE_FILES, migrateStateFiles, statePath, writeRunningMarker,
   countUserTurns, dueForRename, RENAME_AFTER_TURNS,
   createModuleRegistry,
   resolveModulePath, loadModules,
