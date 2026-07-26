@@ -12,6 +12,7 @@
   "MODEL": "opus",
   "MIRROR": true,
   "AUTO_CREATE_TOPICS": true,
+  "_SHOW_TOOL_ACTIVITY": "default for mirroring 🔧 tool steps. /tools on|off in a topic (add 'all' for the whole chat) overrides it at runtime and persists in toolprefs.json",
   "SHOW_TOOL_ACTIVITY": true,
   "IDLE_INJECT_SECONDS": 15,
   "ACTIVE_WINDOW_MIN": 30,
