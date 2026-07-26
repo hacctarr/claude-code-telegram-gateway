@@ -289,3 +289,69 @@ test('service.instance.id defaults to the hostname when otlp.instance is unset',
   const byKey = Object.fromEntries(attrs.map((a) => [a.key, a.value]));
   assert.deepStrictEqual(byKey['service.instance.id'], { stringValue: 'raw-host' });
 });
+
+// ---------------------------------------------------------------------------
+// Send-failure visibility
+// ---------------------------------------------------------------------------
+// The mirror flood ran for hours without a single log line, because a Telegram 429 is a non-ok
+// *response*, not an exception: the catch never fired and nothing counted the rejection. These
+// classify every way a send can fail so the rate is visible in /stats and Grafana.
+test('classifySendFailure: a 429 is rate_limited', () => {
+  assert.strictEqual(gw.classifySendFailure({ ok: false, description: 'Too Many Requests: retry after 30' }), 'rate_limited');
+});
+
+test('classifySendFailure: any other non-ok response is rejected, not an error', () => {
+  assert.strictEqual(gw.classifySendFailure({ ok: false, description: 'Bad Request: message is too long' }), 'rejected');
+  assert.strictEqual(gw.classifySendFailure({ ok: false }), 'rejected');
+  assert.strictEqual(gw.classifySendFailure(null), 'rejected', 'a missing body is a rejection, not a throw');
+});
+
+test('classifySendFailure: a thrown transport fault is error', () => {
+  assert.strictEqual(gw.classifySendFailure(undefined, new Error('ETIMEDOUT')), 'error');
+  assert.strictEqual(gw.classifySendFailure({ ok: false, description: 'retry after 5' }, new Error('boom')), 'error',
+    'a throw wins over whatever partial body came back');
+});
+
+test('formatStats surfaces send failures and stalled mirror batches', () => {
+  const snap = {
+    startMs: 0,
+    counters: [
+      { name: 'gateway.send.failed', attrs: { reason: 'rate_limited' }, value: 41 },
+      { name: 'gateway.send.failed', attrs: { reason: 'error' }, value: 2 },
+      { name: 'gateway.mirror.batch_stalled', attrs: {}, value: 9 },
+    ],
+    histos: [], gauges: [], observables: {},
+  };
+  const out = gw.formatStats(snap, 60000);
+  assert.match(out, /Send failures 43 \(41 rate-limited\)/, 'totals across reasons, names the rate-limited share');
+  assert.match(out, /stalled batches 9/, 'a stalled batch is the flood signature, so it gets its own number');
+});
+
+test('formatStats stays quiet about sends when nothing has failed', () => {
+  const snap = { startMs: 0, counters: [], histos: [], gauges: [], observables: {} };
+  assert.ok(!/Send failures/.test(gw.formatStats(snap, 60000)), 'no noise on a healthy gateway');
+});
+
+test('sendChunked counts every failure mode against the live telemetry instance', async () => {
+  const before = (reason) => gw.telemetry.snapshot().counters
+    .filter((c) => c.name === 'gateway.send.failed' && c.attrs.reason === reason)
+    .reduce((a, c) => a + c.value, 0);
+  const [rl0, rej0, err0] = [before('rate_limited'), before('rejected'), before('error')];
+
+  await gw.sendChunked('-1', 7, 'x', { send: async () => ({ ok: false, description: 'Too Many Requests: retry after 30' }) });
+  await gw.sendChunked('-1', 7, 'x', { send: async () => ({ ok: false, description: 'Bad Request: chat not found' }) });
+  await gw.sendChunked('-1', 7, 'x', { send: async () => { throw new Error('ETIMEDOUT'); } });
+
+  assert.strictEqual(before('rate_limited'), rl0 + 1, '429 counted as rate_limited');
+  assert.strictEqual(before('rejected'), rej0 + 1, 'non-ok body counted as rejected');
+  assert.strictEqual(before('error'), err0 + 1, 'throw counted as error');
+});
+
+test('sendChunked counts nothing when the send succeeds', async () => {
+  const total = () => gw.telemetry.snapshot().counters
+    .filter((c) => c.name === 'gateway.send.failed').reduce((a, c) => a + c.value, 0);
+  const t0 = total();
+  const r = await gw.sendChunked('-1', 7, 'x', { send: async () => ({ ok: true, result: { message_id: 1 } }) });
+  assert.strictEqual(r.allSent, true);
+  assert.strictEqual(total(), t0, 'a healthy send is not counted as a failure');
+});

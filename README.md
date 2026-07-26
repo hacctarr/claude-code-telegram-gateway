@@ -240,6 +240,15 @@ underscores, counters gain `_total`), so the dashboard queries
 A useful alert: `sum(rate(gateway_topic_create_failed_total{reason="rate_limited"}[5m])) > 0`
 catches Telegram topic-creation rate-limit storms.
 
+Message sends are counted separately, because a Telegram 429 arrives as a non-ok
+*response* rather than an exception and so produces no log line at all:
+`gateway_send_failed_total{reason=...}` splits `rate_limited`, `rejected` (any
+other non-ok body) and `error` (a thrown transport fault).
+`gateway_mirror_batch_stalled_total` counts mirror batches that could not finish
+in one pass, with `gateway_mirror_backoff_seconds` recording how long each waited.
+A sustained non-zero rate on the stalled counter means a topic is being
+rate-limited faster than it can drain, which is the shape a flood takes.
+
 Every series is tagged by machine. `service.instance.id` becomes the Prometheus
 `instance` label, defaulting to the host's `hostname`; set `otlp.instance` to a
 friendly per-machine label (e.g. `"personal-mac"`, `"alkami-laptop"`) when more
