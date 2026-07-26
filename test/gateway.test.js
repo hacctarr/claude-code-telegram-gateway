@@ -1147,6 +1147,66 @@ test('restartReady: no flag means no restart, regardless of injection count', ()
   assert.equal(g.restartReady('', 0), false);
 });
 
+test('createInjectionSet: behaves as a set for mirror suppression', () => {
+  let t = 1000;
+  const inj = g.createInjectionSet(() => t);
+  assert.equal(inj.size, 0);
+  inj.add('a'); inj.add('b');
+  assert.equal(inj.has('a'), true);
+  assert.equal(inj.has('zzz'), false);
+  assert.equal(inj.size, 2);
+  inj.delete('a');
+  assert.equal(inj.has('a'), false);
+  assert.equal(inj.size, 1);
+});
+
+test('createInjectionSet: a reservation counts as live until it goes silent', () => {
+  let t = 0;
+  const inj = g.createInjectionSet(() => t);
+  inj.add('sess');
+  assert.equal(inj.liveCount(60_000), 1);
+  t = 59_999;
+  assert.equal(inj.liveCount(60_000), 1);
+  t = 60_000;
+  assert.equal(inj.liveCount(60_000), 0);   // silent too long to keep blocking a restart
+  assert.equal(inj.size, 1);                // the reservation itself is untouched, so the
+  assert.equal(inj.has('sess'), true);      // mirror stays suppressed for the hung turn
+});
+
+test('createInjectionSet: touch resets the silence window, so a long streaming turn still blocks', () => {
+  let t = 0;
+  const inj = g.createInjectionSet(() => t);
+  inj.add('sess');
+  for (let i = 0; i < 10; i++) { t += 50_000; inj.touch('sess'); }   // 500s of steady output
+  assert.equal(inj.liveCount(60_000), 1);
+  t += 60_000;
+  assert.equal(inj.liveCount(60_000), 0);
+});
+
+test('createInjectionSet: touch takes every id a turn reserved and ignores absent ones', () => {
+  let t = 0;
+  const inj = g.createInjectionSet(() => t);
+  inj.add('resumed'); inj.add('forked');
+  t = 30_000;
+  inj.touch('resumed', null, 'forked', 'never-reserved');   // null = an id this turn didn't mint
+  assert.equal(inj.has('never-reserved'), false);           // touch must not create a reservation
+  t = 89_999;
+  assert.equal(inj.liveCount(60_000), 2);
+});
+
+test('createInjectionSet: a stale reservation stops blocking, a fresh one alongside it still does', () => {
+  let t = 0;
+  const inj = g.createInjectionSet(() => t);
+  inj.add('hung');
+  t = 600_000;
+  inj.add('healthy');
+  assert.equal(inj.liveCount(60_000), 1);
+  assert.equal(g.restartReady('/x/restart.flag', inj.liveCount(60_000)), false);
+  t += 60_000;
+  assert.equal(inj.liveCount(60_000), 0);
+  assert.equal(g.restartReady('/x/restart.flag', inj.liveCount(60_000)), true);
+});
+
 // ---------------------------------------------------------------------------
 // Partial-send resume (mirror flood guard)
 // ---------------------------------------------------------------------------
