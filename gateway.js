@@ -76,6 +76,7 @@ const BOT_ID = (BOT_TOKEN || '').split(':')[0];   // bot's own user id (token pr
 const CLAUDE_BINARY = CLAUDE_PATH || 'claude';
 const PERM_MODE = PERMISSION_MODE || 'bypassPermissions';
 const EXTRA = Array.isArray(EXTRA_ARGS) ? EXTRA_ARGS : [];
+// Default only: /tools in a topic overrides it per topic or per chat at runtime (see toolPrefs).
 const SHOW_TOOLS = SHOW_TOOL_ACTIVITY !== false;
 
 // Mirroring / auto-topic behavior (all optional, sensible defaults).
@@ -167,9 +168,23 @@ function loadIgnored(file = IGNORED_FILE, set = ignoredSessions) {
   catch (e) { /* */ }
   return set;
 }
+
 function persistIgnored(file = IGNORED_FILE, set = ignoredSessions) {
   try { fs.writeFileSync(file, JSON.stringify([...set])); } catch (e) { /* */ }
 }
+
+// Tool-activity overrides, keyed by topic ("<chatId>_<threadId>") and by chat. Runtime state rather
+// than config so a noisy topic can be silenced from the phone, without a config edit and restart.
+const TOOLPREFS_FILE = statePath('toolprefs.json');
+let toolPrefs = { chats: {}, threads: {} };
+function loadToolPrefs() {
+  try {
+    const p = JSON.parse(fs.readFileSync(TOOLPREFS_FILE, 'utf8'));
+    toolPrefs = { chats: p.chats || {}, threads: p.threads || {} };
+  } catch (e) { toolPrefs = { chats: {}, threads: {} }; }
+  return toolPrefs;
+}
+function persistToolPrefs() { try { fs.writeFileSync(TOOLPREFS_FILE, JSON.stringify(toolPrefs)); } catch (e) { /* */ } }
 
 // Branch management: when a phone reply forks a held-open desk session, the ORIGINAL desk session is
 // "superseded" — we record the transcript size at the fork point and skip re-topicing it, UNLESS the
@@ -785,6 +800,57 @@ function splitReadout(posts) {
   return { activity, prose };
 }
 
+// --- Tool-activity visibility: pure resolve + command parse -----------------
+// Precedence: this topic's override, then its chat's, then the config default. A long agentic run
+// posts one 🔧 line per tool call, which is the bulk of a busy topic's traffic — turning it off for
+// a topic (or a whole chat) leaves the prose responses, the desk echoes and the stall notices.
+function resolveToolActivity(prefs, chatId, threadId, fallback) {
+  const { chats = {}, threads = {} } = prefs || {};
+  const thread = threads[`${chatId}_${threadId}`];
+  if (typeof thread === 'boolean') return thread;
+  const chat = chats[String(chatId)];
+  if (typeof chat === 'boolean') return chat;
+  return fallback;
+}
+
+// "/tools" | "/tools on|off|default [all]" -> an intent, or null when this isn't the command.
+// An unrecognized argument asks for help rather than falling back to a scope the user didn't name.
+const TOOLS_RE = /^\/tools(?:\s+(\S+))?(?:\s+(\S+))?\s*$/i;
+function parseToolsCommand(text) {
+  const m = TOOLS_RE.exec(String(text || '').trim());
+  if (!m) return null;
+  const [, rawArg, rawScope] = m;
+  if (!rawArg) return { action: 'show' };
+  const arg = rawArg.toLowerCase(), scopeWord = (rawScope || '').toLowerCase();
+  if (scopeWord && scopeWord !== 'all') return { action: 'help' };
+  const scope = scopeWord === 'all' ? 'chat' : 'thread';
+  if (arg === 'on' || arg === 'off') return { action: 'set', on: arg === 'on', scope };
+  if (arg === 'default') return { action: 'clear', scope };
+  return { action: 'help' };
+}
+
+// Apply a parsed set/clear to a prefs object, in place. Clearing removes the key entirely so the
+// next wider scope decides again — storing "unset" as a value would shadow it.
+function setToolPref(prefs, cmd, chatId, threadId) {
+  const bucket = cmd.scope === 'chat' ? prefs.chats : prefs.threads;
+  const key = cmd.scope === 'chat' ? String(chatId) : `${chatId}_${threadId}`;
+  if (cmd.action === 'clear') delete bucket[key];
+  else bucket[key] = cmd.on;
+  return prefs;
+}
+
+// Runtime binding of the resolver to this process's stored prefs and the config default.
+function showToolsIn(chatId, threadId) { return resolveToolActivity(toolPrefs, chatId, threadId, SHOW_TOOLS); }
+
+// Where the effective setting comes from, for /tools to report honestly.
+function toolActivityStatus(chatId, threadId) {
+  const on = showToolsIn(chatId, threadId);
+  const source = typeof toolPrefs.threads[`${chatId}_${threadId}`] === 'boolean' ? 'this topic'
+    : typeof toolPrefs.chats[String(chatId)] === 'boolean' ? 'this chat'
+    : 'the SHOW_TOOL_ACTIVITY default';
+  return { on, source };
+}
+
 // The last user prompt + assistant response in a transcript, so a freshly-created topic shows where
 // the session left off. Reads only the tail of the file to stay cheap on large transcripts.
 function lastExchange(file) {
@@ -858,7 +924,9 @@ function runClaudeTurn(prompt, cwd, sessionId, live, createId, forkId, onPermiss
 
     console.log(`[Claude] ${sessionId ? 'resume ' + sessionId : 'new session'} in ${cwd}`);
     const child = spawn(CLAUDE_BINARY, args, { cwd, env: { ...process.env }, stdio: ['pipe', 'pipe', 'pipe'] });
-    const feed = createFeed(SHOW_TOOLS);
+    // The live message already knows which topic it posts to, so the turn honors that topic's
+    // /tools setting without threading yet another argument through this signature.
+    const feed = createFeed(showToolsIn(live.chatId, live.threadId));
     let stderr = '', rem = '';
 
     const answerPermission = async (o) => {
@@ -1602,7 +1670,8 @@ async function pollTick() {
         const modCtx = { sessionId: id, cwd, chatId: link.chatId, threadId: link.threadId };
         for (const o of lines) moduleRegistry.emit('transcriptLine', modCtx, o);
         const posts = [];
-        for (const o of lines) posts.push(...renderTranscriptLine(o, SHOW_TOOLS));
+        const showTools = showToolsIn(link.chatId, link.threadId);
+        for (const o of lines) posts.push(...renderTranscriptLine(o, showTools));
         // Track unresolved tool calls; announce completion of any we'd flagged as stalled.
         const pstate = (pendingTools[id] = pendingTools[id] || {});
         for (const r of updatePendingTools(pstate, lines, now)) {
@@ -1790,6 +1859,26 @@ async function pollUpdates() {
           continue;
         }
 
+        // /tools [on|off|default] [all] — mirror 🔧 tool steps, or don't. Tool lines are most of a
+        // long run's message volume, so this is the noise dial: per topic, or `all` for the chat.
+        const toolsCmd = parseToolsCommand(text);
+        if (toolsCmd) {
+          if (toolsCmd.action === 'help') {
+            sendPlain(chatId, threadId, "Usage: /tools on|off (this topic) · /tools on|off all (this chat) · " +
+              "/tools default [all] (drop the override) · /tools (show current)");
+            continue;
+          }
+          if (toolsCmd.action !== 'show') {
+            setToolPref(toolPrefs, toolsCmd, chatId, threadId);
+            persistToolPrefs();
+          }
+          const { on, source } = toolActivityStatus(chatId, threadId);
+          const where = toolsCmd.action === 'show' ? '' : (toolsCmd.scope === 'chat' ? ' for this chat' : ' for this topic');
+          sendPlain(chatId, threadId, `${on ? '🔧' : '🔇'} Tool activity is ${on ? 'ON' : 'OFF'}${where} (set by ${source}). ` +
+            `Responses, desk echoes and stall notices always post.`);
+          continue;
+        }
+
         // /desk (or /open) — open this topic's session in the desktop editor on the Mac.
         if (text === '/desk' || text === '/open') {
           const sid = sessionByThread.get(key);
@@ -1895,6 +1984,7 @@ function buildCommandList() {
     { command: 'desk',     description: 'Open this session in the editor on the Mac' },
     { command: 'rename',   description: 'Rename this topic (bare = regenerate from content)' },
     { command: 'exit',     description: 'Close this topic and stop mirroring' },
+    { command: 'tools',    description: 'Show or set tool-step mirroring (on|off [all])' },
     { command: 'resume',   description: 'Link this topic to an existing session' },
   ];
 }
@@ -2081,6 +2171,7 @@ if (require.main === module) {
   loadLinks();
   loadIgnored();
   loadSuperseded();
+  loadToolPrefs();
   moduleRegistry = loadModules(config, buildModuleApi(), console.error);
   if (moduleRegistry.names().length) console.log(`Modules: ${moduleRegistry.names().join(', ')}`);
   snapshotBaseline();   // record current sizes so a restart doesn't mass-create topics
@@ -2088,7 +2179,7 @@ if (require.main === module) {
   console.log("🚀 CLAUDE CODE MULTI-SESSION TELEGRAM GATEWAY");
   console.log("=============================================");
   console.log(`Allowed admins: ${ALLOWED_USER_IDS.length} · repos: ${Object.keys(REPO_MAPPINGS).length}`);
-  console.log(`Permission mode: ${PERM_MODE}${AUTO_APPROVE ? ' · auto-approve: ON' : ''}${MODEL ? ` · model: ${MODEL}` : ''} · tools: ${SHOW_TOOLS ? 'on' : 'off'}`);
+  console.log(`Permission mode: ${PERM_MODE}${AUTO_APPROVE ? ' · auto-approve: ON' : ''}${MODEL ? ` · model: ${MODEL}` : ''} · tools: ${SHOW_TOOLS ? 'on' : 'off'} (${Object.keys(toolPrefs.chats).length + Object.keys(toolPrefs.threads).length} /tools override(s))`);
   console.log(`Mirror: ${MIRROR ? 'on' : 'off'} · auto-topics: ${AUTO_CREATE_TOPICS ? 'on' : 'off'} · prune: ${PRUNE_MODE} after ${PRUNE_AFTER_MS / 86400000}d`);
   console.log(`Restored ${Object.keys(linkBySession).length} linked session(s). Poll ${POLL_MS}ms.`);
   console.log("Listening for Topic messages + mirroring desk sessions...");
@@ -2112,6 +2203,7 @@ module.exports = {
   buildSpawnArgs, spawnSession, buildModuleApi,
   chunkText, parseActionCallback, buildSessionActionBar, buildSessionPickerKeyboard,
   postWithMarkup, sendChunked, resumeCursor, linkCursor, closeSessionTopic,
+  resolveToolActivity, parseToolsCommand, setToolPref, loadToolPrefs, persistToolPrefs,
   sha256, appearanceHash, buildCommandList, resolveBotProfile, resolveChatAppearance, chatPhotoPath,
   configureGroup,
   restartReady,

@@ -74,7 +74,8 @@ then `npm run setup` does the rest. Everything below is the manual equivalent.
    }
    ```
    Optional keys (defaults shown): `MIRROR` (true), `AUTO_CREATE_TOPICS` (true),
-   `SHOW_TOOL_ACTIVITY` (true), `PERMISSION_MODE` ("bypassPermissions"), `MODEL`,
+   `SHOW_TOOL_ACTIVITY` (true — the *default* for 🔧 tool steps; `/tools` overrides it per topic
+   or per chat at runtime), `PERMISSION_MODE` ("bypassPermissions"), `MODEL`,
    `IDLE_INJECT_SECONDS` (15), `ACTIVE_WINDOW_MIN` (30), `PRUNE_AFTER_DAYS` (1),
    `PRUNE_MODE` ("close" | "delete"), `PRUNES_PER_TICK` (5 — cap on prune calls per poll so a
    large idle backlog can't stall a tick or delay a `restart.flag`), `POLL_MS` (2000),
@@ -145,6 +146,12 @@ From a source checkout: `git pull && npm test && touch ~/.claude-gateway/restart
     resumable on disk, and fresh desk activity re-opens a topic for it automatically.
   - **`/desk`** — open this topic's session in the editor on your Mac (VS Code by default). The
     clean "hand it back to the desk" move: it opens the exact session so you continue there.
+  - `/tools off` — stop mirroring 🔧 tool steps in this topic (`/tools off all` for the whole
+    chat, `/tools default` to drop the override, bare `/tools` to see the current setting). Tool
+    lines are most of a long run's message volume, so this is the noise dial; prose responses,
+    desk echoes and stall notices keep posting either way. Same scope as `SHOW_TOOL_ACTIVITY`,
+    which it overrides: ⚠️ tool-error lines are tool activity too, so they go quiet with the rest.
+    The setting persists across restarts in `~/.claude-gateway/toolprefs.json`.
   - `/sessions` — list recent sessions in the repo.
   - `/resume <uuid | text>` — link this topic to an existing session (searches first message + content).
 - **Back at the desk:** two ways, pick per moment —

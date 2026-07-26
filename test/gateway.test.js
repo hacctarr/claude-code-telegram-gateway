@@ -930,10 +930,10 @@ test('buildSessionPickerKeyboard: caps at max rows and returns null when empty',
 });
 
 // --- Group auto-config: pure helpers (Task 3) ------------------------------
-test('buildCommandList: six commands, lowercase names, non-empty descriptions', () => {
+test('buildCommandList: seven commands, lowercase names, non-empty descriptions', () => {
   const cmds = g.buildCommandList();
-  assert.equal(cmds.length, 6);
-  assert.deepEqual(cmds.map((c) => c.command), ['new', 'sessions', 'desk', 'rename', 'exit', 'resume']);
+  assert.equal(cmds.length, 7);
+  assert.deepEqual(cmds.map((c) => c.command), ['new', 'sessions', 'desk', 'rename', 'exit', 'tools', 'resume']);
   for (const c of cmds) {
     assert.match(c.command, /^[a-z]+$/);
     assert.ok(c.description.length > 0 && c.description.length <= 256);
@@ -961,7 +961,7 @@ test('resolveChatAppearance: pulls the per-chat entry, defaults title/descriptio
   assert.equal(r.title, 'T');
   assert.equal(r.description, 'D');
   assert.equal(r.photoSha, 'sha123');
-  assert.equal(r.commands.length, 6);
+  assert.equal(r.commands.length, 7);
   const missing = g.resolveChatAppearance(appearance, '-999', '');
   assert.equal(missing.title, null);
   assert.equal(missing.description, null);
@@ -1078,4 +1078,63 @@ test('linkCursor: a cursor restored from links.json resumes the batch it belongs
 test('linkCursor: a link with no stored cursor starts the batch from zero', () => {
   assert.deepEqual(g.linkCursor({}, 900), { offset: 900, activity: 0, prose: 0 });
   assert.deepEqual(g.linkCursor(undefined, 900), { offset: 900, activity: 0, prose: 0 });
+});
+
+// ---------------------------------------------------------------------------
+// Tool-activity visibility: per-topic / per-chat overrides over the config default
+// ---------------------------------------------------------------------------
+test('resolveToolActivity: with no overrides the config default decides', () => {
+  assert.equal(g.resolveToolActivity({}, '-100', 7, true), true);
+  assert.equal(g.resolveToolActivity({}, '-100', 7, false), false);
+});
+
+test('resolveToolActivity: a chat override beats the config default', () => {
+  const prefs = { chats: { '-100': false }, threads: {} };
+  assert.equal(g.resolveToolActivity(prefs, '-100', 7, true), false);
+  assert.equal(g.resolveToolActivity(prefs, '-200', 7, true), true, 'scoped to its own chat');
+});
+
+test('resolveToolActivity: a topic override beats its chat', () => {
+  const prefs = { chats: { '-100': false }, threads: { '-100_7': true } };
+  assert.equal(g.resolveToolActivity(prefs, '-100', 7, true), true, 'this one topic stays loud');
+  assert.equal(g.resolveToolActivity(prefs, '-100', 8, true), false, 'the rest of the chat stays quiet');
+});
+
+test('parseToolsCommand: bare /tools reports the current state', () => {
+  assert.deepEqual(g.parseToolsCommand('/tools'), { action: 'show' });
+});
+
+test('parseToolsCommand: on/off set this topic, "all" sets the whole chat', () => {
+  assert.deepEqual(g.parseToolsCommand('/tools off'), { action: 'set', on: false, scope: 'thread' });
+  assert.deepEqual(g.parseToolsCommand('/tools on'), { action: 'set', on: true, scope: 'thread' });
+  assert.deepEqual(g.parseToolsCommand('/tools off all'), { action: 'set', on: false, scope: 'chat' });
+  assert.deepEqual(g.parseToolsCommand('  /TOOLS   ON   ALL '), { action: 'set', on: true, scope: 'chat' });
+});
+
+test('parseToolsCommand: "default" clears an override so the wider scope decides again', () => {
+  assert.deepEqual(g.parseToolsCommand('/tools default'), { action: 'clear', scope: 'thread' });
+  assert.deepEqual(g.parseToolsCommand('/tools default all'), { action: 'clear', scope: 'chat' });
+});
+
+test('parseToolsCommand: an unknown argument asks for help instead of guessing', () => {
+  assert.deepEqual(g.parseToolsCommand('/tools maybe'), { action: 'help' });
+  assert.deepEqual(g.parseToolsCommand('/tools off everywhere'), { action: 'help' });
+});
+
+test('parseToolsCommand: anything that is not the command is ignored', () => {
+  assert.equal(g.parseToolsCommand('/toolsmith off'), null);
+  assert.equal(g.parseToolsCommand('what tools do you have'), null);
+  assert.equal(g.parseToolsCommand(''), null);
+  assert.equal(g.parseToolsCommand(undefined), null);
+});
+
+test('setToolPref: writes and clears at both scopes without disturbing the other', () => {
+  const prefs = { chats: {}, threads: {} };
+  g.setToolPref(prefs, { action: 'set', on: false, scope: 'chat' }, '-100', 7);
+  g.setToolPref(prefs, { action: 'set', on: true, scope: 'thread' }, '-100', 7);
+  assert.deepEqual(prefs, { chats: { '-100': false }, threads: { '-100_7': true } });
+  g.setToolPref(prefs, { action: 'clear', scope: 'thread' }, '-100', 7);
+  assert.deepEqual(prefs, { chats: { '-100': false }, threads: {} });
+  g.setToolPref(prefs, { action: 'clear', scope: 'chat' }, '-100', 7);
+  assert.deepEqual(prefs, { chats: {}, threads: {} });
 });
