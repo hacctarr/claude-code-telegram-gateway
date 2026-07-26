@@ -906,6 +906,71 @@ test('doctor: a process merely referencing gateway.js.log does not count as runn
   } finally { child.kill('SIGKILL'); }
 });
 
+// --- Running-version marker (version drift) --------------------------------
+// The gateway loads gateway.js once at boot and holds it in memory; `npm update`
+// or `git pull` changes the on-disk copy without touching the live process. The
+// on-disk package.json version then lies about what's actually running. The boot
+// marker records the version the live process loaded so doctor can flag the gap.
+test('writeRunningMarker: records the loaded version, pid, and dir', () => {
+  const stateDir = fs.mkdtempSync(path.join(os.tmpdir(), 'gw-state-'));
+  const m = g.writeRunningMarker(stateDir);
+  const pkg = require('../package.json');
+  assert.equal(m.version, pkg.version, 'records this package version');
+  assert.equal(m.pid, process.pid, 'records this process pid');
+  assert.equal(m.dir, path.dirname(require.resolve('../gateway.js')), 'records the install dir');
+  const onDisk = JSON.parse(fs.readFileSync(path.join(stateDir, 'running.json'), 'utf8'));
+  assert.deepEqual(onDisk, m, 'persists exactly what it returns');
+});
+
+test('doctor: flags version drift when the live process loaded an older version than what is on disk', () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'gw-home-'));
+  const dir = fakeInstall(path.join(home, 'telegram_gateway'), '1.2.1', '');   // on-disk = new
+  fs.writeFileSync(path.join(dir, 'gateway.js'), 'setTimeout(()=>{},60000)');
+  const child = require('child_process').spawn(process.execPath, [path.join(dir, 'gateway.js')], { stdio: 'ignore' });
+  const stateDir = path.join(home, '.claude-gateway');
+  fs.mkdirSync(stateDir, { recursive: true });
+  // the live process loaded 1.2.0; disk now holds 1.2.1
+  fs.writeFileSync(path.join(stateDir, 'running.json'),
+    JSON.stringify({ version: '1.2.0', pid: child.pid, dir, startedAt: '2026-07-24T00:00:00.000Z' }));
+  try {
+    const out = runDoctor({ home, npmRoot: '' });
+    assert.match(out, /loaded v1\.2\.0/, 'names the version the process is actually running');
+    assert.match(out, /restart to load/, 'tells the user how to close the gap');
+  } finally { child.kill('SIGKILL'); }
+});
+
+test('doctor: no drift warning when the loaded version matches on disk', () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'gw-home-'));
+  const dir = fakeInstall(path.join(home, 'telegram_gateway'), '1.2.1', '');
+  fs.writeFileSync(path.join(dir, 'gateway.js'), 'setTimeout(()=>{},60000)');
+  const child = require('child_process').spawn(process.execPath, [path.join(dir, 'gateway.js')], { stdio: 'ignore' });
+  const stateDir = path.join(home, '.claude-gateway');
+  fs.mkdirSync(stateDir, { recursive: true });
+  fs.writeFileSync(path.join(stateDir, 'running.json'),
+    JSON.stringify({ version: '1.2.1', pid: child.pid, dir, startedAt: '2026-07-24T00:00:00.000Z' }));
+  try {
+    const out = runDoctor({ home, npmRoot: '' });
+    assert.match(out, /v1\.2\.1\s+<- running/, 'still marked running');
+    assert.ok(!/restart to load/.test(out), 'no false drift warning when versions agree');
+  } finally { child.kill('SIGKILL'); }
+});
+
+test('doctor: ignores a stale running.json whose pid is not the live gateway', () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'gw-home-'));
+  const dir = fakeInstall(path.join(home, 'telegram_gateway'), '1.2.1', '');
+  fs.writeFileSync(path.join(dir, 'gateway.js'), 'setTimeout(()=>{},60000)');
+  const child = require('child_process').spawn(process.execPath, [path.join(dir, 'gateway.js')], { stdio: 'ignore' });
+  const stateDir = path.join(home, '.claude-gateway');
+  fs.mkdirSync(stateDir, { recursive: true });
+  // marker left by a previous, now-dead process (different pid): must not be trusted
+  fs.writeFileSync(path.join(stateDir, 'running.json'),
+    JSON.stringify({ version: '1.0.0', pid: child.pid + 100000, dir, startedAt: '2026-07-24T00:00:00.000Z' }));
+  try {
+    const out = runDoctor({ home, npmRoot: '' });
+    assert.ok(!/restart to load/.test(out), 'a marker from another pid is not evidence of drift');
+  } finally { child.kill('SIGKILL'); }
+});
+
 // --- Inline action buttons (Task 1) ----------------------------------------
 test('chunkText: short text is a single chunk', () => {
   assert.deepEqual(g.chunkText('hello'), ['hello']);

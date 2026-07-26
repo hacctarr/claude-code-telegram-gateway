@@ -60,6 +60,29 @@ for d in "${INSTALLS[@]}"; do
   [ -f "$d/package.json" ] && ver=$(python3 -c "import json;print(json.load(open('$d/package.json'))['version'])" 2>/dev/null)
   if pid=$(running_pid_for "$d"); then mark="  <- running (pid $pid)"; else mark=""; fi
   echo "  $d  v$ver$mark"
+  # Version drift: the live process loaded gateway.js at boot and holds it in memory, so the file
+  # on disk may have moved on since. running.json records what that process actually loaded, and is
+  # trusted only when both its pid and its install dir match the process we just found: a marker
+  # left by a dead process, or by the other install on a two-install machine, proves nothing.
+  if [ -n "$pid" ] && [ -f "$STATE/running.json" ]; then
+    loaded=$(python3 - "$STATE/running.json" "$pid" "$d" <<'PY' 2>/dev/null
+import json, os, sys
+marker, pid, install = sys.argv[1], sys.argv[2], sys.argv[3]
+try:
+    m = json.load(open(marker))
+except Exception:
+    sys.exit(0)
+if str(m.get('pid')) != pid:
+    sys.exit(0)
+if os.path.normcase(str(m.get('dir', ''))) != os.path.normcase(install):
+    sys.exit(0)
+print(m.get('version', ''))
+PY
+)
+    if [ -n "$loaded" ] && [ "$loaded" != "$ver" ]; then
+      echo "      DRIFT: process loaded v$loaded, disk has v$ver. restart to load it"
+    fi
+  fi
   if [ -f "$d/gateway.log" ]; then
     # grep -c prints 0 AND exits 1 on no match, so `|| echo 0` would print it twice.
     echo "      retry storms $(grep -c 'createForumTopic failed' "$d/gateway.log" 2>/dev/null)  poll timeouts $(grep -c 'request timeout' "$d/gateway.log" 2>/dev/null)"
