@@ -55,6 +55,8 @@
   "AUTO_FORK": true,
   "STALL_NOTICE_SECONDS": 60,
   "APPROVAL_TIMEOUT_SECONDS": 300,
+  "_RESTART_STALE_TURN_SECONDS": "a queued restart.flag waits for injected turns to finish, but stops waiting on one that has produced no output for this long. The window must clear the longest silent stretch a healthy turn can have, which is one long tool call. Default 600.",
+  "RESTART_STALE_TURN_SECONDS": 600,
   "MODULES": [],
   "_otlp": "optional analytics: ship usage & reliability metrics to Grafana Cloud via OTLP. endpoint + instance/token from your Grafana Cloud OTLP page; auth = base64('<instanceID>:<token>'). enabled:false (or omit the block) runs the gateway unchanged and sends nothing over the network, while /stats still works from the local mirror. 'instance' is a friendly per-machine label that becomes the Prometheus 'instance' label on every series (defaults to this machine's hostname); set a distinct value per machine when several gateways report to the same Grafana stack.",
   "otlp": {

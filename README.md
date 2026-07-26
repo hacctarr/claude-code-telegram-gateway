@@ -144,6 +144,11 @@ then exits so launchd (or systemd) relaunches it on the new version. Unlike
 `launchctl kickstart`, it's safe to run from a phone-driven turn — the gateway won't kill the
 session that asked for the restart mid-reply.
 
+"In-flight" means still producing output. A turn that has gone silent for
+`RESTART_STALE_TURN_SECONDS` (default 600) stops holding the restart: its reply is already lost,
+so waiting longer only keeps you on the old code. Raise it if you run tool calls that stay quiet
+for more than ten minutes.
+
 You don't need to re-run setup or reinstall the service: the plist points at a stable path, and
 config + state live in `~/.claude-gateway/`, outside the install dir, so an update can't wipe them.
 

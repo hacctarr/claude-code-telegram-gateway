@@ -223,6 +223,10 @@ const STALL_NOTICE_MS = config.STALL_NOTICE_SECONDS === 0 ? 0 : (config.STALL_NO
 // auto-denying. Unanswered requests deny after this timeout so turns can't hang forever.
 const PHONE_APPROVALS = PERM_MODE !== 'bypassPermissions';
 const APPROVAL_TIMEOUT_MS = (config.APPROVAL_TIMEOUT_SECONDS || 300) * 1000;
+// How long an injected turn may go without producing any output before a queued restart stops
+// waiting on it. The window has to clear the longest silent stretch a healthy turn can have, which
+// is a single long tool call (the CLI streams nothing while a tool runs), so it is generous.
+const RESTART_STALE_TURN_MS = (config.RESTART_STALE_TURN_SECONDS || 600) * 1000;
 // Auto-approve: answer every tool-permission request with "allow" instead of posting Allow/Deny
 // buttons. For machines that can't run bypassPermissions (managed policy) but still want
 // hands-off phone driving. The `deny` list still short-circuits upstream — a denied tool never
@@ -350,7 +354,33 @@ function persistLinks() {
 
 // Per-thread serialization: one Claude turn at a time per topic.
 const threadChains = new Map();
-const injecting = new Set();             // sessionIds the gateway is currently driving (suppress mirror)
+// sessionIds the gateway is currently driving. Membership suppresses the mirror for the whole
+// life of the turn; the recorded timestamp is the last time the child produced output, which is
+// what the restart gate waits on. Clock is injectable so the silence window is unit-testable.
+function createInjectionSet(clock = Date.now) {
+  const lastActive = new Map();
+  return {
+    add(id) { lastActive.set(id, clock()); },
+    delete(id) { lastActive.delete(id); },
+    has(id) { return lastActive.has(id); },
+    get size() { return lastActive.size; },
+    // Only ids already reserved are bumped: a turn hands over every id it might touch, some of
+    // which it never minted, and touch must not conjure a reservation nothing will ever release.
+    touch(...ids) {
+      const now = clock();
+      for (const id of ids) if (id && lastActive.has(id)) lastActive.set(id, now);
+    },
+    // Reservations that produced child output within `silenceMs`. A turn still streaming must not
+    // be cut off mid-reply; one that has gone quiet this long has already lost its reply, so
+    // continuing to wait on it only holds the restart hostage.
+    liveCount(silenceMs, now = clock()) {
+      let n = 0;
+      for (const t of lastActive.values()) if (now - t < silenceMs) n++;
+      return n;
+    },
+  };
+}
+const injecting = createInjectionSet();
 const queues = new Map();                // sessionId -> [prompt] awaiting an idle desk session
 const lastMirrorAt = new Map();          // sessionId -> ts of last mirror post (rate-limit coalescing)
 const mirrorRetryAt = new Map();         // sessionId -> earliest ts to retry a failed batch (429 backoff)
@@ -1055,6 +1085,9 @@ function runClaudeTurn(prompt, cwd, sessionId, live, createId, forkId, onPermiss
     };
 
     child.stdout.on('data', (d) => {
+      // Proof of life for the restart gate. Every id this turn reserved is bumped, since a resumed
+      // turn that forks streams under the fork's id while both remain reserved.
+      injecting.touch(sessionId, createId, forkId);
       rem += d.toString();
       const lines = rem.split('\n');
       rem = lines.pop();
@@ -1721,9 +1754,12 @@ async function handleActionCallback(act, cb) {
 const RESTART_FLAGS = [path.join(STATE_DIR, 'restart.flag'), path.join(__dirname, 'restart.flag')];
 function seenRestartFlag() { return RESTART_FLAGS.find((f) => { try { return fs.existsSync(f); } catch (e) { return false; } }); }
 
-// Honor a restart only when the flag is present AND no phone-injected turn is mid-flight, so
-// `touch restart.flag` never kills a session mid-reply. Pure so the gate is unit-tested.
-function restartReady(flagPresent, injectingSize) { return Boolean(flagPresent) && injectingSize === 0; }
+// Honor a restart only when the flag is present AND no phone-injected turn is still producing
+// output, so `touch restart.flag` never kills a session mid-reply. The count is of *live* turns
+// rather than every reservation: a child that hangs never releases its reservation, and gating on
+// existence alone let one hold every subsequent restart indefinitely. Pure so the gate is
+// unit-tested.
+function restartReady(flagPresent, liveInjections) { return Boolean(flagPresent) && liveInjections === 0; }
 
 // Checked at the top of the tick AND inside the per-session loop: one tick can iterate dozens of
 // sessions with a network call each (prune/mirror), so a top-of-tick-only check made a
@@ -1731,9 +1767,14 @@ function restartReady(flagPresent, injectingSize) { return Boolean(flagPresent) 
 // even under a large prune backlog. Returns true (after exiting) when it honors the flag.
 function honorRestartIfReady() {
   const flag = seenRestartFlag();
-  if (!restartReady(flag, injecting.size)) return false;
+  const live = injecting.liveCount(RESTART_STALE_TURN_MS);
+  if (!restartReady(flag, live)) return false;
   try { fs.unlinkSync(flag); } catch (e) { /* */ }
-  console.log('[Restart] restart.flag seen and no turns in flight — exiting for launchd relaunch.');
+  if (injecting.size) {
+    console.warn(`[Restart] ${injecting.size} injected turn(s) reserved but silent for ` +
+      `>${Math.round(RESTART_STALE_TURN_MS / 1000)}s, restarting anyway; their replies are already lost.`);
+  }
+  console.log('[Restart] restart.flag seen and no turns in flight, exiting for launchd relaunch.');
   persistLinks();
   process.exit(1);   // non-zero → KeepAlive relaunches
   return true;       // unreachable under a real process.exit; kept for test stubs
@@ -2371,7 +2412,7 @@ module.exports = {
   invertRepoMappings, splitThreadKey, buildThreadIndex,
   migrateLegacy, topicName, pickEmoji, pickIcon, openerText, shouldAutoCreate, loadIgnored, persistIgnored, persisted, deskUrl,
   lastExchange, sessionNameById, heldByOtherPids, updatePendingTools, dueStallNotices, createApprovalRegistry,
-  titleArgs, createTopicCooldown, parseRetryAfter, updateSocketTimeoutMs, UPDATE_POLL_TIMEOUT_S,
+  titleArgs, createTopicCooldown, createInjectionSet, parseRetryAfter, updateSocketTimeoutMs, UPDATE_POLL_TIMEOUT_S,
   loadMcpServerPool, resolveChildMcp,
   STATE_DIR, STATE_FILES, migrateStateFiles, statePath, writeRunningMarker,
   countUserTurns, dueForRename, RENAME_AFTER_TURNS,
