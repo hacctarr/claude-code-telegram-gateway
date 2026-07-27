@@ -121,8 +121,8 @@ npm start
 
 As a background service (auto-start on login, auto-restart on crash):
 ```bash
-./install-service.sh      # loads a launchd agent, logs to gateway.log, adds a `cr` alias
-tail -f gateway.log       # watch it live
+./install-service.sh      # loads a launchd agent, logs to ~/.claude-gateway/gateway.log
+tail -f ~/.claude-gateway/gateway.log   # watch it live
 ./uninstall-service.sh    # stop + remove
 ```
 

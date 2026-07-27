@@ -12,6 +12,9 @@ if [[ -z "$NODE_BIN" ]]; then echo "❌ node not found on PATH. Install Node or 
 NODE_DIR="$(dirname "$NODE_BIN")"
 
 mkdir -p "$HOME/Library/LaunchAgents"
+# launchd will not start a service whose StandardOutPath directory is missing, and the
+# failure surfaces as a bare I/O error with nothing naming the cause.
+mkdir -p "$HOME/.claude-gateway"
 
 # Fill placeholders. Use | as sed delimiter since paths contain /.
 sed -e "s|__NODE__|$NODE_BIN|g" \
@@ -57,7 +60,7 @@ HOOK
 fi
 
 echo "✅ Installed and started $LABEL."
-echo "   Logs:   tail -f \"$DIR/gateway.log\""
+echo "   Logs:   tail -f \"$HOME/.claude-gateway/gateway.log\""
 echo "   Status: launchctl print gui/$(id -u)/$LABEL | grep -i state"
 echo "   Stop:   ./uninstall-service.sh"
 echo
