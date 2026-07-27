@@ -47,6 +47,7 @@ hook bodies synchronous.
 | `api.spawnSession({cwd, prompt, mode})` | fresh detached `claude -p`; returns the new session id |
 | `api.postToTopic(sessionId, text)` | status line into the session's topic |
 | `api.getSessionInfo(sessionId)` | `{ cwd, chatId, threadId, label, mtime }` or null |
+| `api.getContextTokens(sessionId)` | how full that session's context is, in tokens (0 if unknown) |
 | `api.state(name)` | `{ data, save() }` persisted JSON, namespaced per module |
 | `api.config` | the gateway config (read-only) |
 | `api.telemetry` | `count/gauge/record/registerObservable` onto the gateway's OTLP stream |
@@ -67,3 +68,28 @@ non-terminal step settles it injects `/compact`; when `/implement` settles it
 spawns a fresh `/code-review` session in the same repo (its own topic appears in
 Telegram). Config keys (all optional): `STEP_COMMANDS`, `TERMINAL_COMMAND`,
 `SPEC_KIT_SETTLE_SECONDS` (30), `SPEC_KIT_REVIEW_SETTLE_SECONDS` (90).
+
+## auto-compact
+
+Compacts a topic once you have stopped working it. Every session the gateway sees
+is watched; when one has been idle past `AUTO_COMPACT_IDLE_MINUTES` **and** its
+context is at least `AUTO_COMPACT_MIN_TOKENS`, the module injects `/compact` with
+your summarization instructions and posts the size to the topic.
+
+The gateway is the only component that can do this. No hook can initiate a
+compaction (`PreCompact` only fires around one already underway), but `/compact`
+is dispatchable non-interactively, and to Claude Code the gateway is the user.
+
+| key | default | meaning |
+|---|---|---|
+| `AUTO_COMPACT_IDLE_MINUTES` | 45 | how long a topic must be quiet before it counts as closed |
+| `AUTO_COMPACT_MIN_TOKENS` | 120000 | floor below which a compaction isn't worth the call |
+| `AUTO_COMPACT_INSTRUCTIONS` | decisions, rationale, open questions, identifiers | passed to `/compact` |
+| `AUTO_COMPACT_PRELUDE` | none | a turn injected first, e.g. `/remember` to persist before the discard |
+
+Set `AUTO_COMPACT_PRELUDE` if you run a memory plugin whose capture must land
+before context is dropped. The prelude rides its own turn, and the queue drains one
+prompt per tick, so it always completes ahead of the compaction.
+
+The idle window is the setting to get right: a quiet desk session is not
+necessarily an abandoned one, and a compaction is a real summarization call.

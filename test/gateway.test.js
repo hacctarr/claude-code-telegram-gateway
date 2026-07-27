@@ -540,6 +540,45 @@ test('lastExchange: missing file is safe', () => {
 });
 
 // ---------------------------------------------------------------------------
+// contextTokens: how full a session's context is, for modules that act on it
+// ---------------------------------------------------------------------------
+const usageLine = (u) => JSON.stringify({ type: 'assistant', message: { usage: u } });
+
+test('contextTokens: sums the last assistant turn\'s input + cache tokens', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'gw-ct-'));
+  const f = path.join(dir, 's.jsonl');
+  try {
+    fs.writeFileSync(f, [
+      usageLine({ input_tokens: 5, cache_read_input_tokens: 100, cache_creation_input_tokens: 0, output_tokens: 90 }),
+      usageLine({ input_tokens: 2, cache_read_input_tokens: 128827, cache_creation_input_tokens: 1661, output_tokens: 1153 }),
+    ].join('\n') + '\n');
+    assert.equal(g.contextTokens(f), 130490);   // last turn only; output_tokens excluded
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('contextTokens: ignores sidechain (subagent) turns, which have their own context', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'gw-ct2-'));
+  const f = path.join(dir, 's.jsonl');
+  try {
+    fs.writeFileSync(f, [
+      usageLine({ input_tokens: 1, cache_read_input_tokens: 50000, cache_creation_input_tokens: 0 }),
+      JSON.stringify({ type: 'assistant', isSidechain: true, message: { usage: { input_tokens: 1, cache_read_input_tokens: 999999 } } }),
+    ].join('\n') + '\n');
+    assert.equal(g.contextTokens(f), 50001);
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('contextTokens: a transcript with no usage, and a missing file, both read as 0', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'gw-ct3-'));
+  const f = path.join(dir, 's.jsonl');
+  try {
+    fs.writeFileSync(f, JSON.stringify({ type: 'user', message: { content: 'hi' } }) + '\n');
+    assert.equal(g.contextTokens(f), 0);
+    assert.equal(g.contextTokens('/nope/missing.jsonl'), 0);
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
+// ---------------------------------------------------------------------------
 // heldByOtherPids — self-pid filtering (the spurious-fork fix)
 // ---------------------------------------------------------------------------
 test('heldByOtherPids: filters the gateway\'s own pid out of lsof output', () => {

@@ -234,9 +234,10 @@ without modifying the package. List them in `config.json`:
 
     "MODULES": ["~/.claude-gateway/modules/spec-kit.js"]
 
-Empty or absent = no-op. See `examples/modules/` for the contract and the
-bundled `spec-kit` module (compacts a spec-kit session between steps and spawns
-a `/code-review` session when `/implement` finishes).
+Empty or absent = no-op. See `examples/modules/` for the contract and the two
+bundled modules: `spec-kit` (compacts a spec-kit session between steps and spawns
+a `/code-review` session when `/implement` finishes) and `auto-compact` (compacts
+any session that has gone quiet with a large context).
 
 ---
 
