@@ -90,7 +90,12 @@ const config = HAS_CONFIG ? JSON.parse(fs.readFileSync(CONFIG_PATH, 'utf8')) : {
 
 const { createTelemetry } = require('./telemetry');
 const ANALYTICS_DIR = path.join(STATE_DIR, 'analytics');
-const telemetry = createTelemetry({ dir: ANALYTICS_DIR, otlp: config.otlp || {} });
+// Late-bound on purpose: main() replaces console with a timestamping wrapper before
+// telemetry.start() runs, and an arrow picks that up where a direct reference to
+// console.error would capture the unwrapped original.
+const telemetry = createTelemetry({
+  dir: ANALYTICS_DIR, otlp: config.otlp || {}, log: (m) => console.error(m),
+});
 
 // Low-cardinality repo label from a cwd (or a repo dir), matched against REPO_MAPPINGS values.
 function repoOf(cwd, mappings) {
@@ -1604,12 +1609,15 @@ function pickEmoji(text) { return pickIcon(text).emoji; }
 // costing a full agent turn: without them the child inherits the user's entire MCP surface,
 // skills index, settings and CLAUDE.md. Measured on a real install: 63,720 tokens with none of
 // these, 25,269 with all of them. The remainder is Claude Code's own base prompt.
-function titleArgs(tmpId, model = TITLE_MODEL) {
+function titleArgs(tmpId, model = TITLE_MODEL, mode = PERM_MODE) {
   return [
     '-p',
     '--session-id', tmpId,
     '--model', model,
-    '--permission-mode', 'bypassPermissions',
+    // Honour the configured mode. The turn carries no tools and no MCP so it cannot
+    // act either way, but a machine under managed policy is not allowed to pass
+    // bypassPermissions at all, and hardcoding it here left no way to opt out.
+    '--permission-mode', mode,
     '--max-turns', '1',
     '--allowedTools', '',
     '--mcp-config', '{"mcpServers":{}}',
@@ -2512,7 +2520,7 @@ module.exports = {
   invertRepoMappings, splitThreadKey, buildThreadIndex,
   migrateLegacy, topicName, pickEmoji, pickIcon, openerText, shouldAutoCreate, loadIgnored, persistIgnored, persisted, deskUrl,
   lastExchange, contextTokens, sessionNameById, heldByOtherPids, updatePendingTools, dueStallNotices, createApprovalRegistry,
-  titleArgs, createTopicCooldown, createInjectionSet, parseRetryAfter, updateSocketTimeoutMs, UPDATE_POLL_TIMEOUT_S,
+  titleArgs, PERM_MODE, createTopicCooldown, createInjectionSet, parseRetryAfter, updateSocketTimeoutMs, UPDATE_POLL_TIMEOUT_S,
   loadMcpServerPool, resolveChildMcp,
   STATE_DIR, STATE_FILES, migrateStateFiles, statePath, writeRunningMarker,
   countUserTurns, dueForRename, RENAME_AFTER_TURNS,

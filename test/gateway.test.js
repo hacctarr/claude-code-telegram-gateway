@@ -677,6 +677,20 @@ test('titleArgs: isolates the titling turn from the user MCP/CLAUDE.md surface',
   assert.equal(a[a.indexOf('--session-id') + 1], 'tmp-id');
 });
 
+// The titling turn hardcoded `--permission-mode bypassPermissions`. It is a
+// throwaway turn with no tools and no MCP, so it can do nothing, but a laptop under
+// managed policy is not allowed to pass that mode at all and had no way to opt out:
+// every other spawn path honours PERMISSION_MODE and this one did not.
+test('titleArgs: honours the configured permission mode instead of hardcoding bypass', () => {
+  const modeOf = (args) => args[args.indexOf('--permission-mode') + 1];
+  assert.strictEqual(modeOf(g.titleArgs('tmp-id', 'haiku', 'acceptEdits')), 'acceptEdits',
+    'the titling turn must take the configured mode, not a hardcoded one');
+  // And the default must be the gateway's own resolved mode, so a machine that sets
+  // PERMISSION_MODE gets it here too without passing anything.
+  assert.strictEqual(modeOf(g.titleArgs('tmp-id', 'haiku')), g.PERM_MODE,
+    'the default must follow PERMISSION_MODE, which is what a managed machine sets');
+});
+
 test('topicCooldown: a failed creation is not retried on the very next tick', () => {
   const cd = g.createTopicCooldown(1000, 60000);
   assert.equal(cd.blocked('s1', 0), false, 'first attempt is allowed');

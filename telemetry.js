@@ -19,7 +19,20 @@ function createTelemetry(opts = {}) {
     now = () => Date.now(),
     httpsMod = https,
     hostname = os.hostname(),
+    log = null,
   } = opts;
+
+  // Telemetry had no output of any kind: no line saying export was on, and flush
+  // swallowed every outcome including a 401 or a rejected payload. A machine that
+  // was perfectly configured and one that was completely broken produced identical
+  // logs, which is what made "is analytics actually working?" unanswerable on a
+  // remote laptop without read access to the destination.
+  //
+  // Logged on transition rather than per flush: a persistent failure every 30s
+  // would bury the log it is trying to inform. Never throws, for the same reason
+  // export failures never do.
+  const say = (m) => { try { if (log) log(m); } catch { /* logging is best-effort */ } };
+  let lastExportOk = null;
 
   // Device tag. In Grafana Cloud's OTLP->Prometheus mapping, `service.instance.id`
   // becomes the `instance` label on every series (so two machines' metrics stay
@@ -198,13 +211,37 @@ function createTelemetry(opts = {}) {
     });
   }
 
+  // A 2xx is the only success. `skipped` means export is off, which is a steady
+  // state rather than an outcome, so it does not move the transition marker.
+  function reportExport(r) {
+    if (!r || r.skipped) return;
+    const ok = typeof r.status === 'number' && r.status >= 200 && r.status < 300;
+    if (ok === lastExportOk) return;
+    if (ok) {
+      if (lastExportOk === false) say('[Telemetry] OTLP export recovered');
+    } else {
+      say(`[Telemetry] OTLP export failing: ${r.error ? r.error : `HTTP ${r.status}`}`);
+    }
+    lastExportOk = ok;
+  }
+
   async function flush() {
-    try { await exportOtlp(); } catch (e) { /* never let telemetry break the gateway */ }
+    // The catch stays: a throw here must never reach the gateway. It now also
+    // reports, so a transport error is visible rather than merely survived.
+    try { reportExport(await exportOtlp()); }
+    catch (e) { reportExport({ error: e.message }); }
     persist();
   }
 
   function start() {
     loadPersisted();
+    if (otlp.enabled && otlp.endpoint && otlp.auth) {
+      // Endpoint and instance, never the credential: this line goes to a log file
+      // that is not treated as a secret.
+      say(`[Telemetry] OTLP export on -> ${otlp.endpoint} as ${resourceAttrs['service.instance.id']}`);
+    } else {
+      say('[Telemetry] OTLP export disabled (no endpoint/auth, or not enabled)');
+    }
     if (!timer) {
       timer = setInterval(() => { flush().catch(() => {}); }, flushIntervalMs);
       if (timer.unref) timer.unref();
