@@ -10,9 +10,29 @@ const root = path.join(__dirname, '..');
 // The published tarball is defined by package.json "files", which is an allowlist:
 // a runtime file left off it is silently dropped and the installed gateway dies at
 // require time. Ask npm what it would actually ship rather than re-deriving the rules.
+// Reading only one report shape is what turned this guard into the thing that broke
+// the release: CI installs npm@latest, whose report is a map keyed by package name,
+// so the test threw before it could check anything. A shape it cannot read is an
+// assertion failure, never a silent pass.
 function packedFiles() {
   const out = execFileSync('npm', ['pack', '--dry-run', '--json'], { cwd: root, encoding: 'utf8' });
-  return new Set(JSON.parse(out)[0].files.map((f) => f.path));
+  const start = out.search(/[[{]/);
+  assert.ok(start >= 0, `npm pack --json produced no JSON:\n${out}`);
+  const report = pickReport(JSON.parse(out.slice(start)));
+  assert.ok(report && Array.isArray(report.files),
+    `npm pack --json shape not recognized: ${out.slice(start, start + 200)}`);
+  return new Set(report.files.map((f) => f.path));
+}
+
+// Three shapes, all of them from npm itself: a single-element array (npm 11 and
+// earlier), a bare report object, and a map keyed by package name (npm 12).
+function pickReport(parsed) {
+  if (Array.isArray(parsed)) return parsed[0];
+  if (parsed && Array.isArray(parsed.files)) return parsed;
+  if (parsed && typeof parsed === 'object') {
+    return Object.values(parsed).find((v) => v && Array.isArray(v.files));
+  }
+  return undefined;
 }
 
 function localRequires(file) {
