@@ -540,7 +540,7 @@ test('lastExchange: missing file is safe', () => {
 });
 
 // ---------------------------------------------------------------------------
-// contextTokens — how full a session's context is, for modules that act on it
+// contextTokens: how full a session's context is, for modules that act on it
 // ---------------------------------------------------------------------------
 const usageLine = (u) => JSON.stringify({ type: 'assistant', message: { usage: u } });
 

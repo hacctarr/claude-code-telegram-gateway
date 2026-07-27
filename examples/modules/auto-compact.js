@@ -73,7 +73,7 @@ function factory(api) {
         const mtime = info.mtime || 0;
         if (!decideCompaction(store.data[sessionId], cfg, now, mtime, tokens).fire) continue;
         for (const p of prompts) api.injectTurn(sessionId, p);
-        api.postToTopic(sessionId, `🗜️ Topic idle — compacting (~${Math.round(tokens / 1000)}k tokens).`);
+        api.postToTopic(sessionId, `🗜️ Topic idle, compacting (~${Math.round(tokens / 1000)}k tokens).`);
         store.data[sessionId] = { firedAtMtime: mtime, firedAt: now };
         changed = true;
       }
