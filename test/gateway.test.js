@@ -1460,3 +1460,63 @@ test('loadMcpServerPool: reads mcpServers, tolerates a missing or corrupt file',
   assert.deepEqual(g.loadMcpServerPool(bad), {});
   assert.deepEqual(g.loadMcpServerPool(path.join(dir, 'absent.json')), {});
 });
+
+// ---------------------------------------------------------------------------
+// parseTurnUsage / recordTurnUsage — token & cost telemetry from a turn's
+// terminal stream-json `result` event (usage, total_cost_usd, modelUsage).
+// ---------------------------------------------------------------------------
+const { createTelemetry } = require('../telemetry');
+
+test('parseTurnUsage normalizes tokens, cost and a single model', () => {
+  const usage = g.parseTurnUsage({
+    type: 'result', subtype: 'success', total_cost_usd: 0.437035,
+    usage: {
+      input_tokens: 2, output_tokens: 4,
+      cache_creation_input_tokens: 42745, cache_read_input_tokens: 18950,
+    },
+    modelUsage: { 'claude-opus-5[1m]': { inputTokens: 2 } },
+  });
+  assert.strictEqual(usage.input_tokens, 2);
+  assert.strictEqual(usage.output_tokens, 4);
+  assert.strictEqual(usage.cache_creation_input_tokens, 42745);
+  assert.strictEqual(usage.cache_read_input_tokens, 18950);
+  assert.strictEqual(usage.cost_usd, 0.437035);
+  assert.strictEqual(usage.model, 'claude-opus-5[1m]');
+});
+
+test('parseTurnUsage returns undefined when the event has no usage', () => {
+  assert.strictEqual(g.parseTurnUsage({ type: 'result', subtype: 'success' }), undefined);
+  assert.strictEqual(g.parseTurnUsage(null), undefined);
+});
+
+test('parseTurnUsage labels the model multi when a turn spanned several', () => {
+  const usage = g.parseTurnUsage({
+    usage: { input_tokens: 1, output_tokens: 1 },
+    modelUsage: { 'claude-opus-5[1m]': {}, 'claude-haiku-4-5': {} },
+  });
+  assert.strictEqual(usage.model, 'multi');
+});
+
+test('recordTurnUsage fans usage out to bounded token and cost counters', () => {
+  const tel = createTelemetry();
+  g.recordTurnUsage(tel, 'documents', {
+    input_tokens: 10, output_tokens: 5,
+    cache_creation_input_tokens: 100, cache_read_input_tokens: 50,
+    cost_usd: 0.25, model: 'claude-opus-5',
+  });
+  const snap = tel.snapshot();
+  const tokens = snap.counters.filter((c) => c.name === 'gateway.tokens');
+  assert.strictEqual(tokens.length, 4);
+  const input = tokens.find((c) => c.attrs.type === 'input');
+  assert.strictEqual(input.value, 10);
+  assert.deepStrictEqual(input.attrs, { repo: 'documents', type: 'input', model: 'claude-opus-5' });
+  const cost = snap.counters.find((c) => c.name === 'gateway.cost_usd');
+  assert.strictEqual(cost.value, 0.25);
+  assert.deepStrictEqual(cost.attrs, { repo: 'documents', model: 'claude-opus-5' });
+});
+
+test('recordTurnUsage is a no-op when usage is absent', () => {
+  const tel = createTelemetry();
+  g.recordTurnUsage(tel, 'documents', undefined);
+  assert.strictEqual(tel.snapshot().counters.length, 0);
+});
