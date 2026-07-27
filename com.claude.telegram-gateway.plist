@@ -41,9 +41,12 @@
     <key>ThrottleInterval</key>
     <integer>10</integer>
 
+    <!-- The log lives in the state dir, not the install dir. `npm install -g` replaces
+         the package tree, so a log under it is unlinked by every update: the running
+         process goes on writing to a dead inode and the history is gone. -->
     <key>StandardOutPath</key>
-    <string>__DIR__/gateway.log</string>
+    <string>__HOME__/.claude-gateway/gateway.log</string>
     <key>StandardErrorPath</key>
-    <string>__DIR__/gateway.log</string>
+    <string>__HOME__/.claude-gateway/gateway.log</string>
 </dict>
 </plist>

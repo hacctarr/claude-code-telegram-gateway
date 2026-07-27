@@ -62,7 +62,7 @@ topic (self-cleaning). Expect `✅ All checks passed`.
 ```bash
 npm start                 # foreground (testing)
 # or run it as a background service:
-./install-service.sh      # launchd: auto-start on login, restart on crash, logs to gateway.log
+./install-service.sh      # launchd: auto-start on login, restart on crash, logs to ~/.claude-gateway/gateway.log
 ```
 
 ## Using it
