@@ -606,17 +606,41 @@ function classifySendFailure(response, error) {
 // it STOPS at the first failure (pushing the rest of the batch at a chat that just said "slow down"
 // is what earns the next 429), and it reports how many chunks are now on Telegram so the caller can
 // resume mid-batch instead of re-posting what already landed. `send` is injectable for tests.
-async function sendChunked(chatId, threadId, text, { skip = 0, replyMarkup = null, send = telegramRequest } = {}) {
+// One transport blip cost a whole flush interval. Measured across the fleet in a day: 22
+// ETIMEDOUT on one laptop and 9 on another, against a host `curl` reaches in under a second.
+// Nothing is lost, because the caller keeps its cursor and resumes, but the mirror stalls
+// and the log fills.
+//
+// Two attempts, not more, and only on a thrown transport error. Raising SOCKET_TIMEOUT_MS
+// was the tempting fix and the wrong one: 15s is chosen so a hung send cannot stall the poll
+// loop, and each retry already costs a fresh timeout in the worst case. A rate-limit reply is
+// deliberately excluded, since the caller backs off on retryAfterMs and retrying a 429 here
+// is what earns the next one.
+const MAX_SEND_ATTEMPTS = 2;
+const SEND_RETRY_BASE_MS = 400;
+
+async function sendChunked(chatId, threadId, text, { skip = 0, replyMarkup = null, send = telegramRequest, sleep = null } = {}) {
+  const pause = sleep || ((ms) => new Promise((r) => setTimeout(r, ms)));
   const chunks = chunkText(text);
   let sent = Math.min(skip, chunks.length), lastMessageId = null, retryAfterMs = 0;
   for (let i = sent; i < chunks.length; i++) {
     const payload = { chat_id: chatId, message_thread_id: threadId, text: chunks[i] };
     if (replyMarkup && i === chunks.length - 1) payload.reply_markup = replyMarkup;
-    let r;
-    try { r = await send('sendMessage', payload); }
-    catch (e) {
-      console.error('sendChunked error:', e.code || e.message || String(e));
-      telemetry.count('gateway.send.failed', { reason: classifySendFailure(null, e) });
+    let r, lastErr = null;
+    for (let attempt = 1; attempt <= MAX_SEND_ATTEMPTS; attempt++) {
+      try { r = await send('sendMessage', payload); lastErr = null; break; }
+      catch (e) {
+        lastErr = e;
+        if (attempt < MAX_SEND_ATTEMPTS) {
+          // Jittered so a fleet of gateways hitting the same blip does not retry in lockstep.
+          await pause(SEND_RETRY_BASE_MS * attempt + Math.floor(Math.random() * SEND_RETRY_BASE_MS));
+        }
+      }
+    }
+    if (lastErr) {
+      console.error('sendChunked error:', lastErr.code || lastErr.message || String(lastErr),
+        `(after ${MAX_SEND_ATTEMPTS} attempts)`);
+      telemetry.count('gateway.send.failed', { reason: classifySendFailure(null, lastErr) });
       break;
     }
     if (!r || !r.ok) {
