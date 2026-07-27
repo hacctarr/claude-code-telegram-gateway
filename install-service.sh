@@ -7,20 +7,38 @@ LABEL="com.claude.telegram-gateway"
 PLIST_SRC="$DIR/$LABEL.plist"
 PLIST_DST="$HOME/Library/LaunchAgents/$LABEL.plist"
 
-NODE_BIN="$(command -v node || true)"
-if [[ -z "$NODE_BIN" ]]; then echo "❌ node not found on PATH. Install Node or fix PATH, then retry." >&2; exit 1; fi
+# GATEWAY_NODE pins the interpreter. The plist takes an absolute path, so whatever
+# resolves here is what the daemon runs until it is reinstalled, and the installing
+# shell is a poor thing to decide that: a PATH temporarily prepended for some other
+# tool silently changes which node a long-lived service gets.
+NODE_BIN="${GATEWAY_NODE:-$(command -v node || true)}"
+if [[ -z "$NODE_BIN" ]]; then echo "❌ node not found on PATH. Install Node, fix PATH, or set GATEWAY_NODE, then retry." >&2; exit 1; fi
 NODE_DIR="$(dirname "$NODE_BIN")"
+echo "   node:   $NODE_BIN"
 
 mkdir -p "$HOME/Library/LaunchAgents"
 # launchd will not start a service whose StandardOutPath directory is missing, and the
 # failure surfaces as a bare I/O error with nothing naming the cause.
 mkdir -p "$HOME/.claude-gateway"
 
+# A launchd job inherits almost nothing, so this string is the daemon's whole PATH.
+# /opt/homebrew/bin belongs in it: that is where a Mac keeps its tools, and without
+# it a spawn fails with "command not found" inside a process nobody is watching.
+# Deduplicated because $NODE_DIR is frequently one of the standard entries already;
+# a laptop was found with /usr/local/bin listed twice for exactly that reason.
+GATEWAY_PATH=""
+for d in "$NODE_DIR" /opt/homebrew/bin /usr/local/bin /usr/bin /bin /usr/sbin /sbin; do
+  case ":$GATEWAY_PATH:" in
+    *":$d:"*) continue ;;                       # already present, skip
+  esac
+  GATEWAY_PATH="${GATEWAY_PATH:+$GATEWAY_PATH:}$d"
+done
+
 # Fill placeholders. Use | as sed delimiter since paths contain /.
 sed -e "s|__NODE__|$NODE_BIN|g" \
     -e "s|__DIR__|$DIR|g" \
     -e "s|__HOME__|$HOME|g" \
-    -e "s|__PATH__|$NODE_DIR:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin|g" \
+    -e "s|__PATH__|$GATEWAY_PATH|g" \
     "$PLIST_SRC" > "$PLIST_DST"
 
 # (Re)load the service. bootout is async, so retry bootstrap a few times to dodge the
