@@ -227,17 +227,47 @@ settable via the Bot API — it stays a manual in-app choice.
 
 ---
 
+## auto-compact (on by default)
+
+A topic you have stopped working gets compacted for you. Every session the gateway
+sees is watched; once one has been idle past `AUTO_COMPACT_IDLE_MINUTES` **and**
+its context is at least `AUTO_COMPACT_MIN_TOKENS`, the gateway injects `/compact`
+with your summarization instructions and posts the size to the topic.
+
+The gateway is the only component that can do this. No hook can initiate a
+compaction (`PreCompact` only fires around one already underway), but `/compact`
+is dispatchable non-interactively, and to Claude Code the gateway is the user.
+
+| key | default | meaning |
+|---|---|---|
+| `AUTO_COMPACT` | `true` | set `false` to turn the module off entirely |
+| `AUTO_COMPACT_IDLE_MINUTES` | 45 | how long a topic must be quiet before it counts as closed |
+| `AUTO_COMPACT_MIN_TOKENS` | 120000 | floor below which a compaction isn't worth the call |
+| `AUTO_COMPACT_INSTRUCTIONS` | decisions, rationale, open questions, identifiers | passed to `/compact` |
+| `AUTO_COMPACT_PRELUDE` | none | a turn injected first, e.g. `/remember` to persist before the discard |
+
+Both thresholds must be met, so a short session is never compacted no matter how
+long it sits, and a busy one is never compacted while you are still in it. Set
+`AUTO_COMPACT_PRELUDE` if you run a memory plugin whose capture must land before
+context is dropped: the prelude rides its own turn and the queue drains one prompt
+per tick, so it always completes ahead of the compaction.
+
+The idle window is the setting to get right. A quiet desk session is not
+necessarily an abandoned one, and a compaction is a real summarization call.
+
+---
+
 ## Modules (optional)
 
-The gateway can load external modules that extend it against a stable `api`
-without modifying the package. List them in `config.json`:
+Beyond the built-in above, the gateway can load external modules that extend it
+against a stable `api` without modifying the package. List them in `config.json`:
 
     "MODULES": ["~/.claude-gateway/modules/spec-kit.js"]
 
-Empty or absent = no-op. See `examples/modules/` for the contract and the two
-bundled modules: `spec-kit` (compacts a spec-kit session between steps and spawns
-a `/code-review` session when `/implement` finishes) and `auto-compact` (compacts
-any session that has gone quiet with a large context).
+Empty or absent means no external modules; the builtins still load. See
+`examples/modules/` for the contract and for `spec-kit`, which compacts a spec-kit
+session between steps and spawns a `/code-review` session when `/implement`
+finishes.
 
 ---
 

@@ -68,9 +68,57 @@ test('loadModules: a module that throws at load is skipped, not fatal', () => {
   fs.rmSync(dir, { recursive: true, force: true });
 });
 
-test('loadModules: empty/absent MODULES yields a no-op registry', () => {
-  assert.deepEqual(g.loadModules({}, {}, () => {}).names(), []);
-  assert.deepEqual(g.loadModules({ MODULES: [] }, {}, () => {}).names(), []);
+// The real builtin is instantiated in these, not a stand-in, so the api has to carry
+// what its factory actually touches. auto-compact takes api.state() at construction:
+// stubbing thinner than the real api would make every one of these pass by loading
+// nothing, which is the failure they exist to catch.
+function apiStub() {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'gw-api-'));
+  return { config: {}, state: () => ({ data: {}, save() {} }), _dir: dir };
+}
+
+// auto-compact ships in the package and loads with no configuration, so an install
+// that names no MODULES at all still gets it. The older contract here was that an
+// absent MODULES meant an empty registry; that is now "no EXTERNAL modules", which
+// is the assertion below.
+test('loadModules: auto-compact loads by default, with or without an empty MODULES', () => {
+  assert.deepEqual(g.loadModules({}, apiStub(), () => {}).names(), ['auto-compact']);
+  assert.deepEqual(g.loadModules({ MODULES: [] }, apiStub(), () => {}).names(), ['auto-compact']);
+});
+
+test('loadModules: AUTO_COMPACT false is the opt-out, and only false opts out', () => {
+  assert.deepEqual(g.loadModules({ AUTO_COMPACT: false }, apiStub(), () => {}).names(), []);
+  assert.deepEqual(g.loadModules({ AUTO_COMPACT: true }, apiStub(), () => {}).names(), ['auto-compact']);
+  // Absent is on. An unrelated key must not read as an opt-out.
+  assert.deepEqual(g.loadModules({ TITLE_MODE: 'x' }, apiStub(), () => {}).names(), ['auto-compact']);
+});
+
+test('loadModules: a builtin still loads alongside external MODULES, builtins first', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'gw-mod-'));
+  const file = path.join(dir, 'ext.js');
+  fs.writeFileSync(file, `module.exports = () => ({ name: 'ext' });`);
+  assert.deepEqual(g.loadModules({ MODULES: [file] }, apiStub(), () => {}).names(), ['auto-compact', 'ext']);
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+// Naming the shipped file explicitly in MODULES was how it had to be enabled before
+// it became a builtin. Those configs still exist, and loading it twice would inject
+// two /compact turns per idle period.
+test('loadModules: naming the builtin in MODULES does not load it twice', () => {
+  const shipped = require.resolve('../modules/auto-compact.js');
+  assert.deepEqual(g.loadModules({ MODULES: [shipped] }, apiStub(), () => {}).names(), ['auto-compact']);
+});
+
+test('loadModules: a broken builtin is skipped and never stops external modules', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'gw-mod-'));
+  const file = path.join(dir, 'ext.js');
+  fs.writeFileSync(file, `module.exports = () => ({ name: 'ext' });`);
+  const errs = [];
+  const reg = g.loadModules({ MODULES: [file] }, {}, (...a) => errs.push(a.join(' ')), undefined,
+    [{ name: 'auto-compact', file: '/nope/missing-builtin.js' }]);
+  assert.deepEqual(reg.names(), ['ext']);
+  assert.ok(errs.some((e) => /missing-builtin/.test(e)));
+  fs.rmSync(dir, { recursive: true, force: true });
 });
 
 // The mcp argument is passed explicitly here rather than left to default. It defaults to whatever
