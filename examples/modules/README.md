@@ -71,25 +71,8 @@ Telegram). Config keys (all optional): `STEP_COMMANDS`, `TERMINAL_COMMAND`,
 
 ## auto-compact
 
-Compacts a topic once you have stopped working it. Every session the gateway sees
-is watched; when one has been idle past `AUTO_COMPACT_IDLE_MINUTES` **and** its
-context is at least `AUTO_COMPACT_MIN_TOKENS`, the module injects `/compact` with
-your summarization instructions and posts the size to the topic.
-
-The gateway is the only component that can do this. No hook can initiate a
-compaction (`PreCompact` only fires around one already underway), but `/compact`
-is dispatchable non-interactively, and to Claude Code the gateway is the user.
-
-| key | default | meaning |
-|---|---|---|
-| `AUTO_COMPACT_IDLE_MINUTES` | 45 | how long a topic must be quiet before it counts as closed |
-| `AUTO_COMPACT_MIN_TOKENS` | 120000 | floor below which a compaction isn't worth the call |
-| `AUTO_COMPACT_INSTRUCTIONS` | decisions, rationale, open questions, identifiers | passed to `/compact` |
-| `AUTO_COMPACT_PRELUDE` | none | a turn injected first, e.g. `/remember` to persist before the discard |
-
-Set `AUTO_COMPACT_PRELUDE` if you run a memory plugin whose capture must land
-before context is dropped. The prelude rides its own turn, and the queue drains one
-prompt per tick, so it always completes ahead of the compaction.
-
-The idle window is the setting to get right: a quiet desk session is not
-necessarily an abandoned one, and a compaction is a real summarization call.
+Moved into the package at `modules/auto-compact.js` and now loads by default, so
+it is no longer an example to copy. Its settings, including the `AUTO_COMPACT`
+opt-out, are documented in the main README under "auto-compact (on by default)".
+It remains the reference implementation of a module that uses `state()`,
+`getContextTokens()` and `injectTurn()` together.

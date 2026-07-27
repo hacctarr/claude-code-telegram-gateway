@@ -5,7 +5,8 @@
 // The gateway is the only component that can do this: from Claude Code's side it is
 // the user, and /compact is dispatchable non-interactively.
 //
-// External module: lives outside the published package, loaded via config.MODULES.
+// Built in: ships with the package and loads without being named in config.MODULES.
+// `AUTO_COMPACT: false` in config.json is the opt-out.
 
 // Quiet + big enough to be worth a summarization call + not already handled this
 // quiet period. mtime is the gateway's own idea of last write, so a session the

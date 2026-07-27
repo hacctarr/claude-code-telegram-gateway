@@ -1431,24 +1431,46 @@ function resolveModulePath(entry, gatewayDir) {
   return path.isAbsolute(p) ? p : path.join(gatewayDir, p);
 }
 
+// Modules that ship inside the package and load without being named in MODULES.
+// Each carries the config key that turns it off, so the opt-out is data rather
+// than a branch in the loader. Strict `=== false` means only an explicit false
+// disables one: a missing config file, or a config written before the key
+// existed, leaves the module on.
+const BUILTIN_MODULES = [
+  { name: 'auto-compact', file: path.join(__dirname, 'modules', 'auto-compact.js'), off: 'AUTO_COMPACT' },
+];
+
 // Require each module file and instantiate its factory with the curated api.
-// A module that fails to load is logged and skipped — one bad module never
-// stops the gateway or the others.
-function loadModules(config, api, log = console.error, gatewayDir = STATE_DIR) {
-  const entries = Array.isArray(config && config.MODULES) ? config.MODULES : [];
+// A module that fails to load is logged and skipped: one bad module never
+// stops the gateway or the others, and that isolation covers the builtins too.
+// Builtins load first so an external module can observe a session the builtin
+// has already registered.
+function loadModules(config, api, log = console.error, gatewayDir = STATE_DIR, builtins = BUILTIN_MODULES) {
+  const cfg = config || {};
+  const loaded = new Set();
   const instances = [];
-  for (const entry of entries) {
-    const file = resolveModulePath(entry, gatewayDir);
+
+  const add = (file, label) => {
+    if (loaded.has(file)) return;                     // same file named twice loads once
+    loaded.add(file);
     try {
       const factory = require(file);
       if (typeof factory !== 'function') throw new Error('module does not export a factory function');
       const hooks = factory(api);
       const name = (hooks && hooks.name) || path.basename(file, '.js');
       instances.push({ name, hooks: hooks || {} });
-      log(`[Module] loaded ${name} from ${file}`);
+      log(`[Module] loaded ${name} from ${file}${label ? ` (${label})` : ''}`);
     } catch (e) {
       log(`[Module] failed to load ${file}: ${e.message}`);
     }
+  };
+
+  for (const b of builtins || []) {
+    if (cfg[b.off] === false) { log(`[Module] ${b.name} disabled by ${b.off}: false`); continue; }
+    add(b.file, 'builtin');
+  }
+  for (const entry of Array.isArray(cfg.MODULES) ? cfg.MODULES : []) {
+    add(resolveModulePath(entry, gatewayDir));
   }
   return createModuleRegistry(instances, log);
 }
