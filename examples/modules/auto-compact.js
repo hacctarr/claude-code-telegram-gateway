@@ -62,13 +62,13 @@ function factory(api) {
     onTranscriptLine(ctx) { register(ctx.sessionId); },
     onInjectedTurn(ctx, prompt) { if (!isCompactionTurn(prompt)) register(ctx.sessionId); },
     onTick(now) {
+      // Older gateways have no getContextTokens; without it there is no floor to
+      // enforce, and firing blind would compact short sessions. Stay inert instead.
+      if (typeof api.getContextTokens !== 'function') return;
       let changed = false;
       for (const sessionId of Object.keys(store.data)) {
         const info = api.getSessionInfo(sessionId);
         if (!info) { delete store.data[sessionId]; changed = true; continue; }
-        // Older gateways have no getContextTokens; without it there is no floor to
-        // enforce, and firing blind would compact short sessions. Stay inert instead.
-        if (typeof api.getContextTokens !== 'function') return;
         const tokens = api.getContextTokens(sessionId) || 0;
         const mtime = info.mtime || 0;
         if (!decideCompaction(store.data[sessionId], cfg, now, mtime, tokens).fire) continue;
