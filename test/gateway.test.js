@@ -1314,12 +1314,49 @@ test('sendChunked: a retry skips the chunks that already landed', async () => {
   assert.ok(!retry.calls.some((c) => c.startsWith('chunk0')), 'chunk 0 was already on Telegram');
 });
 
-test('sendChunked: a thrown transport error stops the batch and keeps the delivered count', async () => {
-  const f = fakeSend([true, 'throw']);
-  const r = await g.sendChunked('-1', 7, CH(3), { send: f.send });
+// A transport error that does not recover still stops the batch and still reports what
+// landed. The fixture throws on every attempt deliberately: a single 'throw' no longer ends
+// the batch now that transport errors are retried, and with this fixture a lone entry would
+// fall off the end of `outcomes` and be answered as a success.
+test('sendChunked: an unrecovered transport error stops the batch and keeps the delivered count', async () => {
+  const f = fakeSend([true, 'throw', 'throw']);
+  const r = await g.sendChunked('-1', 7, CH(3), { send: f.send, sleep: async () => {} });
   assert.equal(r.allSent, false);
   assert.equal(r.sent, 1);
   assert.equal(r.retryAfterMs, 0);
+});
+
+// A single transport blip cost a whole flush interval. Measured across the fleet in one
+// day: 22 ETIMEDOUT on one laptop, 9 on another, against a host `curl` reaches in under a
+// second. The batch resumes on the next tick so nothing is lost, but the mirror stalls and
+// the log fills. Retry the transport error itself rather than raising SOCKET_TIMEOUT_MS,
+// which is held at 15s deliberately so a hung send cannot stall the poll loop.
+test('sendChunked: a transient transport error is retried rather than costing the batch', async () => {
+  const f = fakeSend([true, 'throw', true, true]);
+  const r = await g.sendChunked('-1', 7, CH(3), { send: f.send, sleep: async () => {} });
+  assert.equal(r.allSent, true, 'a blip on chunk 2 must not end the batch');
+  assert.equal(r.sent, 3);
+  assert.equal(f.calls.length, 4, 'chunk 2 attempted twice, then chunk 3');
+});
+
+// The distinction that matters. A 429 is Telegram asking us to slow down, and the caller
+// already backs off on retryAfterMs; retrying it here is what earns the next 429.
+test('sendChunked: a rate-limit response is NOT retried', async () => {
+  const f = fakeSend([true, 30, true, true]);
+  const r = await g.sendChunked('-1', 7, CH(3), { send: f.send, sleep: async () => {} });
+  assert.equal(r.allSent, false);
+  assert.equal(r.sent, 1);
+  assert.equal(f.calls.length, 2, 'a 429 aborts immediately, exactly as before');
+  assert.equal(r.retryAfterMs, 30000);
+});
+
+test('sendChunked: retries are bounded, and a persistent failure still reports what landed', async () => {
+  const f = fakeSend([true, 'throw', 'throw', 'throw', 'throw', 'throw']);
+  const r = await g.sendChunked('-1', 7, CH(3), { send: f.send, sleep: async () => {} });
+  assert.equal(r.allSent, false);
+  assert.equal(r.sent, 1, 'the delivered count survives a persistent failure');
+  assert.ok(f.calls.length <= 4,
+    `retries must be bounded so a dead network cannot stall the loop; got ${f.calls.length} calls`);
 });
 
 test('sendChunked: reply markup rides the final chunk only', async () => {
