@@ -1023,6 +1023,32 @@ function lastExchange(file) {
   } catch (e) { return { lastText: null, lastUser: null }; }
 }
 
+// How full a session's context is, from the last main-thread assistant turn's usage.
+// Everything the model was sent counts (fresh input + both cache buckets); output does
+// not, since it is already folded into the next turn's input. Sidechain turns are
+// subagents running their own context and would wildly overstate the parent's.
+// Reads only the tail, like lastExchange, so it stays cheap on large transcripts.
+function contextTokens(file) {
+  try {
+    const size = fs.statSync(file).size;
+    const start = Math.max(0, size - 131072);
+    const len = size - start;
+    const buf = Buffer.alloc(len);
+    const fd = fs.openSync(file, 'r');
+    try { fs.readSync(fd, buf, 0, len, start); } finally { fs.closeSync(fd); }
+    let tokens = 0;
+    for (const line of buf.toString('utf8').split('\n')) {
+      if (!line.trim()) continue;
+      let o; try { o = JSON.parse(line); } catch (e) { continue; }
+      if (o.type !== 'assistant' || o.isSidechain) continue;
+      const u = o.message && o.message.usage;
+      if (!u) continue;
+      tokens = (u.input_tokens || 0) + (u.cache_read_input_tokens || 0) + (u.cache_creation_input_tokens || 0);
+    }
+    return tokens;
+  } catch (e) { return 0; }
+}
+
 // Read complete JSONL records appended since `offset`. Returns parsed lines + advanced offset.
 function readNewLines(filePath, offset) {
   let size;
@@ -1433,6 +1459,10 @@ function buildModuleApi() {
       if (file) { cwd = cwdCache.get(file) || null; try { mtime = fs.statSync(file).mtimeMs; } catch (e) { /* */ } }
       if (!l && !file) return null;
       return { cwd, chatId: l && l.chatId, threadId: l && l.threadId, label: l && l.label, mtime };
+    },
+    getContextTokens(sessionId) {
+      const file = sessionFileById(sessionId);
+      return file ? contextTokens(file) : 0;
     },
     state(name) {
       const file = statePath('module-' + name);
@@ -2420,7 +2450,7 @@ module.exports = {
   isActive, shouldPrune, isDeskBusy, resolvePruneMs, formatPruneWindow, resolveShowTools,
   invertRepoMappings, splitThreadKey, buildThreadIndex,
   migrateLegacy, topicName, pickEmoji, pickIcon, openerText, shouldAutoCreate, loadIgnored, persistIgnored, persisted, deskUrl,
-  lastExchange, sessionNameById, heldByOtherPids, updatePendingTools, dueStallNotices, createApprovalRegistry,
+  lastExchange, contextTokens, sessionNameById, heldByOtherPids, updatePendingTools, dueStallNotices, createApprovalRegistry,
   titleArgs, createTopicCooldown, createInjectionSet, parseRetryAfter, updateSocketTimeoutMs, UPDATE_POLL_TIMEOUT_S,
   loadMcpServerPool, resolveChildMcp,
   STATE_DIR, STATE_FILES, migrateStateFiles, statePath, writeRunningMarker,
