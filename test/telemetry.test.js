@@ -355,3 +355,88 @@ test('sendChunked counts nothing when the send succeeds', async () => {
   assert.strictEqual(r.allSent, true);
   assert.strictEqual(total(), t0, 'a healthy send is not counted as a failure');
 });
+
+
+// Telemetry had no console output at all: no line saying export was on, and flush
+// swallowed every outcome including a 401 or a rejected payload. A machine could be
+// perfectly configured or completely broken and look identical from the log, which
+// is what made "is analytics working?" unanswerable on a remote laptop.
+test('start announces that export is on, naming endpoint and instance but never the credential', () => {
+  const lines = [];
+  const t = createTelemetry({
+    otlp: { enabled: true, endpoint: 'https://otlp.example/otlp', auth: 'SUPERSECRETTOKEN', instance: 'alkami-laptop' },
+    log: (m) => lines.push(m),
+  });
+  t.start();
+  t.stop();
+  const joined = lines.join('\n');
+  assert.match(joined, /otlp\.example/, `the startup line must name the endpoint:\n${joined}`);
+  assert.match(joined, /alkami-laptop/, `the startup line must name the instance:\n${joined}`);
+  assert.doesNotMatch(joined, /SUPERSECRETTOKEN/, 'the credential must never be logged');
+});
+
+test('an unconfigured machine says export is off rather than saying nothing', () => {
+  const lines = [];
+  const t = createTelemetry({ otlp: {}, log: (m) => lines.push(m) });
+  t.start();
+  t.stop();
+  assert.match(lines.join('\n'), /disabled|off/i, `silence and "off" must be distinguishable:\n${lines.join('\n')}`);
+});
+
+test('a rejected export is reported once rather than swallowed', async () => {
+  const lines = [];
+  const fakeHttps = {
+    request(_opts, cb) {
+      const res = { statusCode: 401, resume() {}, on(ev, fn) { if (ev === 'end') fn(); } };
+      return { on() {}, setTimeout() {}, write() {}, end() { cb(res); } };
+    },
+  };
+  const t = createTelemetry({
+    otlp: { enabled: true, endpoint: 'https://otlp.example/otlp', auth: 'x', instance: 'i' },
+    httpsMod: fakeHttps,
+    log: (m) => lines.push(m),
+  });
+  await t.flush();
+  const failures = lines.filter((l) => /401/.test(l));
+  assert.strictEqual(failures.length, 1, `a 401 must be reported exactly once:\n${lines.join('\n')}`);
+});
+
+test('a persistent failure does not reprint on every flush', async () => {
+  const lines = [];
+  const fakeHttps = {
+    request(_opts, cb) {
+      const res = { statusCode: 500, resume() {}, on(ev, fn) { if (ev === 'end') fn(); } };
+      return { on() {}, setTimeout() {}, write() {}, end() { cb(res); } };
+    },
+  };
+  const t = createTelemetry({
+    otlp: { enabled: true, endpoint: 'https://otlp.example/otlp', auth: 'x', instance: 'i' },
+    httpsMod: fakeHttps,
+    log: (m) => lines.push(m),
+  });
+  await t.flush(); await t.flush(); await t.flush();
+  const failures = lines.filter((l) => /500/.test(l));
+  assert.strictEqual(failures.length, 1,
+    `a repeating failure must be logged on transition, not every 30s:\n${lines.join('\n')}`);
+});
+
+test('recovery after a failure is announced, so the log shows the transition back', async () => {
+  const lines = [];
+  let status = 500;
+  const fakeHttps = {
+    request(_opts, cb) {
+      const res = { statusCode: status, resume() {}, on(ev, fn) { if (ev === 'end') fn(); } };
+      return { on() {}, setTimeout() {}, write() {}, end() { cb(res); } };
+    },
+  };
+  const t = createTelemetry({
+    otlp: { enabled: true, endpoint: 'https://otlp.example/otlp', auth: 'x', instance: 'i' },
+    httpsMod: fakeHttps,
+    log: (m) => lines.push(m),
+  });
+  await t.flush();
+  status = 200;
+  await t.flush();
+  assert.match(lines.join('\n'), /recover|resumed|ok again/i,
+    `the return to healthy must be visible:\n${lines.join('\n')}`);
+});
