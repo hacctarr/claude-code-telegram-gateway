@@ -101,6 +101,39 @@ function repoOf(cwd, mappings) {
   return path.basename(cwd);
 }
 
+// Token and cost figures a turn's terminal stream-json `result` event already
+// carries (same shape as `claude -p --output-format json`). Returns undefined
+// when the event has no usage, so a turn that reported none records nothing.
+// `model` collapses modelUsage to one bounded label: the single id, 'multi', or
+// 'unknown'.
+function parseTurnUsage(ev) {
+  const u = ev && ev.usage;
+  if (!u || typeof u !== 'object') return undefined;
+  const n = (v) => (Number.isFinite(v) ? v : 0);
+  const models = ev.modelUsage && typeof ev.modelUsage === 'object' ? Object.keys(ev.modelUsage) : [];
+  return {
+    input_tokens: n(u.input_tokens),
+    output_tokens: n(u.output_tokens),
+    cache_creation_input_tokens: n(u.cache_creation_input_tokens),
+    cache_read_input_tokens: n(u.cache_read_input_tokens),
+    cost_usd: n(ev.total_cost_usd),
+    model: models.length === 1 ? models[0] : (models.length ? 'multi' : 'unknown'),
+  };
+}
+
+// Fan usage out to bounded-cardinality counters, one token counter per type plus
+// a cost counter, labelled by repo and model. No message content, so nothing a
+// body could leak. Injected telemetry keeps it unit-testable.
+function recordTurnUsage(tel, repo, usage) {
+  if (!usage) return;
+  const model = usage.model || 'unknown';
+  tel.count('gateway.tokens', { repo, type: 'input', model }, usage.input_tokens || 0);
+  tel.count('gateway.tokens', { repo, type: 'output', model }, usage.output_tokens || 0);
+  tel.count('gateway.tokens', { repo, type: 'cache_creation', model }, usage.cache_creation_input_tokens || 0);
+  tel.count('gateway.tokens', { repo, type: 'cache_read', model }, usage.cache_read_input_tokens || 0);
+  tel.count('gateway.cost_usd', { repo, model }, usage.cost_usd || 0);
+}
+
 const {
   BOT_TOKEN,
   ALLOWED_USER_IDS,
@@ -1122,7 +1155,13 @@ function runClaudeTurn(prompt, cwd, sessionId, live, createId, forkId, onPermiss
         let o; try { o = JSON.parse(line); } catch (e) { continue; }
         if (o.type === 'control_request' && o.request && o.request.subtype === 'can_use_tool') { answerPermission(o); continue; }
         try { if (feed.handle(o)) live.set(feed.render()); } catch (e) { console.error('event handler error:', e.message); }
-        // In stream-json input mode the CLI waits for more input after the result — close stdin to let it exit.
+        // The terminal result event carries the turn's token usage and cost; fan
+        // it out to metrics. Best-effort, never breaks the turn.
+        if (o.type === 'result') {
+          try { recordTurnUsage(telemetry, repoOf(cwd, REPO_MAPPINGS), parseTurnUsage(o)); }
+          catch (e) { /* telemetry is best-effort */ }
+        }
+        // In stream-json input mode the CLI waits for more input after the result, so close stdin to let it exit.
         if (o.type === 'result' && PHONE_APPROVALS) { try { child.stdin.end(); } catch (e) { /* */ } }
       }
     });
@@ -2464,7 +2503,7 @@ module.exports = {
   sha256, appearanceHash, buildCommandList, resolveBotProfile, resolveChatAppearance, chatPhotoPath,
   configureGroup,
   restartReady,
-  repoOf,
+  repoOf, parseTurnUsage, recordTurnUsage,
   formatStats, humanizeMs,
   telemetry,   // exported so tests can assert that failures are actually counted, not just classifiable
 };

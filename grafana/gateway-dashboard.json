@@ -14,6 +14,26 @@
         "type": "datasource",
         "query": "prometheus",
         "current": {}
+      },
+      {
+        "name": "loki",
+        "type": "datasource",
+        "query": "loki",
+        "label": "Logs source",
+        "current": {},
+        "hide": 0,
+        "refresh": 1
+      },
+      {
+        "name": "search",
+        "type": "textbox",
+        "label": "Log filter",
+        "query": "",
+        "current": {
+          "text": "",
+          "value": ""
+        },
+        "hide": 0
       }
     ]
   },
@@ -187,6 +207,172 @@
         {
           "expr": "gateway_mirror_backoff_seconds_max",
           "legendFormat": ""
+        }
+      ]
+    },
+    {
+      "id": 200,
+      "title": "Tokens & cost",
+      "type": "row",
+      "collapsed": false,
+      "gridPos": {
+        "x": 0,
+        "y": 32,
+        "w": 24,
+        "h": 1
+      },
+      "panels": []
+    },
+    {
+      "id": 201,
+      "title": "Token rate by type",
+      "type": "timeseries",
+      "gridPos": {
+        "x": 0,
+        "y": 33,
+        "w": 12,
+        "h": 8
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "description": "Tokens/sec by type. cache_creation is usually the dominant cost driver.",
+      "targets": [
+        {
+          "expr": "sum by (type) (rate(gateway_tokens_total[$__rate_interval]))",
+          "legendFormat": "{{type}}"
+        }
+      ]
+    },
+    {
+      "id": 202,
+      "title": "Total cost ($__range)",
+      "type": "stat",
+      "gridPos": {
+        "x": 12,
+        "y": 33,
+        "w": 6,
+        "h": 8
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "description": "Total claude spend over the dashboard range, from total_cost_usd.",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "currencyUSD",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "yellow",
+                "value": 5
+              },
+              {
+                "color": "red",
+                "value": 25
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "colorMode": "background",
+        "graphMode": "area",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        }
+      },
+      "targets": [
+        {
+          "expr": "sum(increase(gateway_cost_usd_total[$__range]))",
+          "legendFormat": "cost"
+        }
+      ]
+    },
+    {
+      "id": 203,
+      "title": "Cost rate by repo (USD/hr)",
+      "type": "timeseries",
+      "gridPos": {
+        "x": 18,
+        "y": 33,
+        "w": 6,
+        "h": 8
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "description": "Spend rate per repo, projected to USD/hour.",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "currencyUSD"
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "expr": "sum by (repo) (rate(gateway_cost_usd_total[$__rate_interval])) * 3600",
+          "legendFormat": "{{repo}}"
+        }
+      ]
+    },
+    {
+      "id": 100,
+      "title": "Logs",
+      "type": "row",
+      "collapsed": false,
+      "gridPos": {
+        "x": 0,
+        "y": 41,
+        "w": 24,
+        "h": 1
+      },
+      "panels": []
+    },
+    {
+      "id": 101,
+      "title": "Gateway logs (Loki)",
+      "type": "logs",
+      "datasource": {
+        "type": "loki",
+        "uid": "${loki}"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 42,
+        "w": 24,
+        "h": 10
+      },
+      "description": "Gateway logs shipped by Grafana Alloy from gateway.log. (?i)$search is a valid match-all when the filter box is empty.",
+      "options": {
+        "showTime": true,
+        "wrapLogMessage": true,
+        "prettifyLogMessage": false,
+        "enableLogDetails": true,
+        "dedupStrategy": "none",
+        "sortOrder": "Descending"
+      },
+      "targets": [
+        {
+          "expr": "{job=\"telegram-gateway\"} |~ \"(?i)$search\"",
+          "datasource": {
+            "type": "loki",
+            "uid": "${loki}"
+          },
+          "refId": "A"
         }
       ]
     }
