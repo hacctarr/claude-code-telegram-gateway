@@ -1440,6 +1440,27 @@ test('parseToolsCommand: anything that is not the command is ignored', () => {
   assert.equal(g.parseToolsCommand(undefined), null);
 });
 
+test('stripBotMention: strips our own @mention from a command, keeping arguments', () => {
+  assert.equal(g.stripBotMention('/exit@Hacctarr_bot', 'Hacctarr_bot'), '/exit');
+  assert.equal(g.stripBotMention('/sessions@Hacctarr_bot', 'Hacctarr_bot'), '/sessions');
+  assert.equal(g.stripBotMention('/resume@Hacctarr_bot abc def', 'Hacctarr_bot'), '/resume abc def');
+  assert.equal(g.stripBotMention('/exit@hacctarr_BOT', 'Hacctarr_bot'), '/exit', 'Telegram usernames are case-insensitive');
+});
+
+test('stripBotMention: a command addressed to a different bot is dropped, not forwarded', () => {
+  assert.equal(g.stripBotMention('/exit@SomeOther_bot', 'Hacctarr_bot'), null);
+});
+
+test('stripBotMention: with our username unknown, a command mention is treated as ours', () => {
+  assert.equal(g.stripBotMention('/exit@Hacctarr_bot', null), '/exit');
+});
+
+test('stripBotMention: everything else passes through untouched', () => {
+  assert.equal(g.stripBotMention('/exit', 'Hacctarr_bot'), '/exit');
+  assert.equal(g.stripBotMention('ping me@example.com about /exit', 'Hacctarr_bot'), 'ping me@example.com about /exit');
+  assert.equal(g.stripBotMention('plain prose', 'Hacctarr_bot'), 'plain prose');
+});
+
 test('setToolPref: writes and clears at both scopes without disturbing the other', () => {
   const prefs = { chats: {}, threads: {} };
   g.setToolPref(prefs, { action: 'set', on: false, scope: 'chat' }, '-100', 7);
