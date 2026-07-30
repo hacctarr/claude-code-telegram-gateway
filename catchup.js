@@ -103,7 +103,67 @@ function buildDigest(forkLines, deskUuids) {
   return parts.join('\n\n');
 }
 
+// Merge-written like resume.json: concurrent catchups in different repos must not clobber.
+function writeMarker(deskSid, entry, file) {
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  const m = readJson(file, {});
+  m[deskSid] = entry;
+  fs.writeFileSync(file, JSON.stringify(m, null, 2));
+}
+
+// Order is terminal-state discipline: digest printed and FLUSHED, then the marker, then exit.
+// The rebind trigger must not exist until the digest has fully left the process, so a crash at
+// any point before the marker leaves gateway state unchanged and a re-run starts over cleanly.
+// (The desk jsonl only grows after the Bash tool returns, which is after both.)
+async function run({
+  sid,
+  stateDir = STATE_DIR,
+  projectsDir = PROJECTS_DIR,
+  out = process.stdout,
+  now = Date.now,
+  writeMarkerFn = writeMarker,
+} = {}) {
+  const say = (t) => new Promise((res) => out.write(t, res));
+  if (!sid) {
+    await say('catchup: CLAUDE_CODE_SESSION_ID is not set. Run this from inside a Claude Code session.\n');
+    return 1;
+  }
+  const deskFile = findTranscript(sid, projectsDir);
+  if (!deskFile) {
+    await say(`catchup: no transcript found for session ${sid}.\n`);
+    return 1;
+  }
+  const superseded = readJson(path.join(stateDir, 'superseded.json'), {});
+  if (superseded[sid] === undefined) {
+    await say('nothing pending: no phone branch is ahead of this session.\n');
+    return 0;
+  }
+  const links = readJson(path.join(stateDir, 'links.json'), {});
+  const forkId = findLinkedDescendant(sid, deskFile, links);
+  if (!forkId) {
+    await say('nothing pending: no phone branch is ahead of this session.\n');
+    return 0;
+  }
+  const forkFile = path.join(path.dirname(deskFile), forkId + '.jsonl');
+  const forkSize = fs.statSync(forkFile).size;
+  const deskLines = readTranscriptLines(deskFile);
+  const digest = buildDigest(readTranscriptLines(forkFile), uuidSet(deskLines));
+  if (!digest) {
+    await say('nothing pending: the phone branch has no new turns.\n');
+    return 0;
+  }
+  const repoDir = (deskLines.find((o) => o && o.cwd) || {}).cwd || process.cwd();
+  await say(`--- phone branch ${forkId.slice(0, 8)} ---\n\n${digest}\n`);
+  writeMarkerFn(sid, { forkId, forkSize, repoDir, ts: now() }, path.join(stateDir, 'catchup.json'));
+  return 0;
+}
+
+if (require.main === module) {
+  run({ sid: process.env.CLAUDE_CODE_SESSION_ID }).then((code) => { process.exitCode = code; });
+}
+
 module.exports = {
   STATE_DIR, PROJECTS_DIR, readJson,
   readTranscriptLines, uuidSet, findTranscript, findLinkedDescendant, renderDigestEntry, buildDigest,
+  writeMarker, run,
 };

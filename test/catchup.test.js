@@ -136,3 +136,80 @@ test('findLinkedDescendant: never returns the desk session itself', () => {
     c.findLinkedDescendant('desk-sid', path.join(proj, 'desk-sid.jsonl'), links),
     null);
 });
+
+test('writeMarker: merge-writes so concurrent catchups in other repos survive', () => {
+  const { root } = mkFixture();
+  const file = path.join(root, 'catchup.json');
+  c.writeMarker('sid-a', { forkId: 'f-a', forkSize: 10, repoDir: '/r/a', ts: 1 }, file);
+  c.writeMarker('sid-b', { forkId: 'f-b', forkSize: 20, repoDir: '/r/b', ts: 2 }, file);
+  const m = JSON.parse(fs.readFileSync(file, 'utf8'));
+  assert.deepEqual(Object.keys(m).sort(), ['sid-a', 'sid-b']);
+  assert.equal(m['sid-a'].forkId, 'f-a');
+});
+
+// run() needs gateway state files alongside the fixture transcripts.
+function mkStateDir(root, { superseded = {}, links = {} } = {}) {
+  const stateDir = path.join(root, 'state');
+  fs.mkdirSync(stateDir, { recursive: true });
+  fs.writeFileSync(path.join(stateDir, 'superseded.json'), JSON.stringify(superseded));
+  fs.writeFileSync(path.join(stateDir, 'links.json'), JSON.stringify(links));
+  return stateDir;
+}
+
+function fakeOut(events) {
+  return { write(text, cb) { events.push({ ev: 'out', text }); if (cb) cb(); return true; } };
+}
+
+test('run: no session id is a clear error, exit 1, no marker', async () => {
+  const { root, projectsDir } = mkFixture();
+  const stateDir = mkStateDir(root);
+  const events = [];
+  const code = await c.run({ sid: undefined, stateDir, projectsDir, out: fakeOut(events) });
+  assert.equal(code, 1);
+  assert.match(events[0].text, /CLAUDE_CODE_SESSION_ID/);
+  assert.ok(!fs.existsSync(path.join(stateDir, 'catchup.json')));
+});
+
+test('run: not superseded prints nothing pending, exit 0, no marker', async () => {
+  const { root, projectsDir } = mkFixture();
+  const stateDir = mkStateDir(root, { links: { 'fork-sid': { forkedFrom: 'desk-sid' } } });
+  const events = [];
+  const code = await c.run({ sid: 'desk-sid', stateDir, projectsDir, out: fakeOut(events) });
+  assert.equal(code, 0);
+  assert.match(events[0].text, /^nothing pending/);
+  assert.ok(!fs.existsSync(path.join(stateDir, 'catchup.json')));
+});
+
+test('run: no linked descendant prints nothing pending, no marker', async () => {
+  const { root, projectsDir } = mkFixture();
+  const stateDir = mkStateDir(root, { superseded: { 'desk-sid': 100 } });
+  const events = [];
+  const code = await c.run({ sid: 'desk-sid', stateDir, projectsDir, out: fakeOut(events) });
+  assert.equal(code, 0);
+  assert.match(events[0].text, /^nothing pending/);
+  assert.ok(!fs.existsSync(path.join(stateDir, 'catchup.json')));
+});
+
+test('run: digest fully written before the marker exists, marker fields correct', async () => {
+  const { root, projectsDir, proj } = mkFixture();
+  const stateDir = mkStateDir(root, {
+    superseded: { 'desk-sid': 100 },
+    links: { 'fork-sid': { chatId: '-1', threadId: 5, forkedFrom: 'desk-sid' } },
+  });
+  const events = [];
+  const code = await c.run({
+    sid: 'desk-sid', stateDir, projectsDir, out: fakeOut(events), now: () => 12345,
+    writeMarkerFn: (sid, entry, file) => { events.push({ ev: 'marker' }); c.writeMarker(sid, entry, file); },
+  });
+  assert.equal(code, 0);
+  const kinds = events.map((e) => e.ev);
+  assert.equal(kinds[kinds.length - 1], 'marker', 'marker is the terminal write');
+  assert.ok(kinds.slice(0, -1).every((k) => k === 'out'), 'all output precedes the marker');
+  const digestText = events.filter((e) => e.ev === 'out').map((e) => e.text).join('');
+  assert.ok(digestText.includes('📱 phone:'), 'digest contains the phone turns');
+  const m = JSON.parse(fs.readFileSync(path.join(stateDir, 'catchup.json'), 'utf8'));
+  assert.equal(m['desk-sid'].forkId, 'fork-sid');
+  assert.equal(m['desk-sid'].forkSize, fs.statSync(path.join(proj, 'fork-sid.jsonl')).size);
+  assert.equal(m['desk-sid'].repoDir, '/Users/me/repo');
+  assert.equal(m['desk-sid'].ts, 12345);
+});
