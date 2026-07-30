@@ -77,3 +77,62 @@ test('buildDigest: only entries whose uuid the desk file lacks', () => {
     '📱 phone: phone: check  the\ndeploy\n\n🔧 Bash: git status\n\nAll clean.');
   assert.ok(!digest.includes('desk reply'), 'copied history must not appear');
 });
+
+test('findLinkedDescendant: forkedFrom fast path wins without reading transcripts', () => {
+  const { proj } = mkFixture();
+  const links = { 'fork-sid': { chatId: '-1', threadId: 5, forkedFrom: 'desk-sid' } };
+  assert.equal(
+    c.findLinkedDescendant('desk-sid', path.join(proj, 'desk-sid.jsonl'), links),
+    'fork-sid');
+});
+
+test('findLinkedDescendant: legacy links resolve via uuid overlap', () => {
+  const { proj } = mkFixture();
+  const links = { 'fork-sid': { chatId: '-1', threadId: 5 } };
+  assert.equal(
+    c.findLinkedDescendant('desk-sid', path.join(proj, 'desk-sid.jsonl'), links),
+    'fork-sid');
+});
+
+test('findLinkedDescendant: a linked session with no shared history is not a descendant', () => {
+  const { proj } = mkFixture();
+  fs.writeFileSync(path.join(proj, 'fresh-sid.jsonl'),
+    J({ uuid: 'x1', type: 'user', message: { role: 'user', content: 'unrelated /new session' } }));
+  const links = { 'fresh-sid': { chatId: '-1', threadId: 9 } };
+  assert.equal(
+    c.findLinkedDescendant('desk-sid', path.join(proj, 'desk-sid.jsonl'), links),
+    null);
+});
+
+test('findLinkedDescendant: candidates outside the desk project dir are ignored', () => {
+  const { projectsDir, proj } = mkFixture();
+  const other = path.join(projectsDir, '-Users-me-other');
+  fs.copyFileSync(path.join(proj, 'fork-sid.jsonl'), path.join(other, 'else-sid.jsonl'));
+  const links = { 'else-sid': { chatId: '-1', threadId: 5, forkedFrom: 'desk-sid' } };
+  assert.equal(
+    c.findLinkedDescendant('desk-sid', path.join(proj, 'desk-sid.jsonl'), links),
+    null);
+});
+
+test('findLinkedDescendant: fork-of-fork chain resolves to the linked leaf', () => {
+  // The gateway moves the link to each new fork, so in a desk -> fork1 -> fork2 chain only
+  // fork2 is linked; fork1 sits unlinked in superseded state and must not be considered.
+  const { proj } = mkFixture();
+  fs.copyFileSync(path.join(proj, 'fork-sid.jsonl'), path.join(proj, 'fork1-sid.jsonl'));
+  const fork2 = DESK_LINES.concat(FORK_NEW, [
+    { uuid: 'u8', type: 'user', message: { role: 'user', content: 'second phone reply' } },
+  ]);
+  fs.writeFileSync(path.join(proj, 'fork2-sid.jsonl'), fork2.map(J).join(''));
+  const links = { 'fork2-sid': { chatId: '-1', threadId: 5, forkedFrom: 'fork1-sid' } };
+  assert.equal(
+    c.findLinkedDescendant('desk-sid', path.join(proj, 'desk-sid.jsonl'), links),
+    'fork2-sid', 'uuid fallback finds the leaf even though forkedFrom names the middle fork');
+});
+
+test('findLinkedDescendant: never returns the desk session itself', () => {
+  const { proj } = mkFixture();
+  const links = { 'desk-sid': { chatId: '-1', threadId: 5, forkedFrom: 'desk-sid' } };
+  assert.equal(
+    c.findLinkedDescendant('desk-sid', path.join(proj, 'desk-sid.jsonl'), links),
+    null);
+});

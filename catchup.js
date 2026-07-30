@@ -42,6 +42,28 @@ function findTranscript(sid, projectsDir = PROJECTS_DIR) {
   return null;
 }
 
+// The linked descendant leaf. Fork-of-fork chains resolve automatically because the gateway
+// moves the link (and forkedFrom) to each new fork, so there is exactly one LINKED descendant.
+// forkedFrom is recorded at fork time going forward; the uuid-overlap test covers links written
+// before that field existed. Same-project-dir only: a fork shares its parent's cwd.
+function findLinkedDescendant(deskSid, deskFile, links) {
+  const dir = path.dirname(deskFile);
+  const candidates = Object.keys(links || {}).filter((sid) =>
+    sid !== deskSid && fs.existsSync(path.join(dir, sid + '.jsonl')));
+  const byField = candidates.find((sid) => links[sid].forkedFrom === deskSid);
+  if (byField) return byField;
+  const deskUuids = uuidSet(readTranscriptLines(deskFile));
+  for (const sid of candidates) {
+    let overlap = false, extra = false;
+    for (const o of readTranscriptLines(path.join(dir, sid + '.jsonl'))) {
+      if (!o || !o.uuid) continue;
+      if (deskUuids.has(o.uuid)) overlap = true; else extra = true;
+      if (overlap && extra) return sid;
+    }
+  }
+  return null;
+}
+
 // One transcript record to digest lines. User prompts stay VERBATIM (the whole point of the
 // digest); the mirror's renderTranscriptLine collapses whitespace for one-line Telegram posts,
 // which is why this is its own renderer rather than a reuse. Classification matches the mirror:
@@ -83,5 +105,5 @@ function buildDigest(forkLines, deskUuids) {
 
 module.exports = {
   STATE_DIR, PROJECTS_DIR, readJson,
-  readTranscriptLines, uuidSet, findTranscript, renderDigestEntry, buildDigest,
+  readTranscriptLines, uuidSet, findTranscript, findLinkedDescendant, renderDigestEntry, buildDigest,
 };
