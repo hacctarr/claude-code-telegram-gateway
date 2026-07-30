@@ -1892,6 +1892,49 @@ async function handleActionCallback(act, cb) {
 }
 
 // ---------------------------------------------------------------------------
+// Desk catch-up: consume /catchup request markers written by catchup.js.
+// ---------------------------------------------------------------------------
+const CATCHUP_FILE = path.join(STATE_DIR, 'catchup.json');
+// Stale requests come from a killed session: the digest never reached a live context, so
+// rebinding on it would follow a ghost. Dropped on read rather than on write, since the
+// writer may be long gone.
+const CATCHUP_STALE_MS = 10 * 60_000;
+
+function readCatchupRequests(file = CATCHUP_FILE, now = Date.now(), staleMs = CATCHUP_STALE_MS) {
+  let m;
+  try { m = JSON.parse(fs.readFileSync(file, 'utf8')); } catch (e) { return { fresh: {}, all: [] }; }
+  if (!m || typeof m !== 'object') return { fresh: {}, all: [] };
+  const fresh = {};
+  for (const [sid, e] of Object.entries(m)) {
+    if (e && typeof e === 'object' && typeof e.forkId === 'string'
+        && Number.isFinite(e.ts) && now - e.ts <= staleMs) fresh[sid] = e;
+  }
+  return { fresh, all: Object.keys(m) };
+}
+
+// Re-reads before rewriting so a marker written between our read and this cleanup survives.
+function removeCatchupEntries(file, sids) {
+  let m;
+  try { m = JSON.parse(fs.readFileSync(file, 'utf8')); } catch (e) { return; }
+  for (const sid of sids) delete m[sid];
+  try {
+    if (Object.keys(m).length) fs.writeFileSync(file, JSON.stringify(m, null, 2));
+    else fs.unlinkSync(file);
+  } catch (e) { /* next tick retries */ }
+}
+
+function hasPendingCatchup(sid, file = CATCHUP_FILE, now = Date.now()) {
+  return readCatchupRequests(file, now).fresh[sid] !== undefined;
+}
+
+// A fork that grew past the size the digest was cut at means a phone turn landed after the
+// catch-up: the digest already ingested is still valid, but the desk is missing the remainder,
+// so the rebind is declined and a re-run picks up the rest.
+function catchupDecision(entry, forkSizeNow) {
+  return forkSizeNow > entry.forkSize ? 'decline' : 'rebind';
+}
+
+// ---------------------------------------------------------------------------
 // Poll loop: discover new sessions, mirror activity, prune, flush queues.
 // ---------------------------------------------------------------------------
 // Graceful self-restart: `touch restart.flag` (from anywhere — including a phone-driven turn) and
@@ -2590,6 +2633,8 @@ module.exports = {
   sha256, appearanceHash, buildCommandList, resolveBotProfile, resolveChatAppearance, chatPhotoPath,
   configureGroup,
   restartReady,
+  readCatchupRequests, removeCatchupEntries, hasPendingCatchup, catchupDecision,
+  CATCHUP_FILE, CATCHUP_STALE_MS,
   repoOf, parseTurnUsage, recordTurnUsage,
   formatStats, humanizeMs,
   telemetry,   // exported so tests can assert that failures are actually counted, not just classifiable
