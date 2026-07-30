@@ -554,7 +554,10 @@ const SOCKET_TIMEOUT_MS = 15000;   // fail fast; a hung send must not stall the 
 const UPDATE_POLL_TIMEOUT_S = config.UPDATE_POLL_TIMEOUT_S || 25;
 function updateSocketTimeoutMs() { return UPDATE_POLL_TIMEOUT_S * 1000 + 10_000; }
 
-function telegramRequest(method, payload, timeoutMs = SOCKET_TIMEOUT_MS) {
+// payload defaults to {}: a bare call like getMe would otherwise hand JSON.stringify(undefined)
+// to Buffer.byteLength, which throws before the request is made and rejects into callers' silent
+// catches. Both getMe call sites (identity, appearance) hit exactly that.
+function telegramRequest(method, payload = {}, timeoutMs = SOCKET_TIMEOUT_MS) {
   return new Promise((resolve, reject) => {
     const data = JSON.stringify(payload);
     const options = {
