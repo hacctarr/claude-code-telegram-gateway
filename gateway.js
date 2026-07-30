@@ -151,6 +151,7 @@ const {
 } = config;
 
 const BOT_ID = (BOT_TOKEN || '').split(':')[0];   // bot's own user id (token prefix)
+let BOT_USERNAME = null;   // from getMe at boot; group menu taps arrive as "/cmd@username"
 const CLAUDE_BINARY = CLAUDE_PATH || 'claude';
 const PERM_MODE = PERMISSION_MODE || 'bypassPermissions';
 const EXTRA = Array.isArray(EXTRA_ARGS) ? EXTRA_ARGS : [];
@@ -1018,6 +1019,18 @@ function resolveToolActivity(prefs, chatId, threadId, fallback) {
   const chat = chats[String(chatId)];
   if (typeof chat === 'boolean') return chat;
   return fallback;
+}
+
+// Tapping a command from the menu in a group sends "/exit@BotName", not "/exit". Strip the mention
+// when it is ours (Telegram usernames are case-insensitive) so dispatch sees the bare form; return
+// null for another bot's command, which must never be injected into a session as prose. A null
+// botUsername (getMe not yet answered) claims the mention: mapped groups run a single bot, and
+// dropping our own command would be the worse failure.
+function stripBotMention(text, botUsername) {
+  const m = /^(\/[A-Za-z0-9_]+)@([A-Za-z0-9_]+)([\s\S]*)$/.exec(text || '');
+  if (!m) return text;
+  if (botUsername && m[2].toLowerCase() !== botUsername.toLowerCase()) return null;
+  return m[1] + m[3];
 }
 
 // "/tools" | "/tools on|off|default [all]" -> an intent, or null when this isn't the command.
@@ -2119,7 +2132,7 @@ async function pollUpdates() {
         const senderId = message.from ? message.from.id.toString() : null;
         const chatId = message.chat.id.toString();
         const threadId = message.message_thread_id;
-        const text = message.text;
+        const rawText = message.text;
 
         if (senderId === BOT_ID) continue;   // ignore our own posts / forum service messages
         if (!ALLOWED_USER_IDS.includes(senderId)) { console.warn(`[Blocked] user ${senderId}`); telemetry.count('gateway.access.blocked'); continue; }
@@ -2128,7 +2141,10 @@ async function pollUpdates() {
           telegramRequest('sendMessage', { chat_id: chatId, text: "⚠️ Please send commands inside a topic thread." }).catch(() => {});
           continue;
         }
-        if (!text) continue;
+        if (!rawText) continue;
+
+        const text = stripBotMention(rawText, BOT_USERNAME);
+        if (text === null) continue;   // another bot's command: its business, not a session prompt
 
         const key = `${chatId}_${threadId}`;
 
@@ -2474,6 +2490,18 @@ async function configureGroup() {
   saveAppearanceState(state);
 }
 
+// Learn our @username so "/cmd@username" menu taps dispatch as commands. Best-effort: on failure
+// BOT_USERNAME stays null and stripBotMention claims any command mention.
+async function resolveBotUsername() {
+  try {
+    const r = await telegramRequest('getMe');
+    if (r && r.ok && r.result && r.result.username) {
+      BOT_USERNAME = r.result.username;
+      console.log(`[Identity] commands accepted as /cmd and /cmd@${BOT_USERNAME}`);
+    }
+  } catch (e) { /* */ }
+}
+
 // ---------------------------------------------------------------------------
 // Boot
 // ---------------------------------------------------------------------------
@@ -2531,6 +2559,7 @@ if (require.main === module) {
   console.log(`Mirror: ${MIRROR ? 'on' : 'off'} · auto-topics: ${AUTO_CREATE_TOPICS ? 'on' : 'off'} · prune: ${PRUNE_MODE} after ${formatPruneWindow(PRUNE_AFTER_MS)}`);
   console.log(`Restored ${Object.keys(linkBySession).length} linked session(s). Poll ${POLL_MS}ms.`);
   console.log("Listening for Topic messages + mirroring desk sessions...");
+  resolveBotUsername();
   configureGroup().catch((e) => console.error('appearance:', e.message));
   pollUpdates();
   setInterval(pollTick, POLL_MS);
@@ -2553,7 +2582,7 @@ module.exports = {
   buildSpawnArgs, spawnSession, buildModuleApi,
   chunkText, parseActionCallback, buildSessionActionBar, buildSessionPickerKeyboard,
   postWithMarkup, sendChunked, classifySendFailure, resumeCursor, linkCursor, closeSessionTopic,
-  resolveToolActivity, parseToolsCommand, setToolPref, loadToolPrefs, persistToolPrefs,
+  resolveToolActivity, parseToolsCommand, setToolPref, loadToolPrefs, persistToolPrefs, stripBotMention,
   sha256, appearanceHash, buildCommandList, resolveBotProfile, resolveChatAppearance, chatPhotoPath,
   configureGroup,
   restartReady,
