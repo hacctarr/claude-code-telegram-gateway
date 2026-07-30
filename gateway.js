@@ -1380,6 +1380,7 @@ async function driveTurn(chatId, threadId, prompt, resolveSession) {
         supersededAt[sessionId] = sizeCurrent(sessionId); persistSuperseded();
         delete linkBySession[sessionId];
         await upsertLink(forkId, chatId, threadId, prompt);          // overwrites thread→session mapping
+        linkBySession[forkId].forkedFrom = sessionId;                // /catchup descendant fast path
         try { linkBySession[forkId].offset = sizeCurrent(forkId); } catch (e) { /* */ }
         persistLinks();
         if (queues.has(sessionId)) { queues.set(forkId, queues.get(sessionId)); queues.delete(sessionId); }  // queued replies follow the fork
