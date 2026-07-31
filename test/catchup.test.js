@@ -391,6 +391,54 @@ test('run: everything already shown by a declined run prints nothing pending', a
   assert.match(events[0].text, /^nothing pending/);
 });
 
+// The marker is a request to a daemon that may not be running. It ages out after 10 minutes
+// with nothing said to anyone, so a catch-up run against a stopped gateway looks identical to
+// one that worked: the digest is in context either way, but the topic never rebinds.
+test('run: warns when no gateway is running to consume the marker', async () => {
+  const { root, projectsDir } = mkFixture();
+  const stateDir = mkStateDir(root, {
+    superseded: { 'desk-sid': 100 },
+    links: { 'fork-sid': { chatId: '-1', threadId: 5, forkedFrom: 'desk-sid' } },
+  });
+  const events = [];
+  await c.run({
+    sid: 'desk-sid', stateDir, projectsDir, out: fakeOut(events), gatewayAlive: () => false,
+  });
+  const text = events.map((e) => e.text).join('');
+  assert.match(text, /not running|isn't running/i, 'says the rebind will not happen');
+  assert.ok(text.includes('📱 phone:'), 'the digest is still delivered, since the turns are the point');
+});
+
+test('run: says nothing about the daemon when one is running', async () => {
+  const { root, projectsDir } = mkFixture();
+  const stateDir = mkStateDir(root, {
+    superseded: { 'desk-sid': 100 },
+    links: { 'fork-sid': { chatId: '-1', threadId: 5, forkedFrom: 'desk-sid' } },
+  });
+  const events = [];
+  await c.run({
+    sid: 'desk-sid', stateDir, projectsDir, out: fakeOut(events), gatewayAlive: () => true,
+  });
+  const text = events.map((e) => e.text).join('');
+  assert.doesNotMatch(text, /not running/i, 'no warning in the normal case');
+});
+
+test('run: the daemon warning still leaves the marker as the terminal write', async () => {
+  const { root, projectsDir } = mkFixture();
+  const stateDir = mkStateDir(root, {
+    superseded: { 'desk-sid': 100 },
+    links: { 'fork-sid': { chatId: '-1', threadId: 5, forkedFrom: 'desk-sid' } },
+  });
+  const events = [];
+  await c.run({
+    sid: 'desk-sid', stateDir, projectsDir, out: fakeOut(events), gatewayAlive: () => false,
+    writeMarkerFn: (sid, entry, file) => { events.push({ ev: 'marker' }); c.writeMarker(sid, entry, file); },
+  });
+  const kinds = events.map((e) => e.ev);
+  assert.equal(kinds[kinds.length - 1], 'marker',
+    'the warning must not slip after the marker and break terminal-state discipline');
+});
+
 test('run: digest fully written before the marker exists, marker fields correct', async () => {
   const { root, projectsDir, proj } = mkFixture();
   const stateDir = mkStateDir(root, {
