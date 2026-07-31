@@ -75,8 +75,12 @@ rebind), and a thin `/catchup` slash command. Phase 2 adds `catchup-warn.js` as 
    terminal-state discipline: the rebind trigger only exists once the digest has fully left the
    process, so there is no state where the daemon rebinds a desk session that never ingested.
 7. Marker: `~/.claude-gateway/catchup.json` holding
-   `{ "<deskSid>": { forkId, forkSize, repoDir, ts } }`,
+   `{ "<deskSid>": { forkId, forkSize, repoDir, ts, shownUuids, declined? } }`,
    merge-written like `resume.json` so concurrent catchups in different repos don't clobber.
+   `forkSize` is the byte length of the content actually digested, taken from the single read
+   rather than a separate `stat`: a phone turn landing between a stat and the read would record a
+   size smaller than the digest covered, and the daemon would then decline a rebind that was in
+   fact complete. `shownUuids` is what a declined entry carries into the retry (see below).
 
 A phone session started fresh (`/new`) is not a descendant and is out of scope: catch-up targets
 branches forked from the invoking session.
@@ -86,8 +90,12 @@ branches forked from the invoking session.
 At the top of `pollTick`, before the file loop, consume `catchup.json` entries:
 
 - Guard: `sizeCurrent(forkId) > forkSize` means the phone landed another turn after the digest was
-  cut. Decline: drop the entry, post to the topic "📱 a phone turn landed after catch-up, run
-  /catchup again". The already-ingested digest remains valid; the re-run picks up the remainder.
+  cut. Decline: post to the topic "📱 a phone turn landed after catch-up, run /catchup again", and
+  mark the entry `declined` rather than dropping it. The already-ingested digest remains valid, and
+  the retained `shownUuids` are what makes "the re-run picks up the remainder" true: the desk
+  transcript records the first digest only as prose under a fresh uuid, so a re-run diffing on the
+  desk file alone would re-print every turn the user just read. A declined entry is not a pending
+  request: it neither re-triggers a rebind nor blocks the re-topic guard.
 - Rebind (mirror of the fork block in `driveTurn`, inverted):
   - `delete supersededAt[deskSid]`; `supersededAt[forkId] = sizeCurrent(forkId)`; persist.
   - `delete linkBySession[forkId]`; `upsertLink(deskSid, chatId, threadId, label)` reusing the
@@ -145,9 +153,13 @@ node:test, alongside the existing suite:
 - uuid-diff extraction: new-turn selection, meta/command exclusion, tool one-liner rendering.
 - Descendant resolution: direct fork, fork-of-fork chain, `forkedFrom` fast path, uuid fallback,
   no-descendant and not-superseded cases.
-- Marker semantics: merge-write, stale-entry drop, write ordering (digest before marker).
+- Marker semantics: merge-write, stale-entry drop, write ordering (digest before marker),
+  `forkSize` derived from the digested bytes under a fork that grows mid-read.
+- Decline recovery: a re-run after a decline shows only the remainder, and prints "nothing
+  pending" when the retained `shownUuids` already cover the fork.
 - Daemon consumption: atomic rebind state (superseded both directions, link fields carried,
-  offset jump, queue handoff, resume marker), decline-on-growth, skip-re-topic-with-pending-entry.
+  offset jump, queue handoff, resume marker), decline-on-growth, decline retains the entry,
+  a declined entry reads as not-pending, skip-re-topic-with-pending-entry.
 - Warn hook: silent fast path, turn count over the fork region, self-clear after rebind.
 
 Fixtures mirror real transcript shape: multiple project dirs, a desk file plus a fork carrying

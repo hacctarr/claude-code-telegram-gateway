@@ -54,6 +54,36 @@ test('catchupDecision: fork growth after the digest declines, unchanged rebinds'
   assert.equal(g.catchupDecision(entry({ forkSize: 500 }), 500), 'rebind');
 });
 
+test('markDeclined: retains the entry with what was shown, so the retry only fetches the rest', () => {
+  const file = mkMarker({ 'desk-1': entry({ shownUuids: ['u3', 'u4'] }), 'desk-2': entry() });
+  g.markDeclined(file, 'desk-1');
+  const m = JSON.parse(fs.readFileSync(file, 'utf8'));
+  assert.equal(m['desk-1'].declined, true);
+  assert.deepEqual(m['desk-1'].shownUuids, ['u3', 'u4'], 'the shown set survives for the re-run');
+  assert.deepEqual(m['desk-2'], entry(), 'other entries untouched');
+});
+
+test('readCatchupRequests: a fresh declined entry is kept on disk for the retry, a stale one is not', () => {
+  // The whole point of retaining a declined entry is that the user's NEXT /catchup run reads its
+  // shownUuids. A cleanup that treats it as handled deletes it before the retry ever happens.
+  const file = mkMarker({
+    'desk-1': entry({ declined: true, shownUuids: ['u3'] }),
+    'desk-2': entry({ declined: true, shownUuids: ['u9'], ts: NOW - g.CATCHUP_STALE_MS - 1 }),
+  });
+  const { fresh, all } = g.readCatchupRequests(file, NOW);
+  assert.deepEqual(Object.keys(fresh), [], 'neither is a pending rebind request');
+  assert.deepEqual(all.sort(), ['desk-2'],
+    'only the stale one is offered for cleanup; the fresh declined entry survives the tick');
+});
+
+test('markDeclined: a declined entry is not treated as a pending rebind request', () => {
+  // It stays on disk as a record of what was shown, but must not re-trigger a rebind or
+  // keep blocking the re-topic guard forever.
+  const file = mkMarker({ 'desk-1': entry({ declined: true, shownUuids: ['u3'] }) });
+  assert.deepEqual(Object.keys(g.readCatchupRequests(file, NOW).fresh), []);
+  assert.equal(g.hasPendingCatchup('desk-1', file, NOW), false);
+});
+
 // Full injected context for executeCatchupRebind, recording every persist and resume write.
 function mkCtx({ forkLinked = true, deskSize = 900, forkSize = 500, queued = null } = {}) {
   const calls = [];

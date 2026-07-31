@@ -1904,12 +1904,30 @@ function readCatchupRequests(file = CATCHUP_FILE, now = Date.now(), staleMs = CA
   let m;
   try { m = JSON.parse(fs.readFileSync(file, 'utf8')); } catch (e) { return { fresh: {}, all: [] }; }
   if (!m || typeof m !== 'object') return { fresh: {}, all: [] };
+  // `fresh` is the pending rebind requests; `all` is what the tick may clean up afterwards.
+  // A fresh declined entry is neither: it is the record of what a refused catch-up already
+  // showed, and it has to outlive this tick so the user's re-run can subtract it.
   const fresh = {};
+  const all = [];
   for (const [sid, e] of Object.entries(m)) {
-    if (e && typeof e === 'object' && typeof e.forkId === 'string'
-        && Number.isFinite(e.ts) && now - e.ts <= staleMs) fresh[sid] = e;
+    const live = e && typeof e === 'object' && typeof e.forkId === 'string'
+      && Number.isFinite(e.ts) && now - e.ts <= staleMs;
+    if (live && e.declined) continue;
+    all.push(sid);
+    if (live) fresh[sid] = e;
   }
-  return { fresh, all: Object.keys(m) };
+  return { fresh, all };
+}
+
+// A declined entry stays on disk as the record of what the desk already ingested, so the re-run
+// digests only the remainder. It is not a pending request: it must neither re-trigger a rebind
+// nor keep blocking the re-topic guard. The next run overwrites it; staleness drops it otherwise.
+function markDeclined(file, sid) {
+  let m;
+  try { m = JSON.parse(fs.readFileSync(file, 'utf8')); } catch (e) { return; }
+  if (!m || !m[sid]) return;
+  m[sid] = { ...m[sid], declined: true };
+  try { fs.writeFileSync(file, JSON.stringify(m, null, 2)); } catch (e) { /* next tick retries */ }
 }
 
 // Re-reads before rewriting so a marker written between our read and this cleanup survives.
@@ -1966,6 +1984,7 @@ async function consumeCatchupRequests(now = Date.now()) {
   try {
     const { fresh, all } = readCatchupRequests(CATCHUP_FILE, now);
     if (!all.length) return;
+    const declined = [];
     for (const [deskSid, entry] of Object.entries(fresh)) {
       const fl = linkBySession[entry.forkId];
       if (catchupDecision(entry, sizeCurrent(entry.forkId)) === 'decline') {
@@ -1973,6 +1992,7 @@ async function consumeCatchupRequests(now = Date.now()) {
           '📱 A phone turn landed after catch-up. Run /catchup again to pull the rest.');
         console.log(`[Catchup] declined ${deskSid.slice(0, 8)}: fork grew after the digest was cut`);
         telemetry.count('gateway.catchup', { outcome: 'declined' });
+        declined.push(deskSid);
         continue;
       }
       const r = executeCatchupRebind(deskSid, entry, {
@@ -1984,7 +2004,11 @@ async function consumeCatchupRequests(now = Date.now()) {
       console.log(`[Catchup] rebound ${deskSid.slice(0, 8)} from fork ${entry.forkId.slice(0, 8)}`);
       telemetry.count('gateway.catchup', { outcome: 'rebound' });
     }
-    removeCatchupEntries(CATCHUP_FILE, all);
+    // Mark before cleanup: a declined entry is retained so the re-run knows what the desk already
+    // ingested, and marking it first takes it out of this tick's cleanup set. Everything else,
+    // rebound or stale, goes.
+    for (const sid of declined) markDeclined(CATCHUP_FILE, sid);
+    removeCatchupEntries(CATCHUP_FILE, all.filter((sid) => !declined.includes(sid)));
   } catch (e) { console.error('[Catchup] consume error:', e.message); }
 }
 
@@ -2693,7 +2717,7 @@ module.exports = {
   sha256, appearanceHash, buildCommandList, resolveBotProfile, resolveChatAppearance, chatPhotoPath,
   configureGroup,
   restartReady,
-  readCatchupRequests, removeCatchupEntries, hasPendingCatchup, catchupDecision, executeCatchupRebind,
+  readCatchupRequests, removeCatchupEntries, markDeclined, hasPendingCatchup, catchupDecision, executeCatchupRebind,
   CATCHUP_FILE, CATCHUP_STALE_MS,
   repoOf, parseTurnUsage, recordTurnUsage,
   formatStats, humanizeMs,

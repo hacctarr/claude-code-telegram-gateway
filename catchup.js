@@ -17,13 +17,25 @@ function readJson(file, fallback) {
   try { return JSON.parse(fs.readFileSync(file, 'utf8')); } catch (e) { return fallback; }
 }
 
-function readTranscriptLines(file) {
+function parseTranscript(text) {
   const out = [];
-  for (const line of fs.readFileSync(file, 'utf8').split('\n')) {
+  for (const line of text.split('\n')) {
     if (!line.trim()) continue;
     try { out.push(JSON.parse(line)); } catch (e) { /* partial trailing line */ }
   }
   return out;
+}
+
+function readTranscriptLines(file) {
+  return parseTranscript(fs.readFileSync(file, 'utf8'));
+}
+
+// Size is derived from the bytes read, never stat'd separately: a phone turn landing between a
+// stat and the read would make the recorded size stale-small relative to the digest, and the
+// daemon would decline a rebind whose digest was in fact complete.
+function readTranscriptWithSize(file) {
+  const buf = fs.readFileSync(file);
+  return { lines: parseTranscript(buf.toString('utf8')), size: buf.length };
 }
 
 function uuidSet(lines) {
@@ -94,13 +106,20 @@ function renderDigestEntry(o) {
 // The new phone turns are exactly the fork entries whose uuid the desk file lacks
 // (--fork-session copies history with uuids preserved). Records without a uuid are
 // headers/summaries, never turns, so they are skipped rather than treated as new.
-function buildDigest(forkLines, deskUuids) {
+// `shown` carries the uuids a previous declined run already printed: the desk transcript records
+// that digest only as prose under a fresh uuid, so without this a retry re-prints everything.
+// Returns the rendered uuids alongside the text so the marker can record what was shown.
+function buildDigest(forkLines, deskUuids, shown = new Set()) {
   const parts = [];
+  const uuids = [];
   for (const o of forkLines) {
-    if (!o || !o.uuid || deskUuids.has(o.uuid)) continue;
-    parts.push(...renderDigestEntry(o));
+    if (!o || !o.uuid || deskUuids.has(o.uuid) || shown.has(o.uuid)) continue;
+    const rendered = renderDigestEntry(o);
+    if (!rendered.length) continue;
+    parts.push(...rendered);
+    uuids.push(o.uuid);
   }
-  return parts.join('\n\n');
+  return { text: parts.join('\n\n'), uuids };
 }
 
 // Merge-written like resume.json: concurrent catchups in different repos must not clobber.
@@ -144,17 +163,25 @@ async function run({
     await say('nothing pending: no phone branch is ahead of this session.\n');
     return 0;
   }
+  const markerFile = path.join(stateDir, 'catchup.json');
+  // A declined entry is the record of a run whose rebind was refused because a phone turn landed
+  // mid-catch-up. Its uuids are already in the desk context, so this run picks up only the rest.
+  const prior = readJson(markerFile, {})[sid];
+  const shown = new Set(prior && prior.declined && Array.isArray(prior.shownUuids) ? prior.shownUuids : []);
   const forkFile = path.join(path.dirname(deskFile), forkId + '.jsonl');
-  const forkSize = fs.statSync(forkFile).size;
+  const { lines: forkLines, size: forkSize } = readTranscriptWithSize(forkFile);
   const deskLines = readTranscriptLines(deskFile);
-  const digest = buildDigest(readTranscriptLines(forkFile), uuidSet(deskLines));
-  if (!digest) {
+  const digest = buildDigest(forkLines, uuidSet(deskLines), shown);
+  if (!digest.text) {
     await say('nothing pending: the phone branch has no new turns.\n');
     return 0;
   }
   const repoDir = (deskLines.find((o) => o && o.cwd) || {}).cwd || process.cwd();
-  await say(`--- phone branch ${forkId.slice(0, 8)} ---\n\n${digest}\n`);
-  writeMarkerFn(sid, { forkId, forkSize, repoDir, ts: now() }, path.join(stateDir, 'catchup.json'));
+  await say(`--- phone branch ${forkId.slice(0, 8)} ---\n\n${digest.text}\n`);
+  writeMarkerFn(sid, {
+    forkId, forkSize, repoDir, ts: now(),
+    shownUuids: [...shown, ...digest.uuids],
+  }, markerFile);
   return 0;
 }
 
@@ -164,6 +191,7 @@ if (require.main === module) {
 
 module.exports = {
   STATE_DIR, PROJECTS_DIR, readJson,
-  readTranscriptLines, uuidSet, findTranscript, findLinkedDescendant, renderDigestEntry, buildDigest,
+  parseTranscript, readTranscriptLines, readTranscriptWithSize,
+  uuidSet, findTranscript, findLinkedDescendant, renderDigestEntry, buildDigest,
   writeMarker, run,
 };

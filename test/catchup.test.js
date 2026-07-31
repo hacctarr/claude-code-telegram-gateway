@@ -73,9 +73,20 @@ test('buildDigest: only entries whose uuid the desk file lacks', () => {
   const { proj } = mkFixture();
   const deskUuids = c.uuidSet(c.readTranscriptLines(path.join(proj, 'desk-sid.jsonl')));
   const digest = c.buildDigest(c.readTranscriptLines(path.join(proj, 'fork-sid.jsonl')), deskUuids);
-  assert.equal(digest,
+  assert.equal(digest.text,
     '📱 phone: phone: check  the\ndeploy\n\n🔧 Bash: git status\n\nAll clean.');
-  assert.ok(!digest.includes('desk reply'), 'copied history must not appear');
+  assert.ok(!digest.text.includes('desk reply'), 'copied history must not appear');
+  assert.deepEqual(digest.uuids, ['u3', 'u4'], 'only entries that rendered are reported as shown');
+});
+
+test('buildDigest: uuids already shown by a declined run are subtracted', () => {
+  const { proj } = mkFixture();
+  const deskUuids = c.uuidSet(c.readTranscriptLines(path.join(proj, 'desk-sid.jsonl')));
+  const forkLines = c.readTranscriptLines(path.join(proj, 'fork-sid.jsonl'));
+  const digest = c.buildDigest(forkLines, deskUuids, new Set(['u3']));
+  assert.ok(!digest.text.includes('phone: check'), 'the shown turn is not repeated');
+  assert.ok(digest.text.includes('All clean.'), 'the unshown turn still lands');
+  assert.deepEqual(digest.uuids, ['u4']);
 });
 
 test('findLinkedDescendant: forkedFrom fast path wins without reading transcripts', () => {
@@ -188,6 +199,126 @@ test('run: no linked descendant prints nothing pending, no marker', async () => 
   assert.equal(code, 0);
   assert.match(events[0].text, /^nothing pending/);
   assert.ok(!fs.existsSync(path.join(stateDir, 'catchup.json')));
+});
+
+test('run: forkSize describes what was digested, not an earlier stat', async () => {
+  // A phone turn landing between the size stat and the content read would make forkSize
+  // stale-small relative to the digest, and the daemon would decline a rebind whose digest
+  // was already complete. Size must be derived from the bytes actually digested.
+  const { root, projectsDir, proj } = mkFixture();
+  const forkFile = path.join(proj, 'fork-sid.jsonl');
+  const stateDir = mkStateDir(root, {
+    superseded: { 'desk-sid': 100 },
+    links: { 'fork-sid': { chatId: '-1', threadId: 5, forkedFrom: 'desk-sid' } },
+  });
+  const lateTurn = J({ uuid: 'u9', type: 'user', message: { role: 'user', content: 'late phone turn' } });
+  const grewBy = Buffer.byteLength(lateTurn);
+  const realRead = fs.readFileSync;
+  let grew = false;
+  // Grow the fork exactly once, at the moment run() first reads it: the interleaving that a
+  // stat-then-read ordering cannot see.
+  fs.readFileSync = function (file, ...rest) {
+    const out = realRead.call(fs, file, ...rest);
+    if (!grew && file === forkFile) {
+      grew = true;
+      fs.appendFileSync(forkFile, lateTurn);
+    }
+    return out;
+  };
+  let code;
+  try {
+    code = await c.run({ sid: 'desk-sid', stateDir, projectsDir, out: fakeOut([]) });
+  } finally { fs.readFileSync = realRead; }
+  assert.equal(code, 0);
+  const m = JSON.parse(fs.readFileSync(path.join(stateDir, 'catchup.json'), 'utf8'));
+  // The digest covers the pre-append bytes only, and forkSize says exactly that: the late turn
+  // is genuinely outside the digest, so the daemon declines on it for a real reason rather than
+  // on a stale stat. u9 must not have been rendered.
+  assert.ok(!m['desk-sid'].shownUuids.includes('u9'), 'the late turn is not in the digest');
+  assert.equal(m['desk-sid'].forkSize, fs.statSync(forkFile).size - grewBy,
+    'recorded size is the digested byte count, not a pre-read stat');
+  assert.ok(m['desk-sid'].forkSize < fs.statSync(forkFile).size,
+    'so the daemon still declines, correctly, on the genuinely-missing turn');
+});
+
+test('run: a re-run after a decline shows only the remainder, not the whole digest again', async () => {
+  // The declined marker records what was already shown; the retry subtracts it. Without this
+  // the user re-reads every turn they just read.
+  const { root, projectsDir, proj } = mkFixture();
+  const forkFile = path.join(proj, 'fork-sid.jsonl');
+  const stateDir = mkStateDir(root, {
+    superseded: { 'desk-sid': 100 },
+    links: { 'fork-sid': { chatId: '-1', threadId: 5, forkedFrom: 'desk-sid' } },
+  });
+  const first = [];
+  await c.run({ sid: 'desk-sid', stateDir, projectsDir, out: fakeOut(first) });
+  const firstText = first.map((e) => e.text).join('');
+  assert.ok(firstText.includes('phone: check'), 'first run shows the original turns');
+
+  // A phone turn lands mid-catch-up; the daemon declines and retains the entry with the
+  // uuids already shown (what consumeCatchupRequests does on the decline path).
+  fs.appendFileSync(forkFile,
+    J({ uuid: 'u9', type: 'user', message: { role: 'user', content: 'late phone turn' } }));
+  const marker = path.join(stateDir, 'catchup.json');
+  const m = JSON.parse(fs.readFileSync(marker, 'utf8'));
+  m['desk-sid'] = { ...m['desk-sid'], declined: true, shownUuids: ['u3', 'u4'] };
+  fs.writeFileSync(marker, JSON.stringify(m));
+
+  const second = [];
+  await c.run({ sid: 'desk-sid', stateDir, projectsDir, out: fakeOut(second) });
+  const secondText = second.map((e) => e.text).join('');
+  assert.ok(secondText.includes('late phone turn'), 're-run shows the new turn');
+  assert.ok(!secondText.includes('phone: check'), 'already-shown turns are not repeated');
+  assert.ok(!secondText.includes('All clean.'), 'already-shown assistant text is not repeated');
+});
+
+test('run: marker records the digested uuids so a later decline can subtract them', async () => {
+  const { root, projectsDir } = mkFixture();
+  const stateDir = mkStateDir(root, {
+    superseded: { 'desk-sid': 100 },
+    links: { 'fork-sid': { chatId: '-1', threadId: 5, forkedFrom: 'desk-sid' } },
+  });
+  await c.run({ sid: 'desk-sid', stateDir, projectsDir, out: fakeOut([]) });
+  const m = JSON.parse(fs.readFileSync(path.join(stateDir, 'catchup.json'), 'utf8'));
+  assert.deepEqual(m['desk-sid'].shownUuids.sort(), ['u3', 'u4'],
+    'only uuids that rendered into the digest are recorded');
+});
+
+test('run: the retry clears the declined flag, so the daemon sees a live request again', async () => {
+  const { root, projectsDir, proj } = mkFixture();
+  const stateDir = mkStateDir(root, {
+    superseded: { 'desk-sid': 100 },
+    links: { 'fork-sid': { chatId: '-1', threadId: 5, forkedFrom: 'desk-sid' } },
+  });
+  const marker = path.join(stateDir, 'catchup.json');
+  fs.writeFileSync(marker, JSON.stringify({
+    'desk-sid': { forkId: 'fork-sid', forkSize: 1, repoDir: '/r', ts: 1,
+                  declined: true, shownUuids: ['u3', 'u4'] },
+  }));
+  fs.appendFileSync(path.join(proj, 'fork-sid.jsonl'),
+    J({ uuid: 'u9', type: 'user', message: { role: 'user', content: 'late phone turn' } }));
+  await c.run({ sid: 'desk-sid', stateDir, projectsDir, out: fakeOut([]) });
+  const m = JSON.parse(fs.readFileSync(marker, 'utf8'));
+  assert.equal(m['desk-sid'].declined, undefined, 'a fresh request is not still marked declined');
+  assert.deepEqual(m['desk-sid'].shownUuids.sort(), ['u3', 'u4', 'u9'],
+    'the shown set accumulates across the decline so a second decline still subtracts correctly');
+});
+
+test('run: everything already shown by a declined run prints nothing pending', async () => {
+  const { root, projectsDir } = mkFixture();
+  const stateDir = mkStateDir(root, {
+    superseded: { 'desk-sid': 100 },
+    links: { 'fork-sid': { chatId: '-1', threadId: 5, forkedFrom: 'desk-sid' } },
+  });
+  const marker = path.join(stateDir, 'catchup.json');
+  fs.writeFileSync(marker, JSON.stringify({
+    'desk-sid': { forkId: 'fork-sid', forkSize: 10, repoDir: '/r', ts: 1,
+                  declined: true, shownUuids: ['u3', 'u4'] },
+  }));
+  const events = [];
+  const code = await c.run({ sid: 'desk-sid', stateDir, projectsDir, out: fakeOut(events) });
+  assert.equal(code, 0);
+  assert.match(events[0].text, /^nothing pending/);
 });
 
 test('run: digest fully written before the marker exists, marker fields correct', async () => {
