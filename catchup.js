@@ -38,6 +38,31 @@ function readTranscriptWithSize(file) {
   return { lines: parseTranscript(buf.toString('utf8')), size: buf.length };
 }
 
+// Feed a transcript's records to `onRecord` in chunks, stopping as soon as it returns false.
+// Transcripts here reach hundreds of MB, so a scan that only needs uuids must never materialize
+// the file: reading one 276 MB candidate whole cost more than the rest of the lookup combined.
+function scanTranscript(file, onRecord, chunkBytes = 1 << 20) {
+  let fd;
+  try { fd = fs.openSync(file, 'r'); } catch (e) { return; }
+  const buf = Buffer.alloc(chunkBytes);
+  let rest = '';
+  try {
+    for (;;) {
+      const n = fs.readSync(fd, buf, 0, chunkBytes, null);
+      if (!n) break;
+      const text = rest + buf.toString('utf8', 0, n);
+      const lines = text.split('\n');
+      rest = lines.pop();                      // trailing partial line carries to the next chunk
+      for (const line of lines) {
+        if (!line.trim()) continue;
+        let o; try { o = JSON.parse(line); } catch (e) { continue; }
+        if (onRecord(o) === false) return;
+      }
+    }
+    if (rest.trim()) { try { onRecord(JSON.parse(rest)); } catch (e) { /* partial trailing line */ } }
+  } finally { fs.closeSync(fd); }
+}
+
 function uuidSet(lines) {
   const s = new Set();
   for (const o of lines) if (o && o.uuid) s.add(o.uuid);
@@ -66,12 +91,22 @@ function findLinkedDescendant(deskSid, deskFile, links) {
   if (byField) return byField;
   const deskUuids = uuidSet(readTranscriptLines(deskFile));
   for (const sid of candidates) {
-    let overlap = false, extra = false;
-    for (const o of readTranscriptLines(path.join(dir, sid + '.jsonl'))) {
-      if (!o || !o.uuid) continue;
-      if (deskUuids.has(o.uuid)) overlap = true; else extra = true;
-      if (overlap && extra) return sid;
-    }
+    // --fork-session copies history from the start, so a descendant's FIRST uuid-bearing record
+    // is one the desk has. A candidate failing that cannot be a descendant, and stopping there
+    // is what keeps the scan cheap: on this corpus all 146 candidates are rejected on that
+    // record, one of them a 276 MB file that otherwise costs 2 s to read only to prove a
+    // negative. Leading records without a uuid are headers/summaries and are skipped, not
+    // treated as the head: that distinction is the whole difference, since every transcript
+    // here opens with one.
+    let overlap = false, extra = false, decided = false;
+    scanTranscript(path.join(dir, sid + '.jsonl'), (o) => {
+      if (!o || !o.uuid) return true;
+      const known = deskUuids.has(o.uuid);
+      if (!decided) { decided = true; if (!known) return false; }
+      if (known) overlap = true; else extra = true;
+      return !(overlap && extra);
+    });
+    if (overlap && extra) return sid;
   }
   return null;
 }
@@ -191,7 +226,7 @@ if (require.main === module) {
 
 module.exports = {
   STATE_DIR, PROJECTS_DIR, readJson,
-  parseTranscript, readTranscriptLines, readTranscriptWithSize,
+  parseTranscript, readTranscriptLines, readTranscriptWithSize, scanTranscript,
   uuidSet, findTranscript, findLinkedDescendant, renderDigestEntry, buildDigest,
   writeMarker, run,
 };

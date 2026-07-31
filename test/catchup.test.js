@@ -148,6 +148,76 @@ test('findLinkedDescendant: never returns the desk session itself', () => {
     null);
 });
 
+test('findLinkedDescendant: candidate transcripts are never slurped whole into memory', () => {
+  // The real machine keeps 226 transcripts totalling 774 MB in one project dir; one lookup was
+  // fully reading 644 MB of them, 276 MB in a single file, for 3-4 s inside a Bash tool call.
+  // Only uuids matter here, so candidates stream and stop early. Rejecting on the first line is
+  // NOT sufficient: on real data 143 of 146 candidates share the desk's opening uuid.
+  const { proj } = mkFixture();
+  const bulk = [];
+  for (let i = 0; i < 4000; i++) {
+    bulk.push({ uuid: `x${i}`, type: 'user', message: { role: 'user', content: 'unrelated '.repeat(40) } });
+  }
+  // Opens with a uuid-less summary record, exactly as the real transcripts do. A probe that
+  // reads the first LINE sees no uuid, cannot decide, and falls through to the full read: that
+  // is the bug this fixture exists to catch. The first uuid-BEARING record is what decides.
+  const sibling = [{ type: 'summary', summary: 'prior session' }, DESK_LINES[0]].concat(bulk);
+  fs.writeFileSync(path.join(proj, 'big-sid.jsonl'), sibling.map(J).join(''));
+  const bytes = fs.statSync(path.join(proj, 'big-sid.jsonl')).size;
+  assert.ok(bytes > 1e6, 'fixture is big enough for the read cost to be measurable');
+
+  let slurped = 0;
+  const realRead = fs.readFileSync;
+  fs.readFileSync = function (file, ...rest) {
+    const out = realRead.call(fs, file, ...rest);
+    if (String(file).endsWith('big-sid.jsonl')) slurped += out.length;
+    return out;
+  };
+  try {
+    const links = { 'big-sid': { chatId: '-1', threadId: 5 } };
+    // It DOES have overlap and extra, so it resolves as the descendant; the point is the cost.
+    c.findLinkedDescendant('desk-sid', path.join(proj, 'desk-sid.jsonl'), links);
+  } finally { fs.readFileSync = realRead; }
+  assert.ok(slurped < bytes / 2,
+    `candidate must not be slurped whole: read ${slurped} of ${bytes} bytes`);
+});
+
+test('findLinkedDescendant: a descendant behind uuid-less header records still resolves', () => {
+  // Every real transcript opens with a summary record carrying no uuid. Those must be skipped
+  // rather than counted as the deciding record, or the cheap rejection would drop real forks.
+  const { proj } = mkFixture();
+  const withHeaders = [
+    { type: 'summary', summary: 'prior session' },
+    { type: 'file-history-snapshot', messageId: 'x' },
+  ].concat(DESK_LINES, FORK_NEW);
+  fs.writeFileSync(path.join(proj, 'hdr-sid.jsonl'), withHeaders.map(J).join(''));
+  assert.equal(
+    c.findLinkedDescendant('desk-sid', path.join(proj, 'desk-sid.jsonl'),
+      { 'hdr-sid': { chatId: '-1', threadId: 5 } }),
+    'hdr-sid');
+});
+
+test('findLinkedDescendant: still resolves and rejects correctly while streaming', () => {
+  // The cost fix must not change any answer: re-assert the semantics against a streamed read.
+  const { proj } = mkFixture();
+  assert.equal(
+    c.findLinkedDescendant('desk-sid', path.join(proj, 'desk-sid.jsonl'),
+      { 'fork-sid': { chatId: '-1', threadId: 5 } }),
+    'fork-sid', 'overlap plus extra is still a descendant');
+  fs.writeFileSync(path.join(proj, 'nomatch-sid.jsonl'),
+    J({ uuid: 'z1', type: 'user', message: { role: 'user', content: 'unrelated' } }));
+  assert.equal(
+    c.findLinkedDescendant('desk-sid', path.join(proj, 'desk-sid.jsonl'),
+      { 'nomatch-sid': { chatId: '-1', threadId: 9 } }),
+    null, 'no shared history is still not a descendant');
+  // A pure prefix of the desk (overlap, no extra) is a copy, not a descendant.
+  fs.writeFileSync(path.join(proj, 'prefix-sid.jsonl'), J(DESK_LINES[0]));
+  assert.equal(
+    c.findLinkedDescendant('desk-sid', path.join(proj, 'desk-sid.jsonl'),
+      { 'prefix-sid': { chatId: '-1', threadId: 9 } }),
+    null, 'overlap without extra is not a descendant');
+});
+
 test('writeMarker: merge-writes so concurrent catchups in other repos survive', () => {
   const { root } = mkFixture();
   const file = path.join(root, 'catchup.json');
