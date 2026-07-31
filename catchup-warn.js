@@ -8,22 +8,46 @@ const fs = require('fs');
 const path = require('path');
 const { STATE_DIR, findTranscript, readJson } = require('./catchup.js');
 
-// Count real phone turns in the fork region past the desk's fork-point size. The copied
-// history is byte-similar, not byte-identical, so the offset is approximate; good enough for
-// a warning, and cheap enough for a per-prompt hook (never re-reads the whole transcript).
+// Count real phone turns in the fork region past the desk's fork-point size. The offset is
+// derived from the DESK file's size but indexes the FORK file, and copied history is
+// byte-similar rather than byte-identical, so it lands mid-record routinely. Reading straight
+// from it truncates that record, JSON.parse rejects the fragment, and a real phone turn
+// disappears from the count without any error. Rewind to the preceding newline so the record
+// containing the offset is read whole. The rewind never crosses more than one record, so it
+// cannot re-count history the desk already ingested.
 function countPhoneTurns(forkFile, fromOffset) {
   let text;
+  let skipFirst = false;
   try {
     const size = fs.statSync(forkFile).size;
     if (size <= fromOffset) return 0;
-    const buf = Buffer.alloc(size - fromOffset);
     const fd = fs.openSync(forkFile, 'r');
-    try { fs.readSync(fd, buf, 0, buf.length, fromOffset); } finally { fs.closeSync(fd); }
-    text = buf.toString('utf8');
+    let start = fromOffset;
+    try {
+      // Rewind to the start of the record containing the offset, so it is read whole rather
+      // than as an unparseable fragment. Bounded by one record length, so still cheap enough
+      // for a per-prompt hook.
+      const probe = Buffer.alloc(1);
+      while (start > 0) {
+        fs.readSync(fd, probe, 0, 1, start - 1);
+        if (probe[0] === 0x0a) break;
+        start--;
+      }
+      const buf = Buffer.alloc(size - start);
+      fs.readSync(fd, buf, 0, buf.length, start);
+      text = buf.toString('utf8');
+      // The rewound record is desk history when it ends at or before the fork point; it is a
+      // genuine phone turn only when it extends past it. Byte position alone cannot tell these
+      // apart, since both sit "before" the offset.
+      skipFirst = start < fromOffset
+        && start + Buffer.byteLength(text.split('\n')[0], 'utf8') < fromOffset;
+    } finally { fs.closeSync(fd); }
   } catch (e) { return 0; }
   let n = 0;
+  let first = true;
   for (const line of text.split('\n')) {
     if (!line.trim()) continue;
+    if (first) { first = false; if (skipFirst) continue; }
     let o; try { o = JSON.parse(line); } catch (e) { continue; }
     if (o.type !== 'user' || o.isMeta || !o.message) continue;
     const c = o.message.content;

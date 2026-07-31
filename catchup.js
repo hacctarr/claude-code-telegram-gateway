@@ -8,6 +8,7 @@
 const fs = require('fs');
 const path = require('path');
 const os = require('os');
+const { execFileSync } = require('child_process');
 const { summarizeToolInput } = require('./gateway.js');
 
 const STATE_DIR = process.env.CLAUDE_GATEWAY_DIR || path.join(os.homedir(), '.claude-gateway');
@@ -169,6 +170,16 @@ function writeMarker(deskSid, entry, file) {
 // The rebind trigger must not exist until the digest has fully left the process, so a crash at
 // any point before the marker leaves gateway state unchanged and a re-run starts over cleanly.
 // (The desk jsonl only grows after the Bash tool returns, which is after both.)
+// Same probe doctor.sh uses. Failing open (assuming a daemon is up) is the safe direction: a
+// spurious warning on a healthy setup is worse than staying quiet, and the marker is written
+// either way, so a missed warning costs nothing the user cannot see by re-running.
+function isGatewayRunning() {
+  try {
+    return execFileSync('pgrep', ['-f', 'gateway\\.js'], { stdio: ['ignore', 'pipe', 'ignore'] })
+      .toString().trim().length > 0;
+  } catch (e) { return true; }
+}
+
 async function run({
   sid,
   stateDir = STATE_DIR,
@@ -176,6 +187,7 @@ async function run({
   out = process.stdout,
   now = Date.now,
   writeMarkerFn = writeMarker,
+  gatewayAlive = isGatewayRunning,
 } = {}) {
   const say = (t) => new Promise((res) => out.write(t, res));
   if (!sid) {
@@ -213,6 +225,14 @@ async function run({
   }
   const repoDir = (deskLines.find((o) => o && o.cwd) || {}).cwd || process.cwd();
   await say(`--- phone branch ${forkId.slice(0, 8)} ---\n\n${digest.text}\n`);
+  // The marker is a request to the daemon, which alone can rebind the topic. With no daemon
+  // running it simply ages out after CATCHUP_STALE_MS with nothing said, and the run looks
+  // identical to one that worked: the digest lands in context either way, so the only visible
+  // difference is a topic that never comes back. Say so while the user can still act on it.
+  if (!gatewayAlive()) {
+    await say('\n⚠️  The gateway is not running, so this topic will not rebind to the desk. ' +
+      'The turns above are in context regardless. Start the gateway and re-run /catchup to rebind.\n');
+  }
   writeMarkerFn(sid, {
     forkId, forkSize, repoDir, ts: now(),
     shownUuids: [...shown, ...digest.uuids],

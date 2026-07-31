@@ -31,6 +31,32 @@ test('countPhoneTurns: real user turns past the offset only', () => {
   assert.equal(w.countPhoneTurns(file, 10_000_000), 0, 'offset past EOF is zero, not a throw');
 });
 
+// The offset comes from the DESK file's size but indexes the FORK file. Copied history is
+// byte-similar, not byte-identical, so it lands mid-record routinely. Every fixture above
+// aligns it to a newline, which is why the truncation below went unnoticed: a partial first
+// line fails JSON.parse and is skipped, so a real phone turn silently vanishes from the count.
+test('countPhoneTurns: an offset landing mid-record still counts that record', () => {
+  const { file, offset } = mkFork();
+  // Five bytes INTO the first phone turn, not before it.
+  const midRecord = offset + 5;
+  assert.equal(w.countPhoneTurns(file, midRecord), 2,
+    'rewinding to the previous line boundary keeps the truncated turn');
+});
+
+test('countPhoneTurns: a record ending at or before the fork point is desk history, not a phone turn', () => {
+  const { file, offset } = mkFork();
+  // The realistic drift: the fork file runs slightly LONGER than the desk copy, so the desk's
+  // size lands a few bytes inside the record that follows the history it already has. That
+  // record must still be counted once, never twice, and the history before it never at all.
+  assert.equal(w.countPhoneTurns(file, offset + 5), 2, 'straddling record counts once');
+  assert.equal(w.countPhoneTurns(file, offset), 2, 'boundary-aligned offset is unchanged');
+  // A record wholly before the offset is history the desk already has.
+  const pastFirstPhoneTurn = offset + Buffer.byteLength(
+    JSON.stringify({ uuid: 'u2', type: 'user', message: { role: 'user', content: 'phone turn one' } }) + '\n', 'utf8');
+  assert.equal(w.countPhoneTurns(file, pastFirstPhoneTurn), 1,
+    'the consumed phone turn drops out of the count');
+});
+
 test('warnLine: names the turn count and the command', () => {
   const { file, offset } = mkFork();
   const line = w.warnLine('desk-1',
