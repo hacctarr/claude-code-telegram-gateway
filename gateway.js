@@ -1303,14 +1303,57 @@ function openOnDesk(sessionId) {
 }
 
 // Is the transcript currently held open by ANOTHER process (the desk TUI / VS Code extension)?
-// Verified: a live TUI keeps its .jsonl open even when idle, so lsof detects it — letting us decide
-// fork-vs-resume BEFORE running, so the prompt (and its side effects) never runs twice.
 // CRITICAL: exclude our own pid — the gateway's own transient read streams (mirror/label scans)
 // otherwise register as "held" and caused spurious chained forks.
 function heldByOtherPids(lsofOutput, selfPid) {
   return lsofOutput.split('\n').map((s) => parseInt(s.trim(), 10)).filter(Boolean).filter((pid) => pid !== selfPid);
 }
-function isSessionHeld(file) {
+
+// Claude Code's own session registry: ~/.claude/sessions/<pid>.json per running session, carrying
+// sessionId, cwd, entrypoint and version. This is the liveness signal, replacing an lsof probe on
+// the transcript. Up to 2.1.x a live TUI kept its .jsonl open, so lsof detected it; 2.1.220 does
+// not, which silently disabled forking altogether: every phone reply resumed a live desk session
+// in place, the exact clobbering the fork exists to prevent. A registry the harness maintains
+// deliberately beats inferring liveness from file-handle behaviour it never promised to keep.
+const SESSIONS_DIR = path.join(os.homedir(), '.claude', 'sessions');
+
+function pidAlive(pid) {
+  try { process.kill(pid, 0); return true; } catch (e) { return e.code === 'EPERM'; }
+}
+
+// Direct children of this process. The daemon spawns `claude -p --resume <sid>` for the phone
+// turn and 2.1.220 registers THAT under the same session id, so without this every session would
+// look held and fork on every reply.
+function daemonChildPids(selfPid = process.pid) {
+  try {
+    return execFileSync('pgrep', ['-P', String(selfPid)], { stdio: ['ignore', 'pipe', 'ignore'] })
+      .toString().split('\n').map((s) => parseInt(s.trim(), 10)).filter(Boolean);
+  } catch (e) { return []; }      // pgrep exits non-zero when there are no children
+}
+
+function liveSessionHolders(sessionId, {
+  dir = SESSIONS_DIR, isAlive = pidAlive, selfPid = process.pid, childPids = daemonChildPids,
+} = {}) {
+  if (!sessionId) return [];
+  let files;
+  try { files = fs.readdirSync(dir); } catch (e) { return []; }
+  const mine = new Set([selfPid, ...childPids(selfPid)]);
+  const out = [];
+  for (const f of files) {
+    if (!f.endsWith('.json')) continue;
+    let j;
+    try { j = JSON.parse(fs.readFileSync(path.join(dir, f), 'utf8')); } catch (e) { continue; }
+    if (!j || j.sessionId !== sessionId || !Number.isFinite(j.pid)) continue;
+    if (mine.has(j.pid) || !isAlive(j.pid)) continue;
+    out.push(j.pid);
+  }
+  return out;
+}
+
+// Registry first, lsof as the fallback: an older Claude Code that keeps the transcript open but
+// writes no registry entry still forks correctly.
+function isSessionHeld(file, sessionId) {
+  if (sessionId && liveSessionHolders(sessionId).length > 0) return true;
   if (!file) return false;
   try {
     const out = execFileSync('lsof', ['-t', file], { stdio: ['ignore', 'pipe', 'ignore'] }).toString();
@@ -1332,7 +1375,7 @@ async function driveTurn(chatId, threadId, prompt, resolveSession) {
   //   held, no AUTO_FORK                  → resume; reply has full context but won't persist
   //   free existing session               → resume in place
   //   no session                          → fresh session with a pre-minted id
-  const held = !!(sessionId && isSessionHeld(sessionFileById(sessionId)));
+  const held = !!(sessionId && isSessionHeld(sessionFileById(sessionId), sessionId));
   const forkId = (AUTO_FORK && held) ? crypto.randomUUID() : null;
   const createId = sessionId ? null : crypto.randomUUID();
   const sizeBefore = sessionId ? sizeCurrent(sessionId) : 0;
@@ -2717,6 +2760,7 @@ module.exports = {
   sha256, appearanceHash, buildCommandList, resolveBotProfile, resolveChatAppearance, chatPhotoPath,
   configureGroup,
   restartReady,
+  liveSessionHolders, pidAlive, daemonChildPids, SESSIONS_DIR,
   readCatchupRequests, removeCatchupEntries, markDeclined, hasPendingCatchup, catchupDecision, executeCatchupRebind,
   CATCHUP_FILE, CATCHUP_STALE_MS,
   repoOf, parseTurnUsage, recordTurnUsage,
