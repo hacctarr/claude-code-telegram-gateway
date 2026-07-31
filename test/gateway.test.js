@@ -590,6 +590,76 @@ test('heldByOtherPids: filters the gateway\'s own pid out of lsof output', () =>
 });
 
 // ---------------------------------------------------------------------------
+// liveSessionHolders: the session registry, which replaced lsof as the liveness signal
+// ---------------------------------------------------------------------------
+// Claude Code 2.1.220 stopped keeping the transcript open, so lsof reported nothing and every
+// phone reply resumed a live desk session in place instead of forking. It does maintain
+// ~/.claude/sessions/<pid>.json per running session, which is a direct signal rather than an
+// inference from file handles. Fixtures mirror real files observed on this machine.
+const REG = (over = {}) => ({
+  pid: 61721, sessionId: 'desk-sid', cwd: '/Users/me/repo', version: '2.1.220',
+  kind: 'interactive', entrypoint: 'claude-vscode', name: 'documents-1d', ...over,
+});
+
+function mkRegistry(entries) {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'sessions-'));
+  for (const e of entries) fs.writeFileSync(path.join(dir, `${e.pid}.json`), JSON.stringify(e));
+  return dir;
+}
+
+test('liveSessionHolders: finds the live pid holding a session id', () => {
+  const dir = mkRegistry([REG()]);
+  assert.deepEqual(
+    g.liveSessionHolders('desk-sid', { dir, isAlive: () => true, selfPid: 999, childPids: () => [] }),
+    [61721]);
+});
+
+test('liveSessionHolders: a dead pid is not a holder, so its file cannot pin a stale fork', () => {
+  const dir = mkRegistry([REG()]);
+  assert.deepEqual(
+    g.liveSessionHolders('desk-sid', { dir, isAlive: () => false, selfPid: 999, childPids: () => [] }),
+    []);
+});
+
+test('liveSessionHolders: the daemon\'s own headless turn is not a holder', () => {
+  // The daemon spawns `claude -p --resume <sid>` for the phone turn, and 2.1.220 registers it
+  // too, under the SAME session id. Counting it would make every session look held and fork on
+  // every reply. It is a child of the daemon and carries entrypoint sdk-cli.
+  const dir = mkRegistry([REG({ pid: 73020, entrypoint: 'sdk-cli' })]);
+  assert.deepEqual(
+    g.liveSessionHolders('desk-sid', { dir, isAlive: () => true, selfPid: 53871, childPids: () => [73020] }),
+    [], 'a daemon child must never count as a desk holder');
+});
+
+test('liveSessionHolders: a real desk session alongside the daemon\'s own turn still counts', () => {
+  // The live case during a phone reply: both exist at once. The desk session must survive the
+  // filter, or the fork never fires.
+  const dir = mkRegistry([
+    REG({ pid: 61721, entrypoint: 'claude-vscode' }),
+    REG({ pid: 73020, entrypoint: 'sdk-cli' }),
+  ]);
+  assert.deepEqual(
+    g.liveSessionHolders('desk-sid', { dir, isAlive: () => true, selfPid: 53871, childPids: () => [73020] }),
+    [61721]);
+});
+
+test('liveSessionHolders: entries for other sessions are ignored', () => {
+  const dir = mkRegistry([REG({ pid: 59038, sessionId: 'other-sid' })]);
+  assert.deepEqual(
+    g.liveSessionHolders('desk-sid', { dir, isAlive: () => true, selfPid: 999, childPids: () => [] }),
+    []);
+});
+
+test('liveSessionHolders: a missing directory or unparseable entry is empty, never a throw', () => {
+  assert.deepEqual(g.liveSessionHolders('desk-sid',
+    { dir: '/nonexistent/sessions', isAlive: () => true, selfPid: 9, childPids: () => [] }), []);
+  const dir = mkRegistry([]);
+  fs.writeFileSync(path.join(dir, 'junk.json'), 'not json');
+  assert.deepEqual(g.liveSessionHolders('desk-sid',
+    { dir, isAlive: () => true, selfPid: 9, childPids: () => [] }), []);
+});
+
+// ---------------------------------------------------------------------------
 // Stall/approval notices — updatePendingTools + dueStallNotices
 // ---------------------------------------------------------------------------
 test('updatePendingTools: tracks tool_use, clears on tool_result', () => {
