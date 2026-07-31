@@ -112,3 +112,36 @@ done
 SESSIONS=$(find "$PROJ" -maxdepth 1 -name '*.jsonl' 2>/dev/null | wc -l | tr -d ' ')
 TITLERS=$(find "$PROJ" -maxdepth 1 -name '*.jsonl' -exec grep -l 'kebab-case slug titling this work session' {} + 2>/dev/null | wc -l | tr -d ' ')
 echo "orphaned titlers: $TITLERS  of $SESSIONS sessions in $PROJ"
+
+# Fork liveness. This is the check whose absence let forking die silently for weeks: the old
+# probe assumed a live session keeps its .jsonl open, Claude Code 2.1.220 stopped doing that,
+# lsof went quiet, and every phone reply resumed a live desk session in place instead of
+# forking, with no error anywhere. A capability that fails by doing nothing needs a check
+# that asserts it can still see something, so state the signal's health rather than its
+# absence. Detection lives in gateway.js (liveSessionHolders); this only reports on it.
+REG="$HOME/.claude/sessions"
+if [ ! -d "$REG" ]; then
+  echo "fork liveness:    NO REGISTRY at $REG (this Claude Code predates it; falling back to lsof)"
+else
+  live=0; stale=0
+  for f in "$REG"/*.json; do
+    [ -e "$f" ] || continue
+    pid=$(basename "$f" .json)
+    case "$pid" in (*[!0-9]*) continue ;; esac
+    if kill -0 "$pid" 2>/dev/null; then live=$((live+1)); else stale=$((stale+1)); fi
+  done
+  echo "fork liveness:    $live live session(s) in registry, $stale stale entr(ies)"
+  if [ "$live" = 0 ]; then
+    echo "      NOTE: no live sessions right now, so this says nothing about the signal's health."
+  fi
+  # The assumption that broke. If a live session DOES hold its transcript, the lsof fallback is
+  # still meaningful; if none does, the registry is the only thing keeping forking alive.
+  holds=0
+  for f in "$REG"/*.json; do
+    [ -e "$f" ] || continue
+    sid=$(python3 -c "import json,sys;print(json.load(open(sys.argv[1])).get('sessionId',''))" "$f" 2>/dev/null)
+    [ -n "$sid" ] && [ -f "$PROJ/$sid.jsonl" ] || continue
+    [ -n "$(lsof -t "$PROJ/$sid.jsonl" 2>/dev/null)" ] && holds=$((holds+1))
+  done
+  echo "      transcripts held open by any process: $holds  (0 = lsof fallback is dead here, only the registry keeps forking alive)"
+fi
