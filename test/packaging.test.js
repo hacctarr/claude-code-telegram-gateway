@@ -49,7 +49,7 @@ function resolveFrom(file, spec) {
 
 test('every runtime require of an entrypoint is inside the published tarball', () => {
   const packed = packedFiles();
-  const entrypoints = ['gateway.js', 'setup.js', 'resume-hook.js', 'bin/claude-tg.js'];
+  const entrypoints = ['gateway.js', 'setup.js', 'resume-hook.js', 'bin/claude-tg.js', 'catchup.js', 'catchup-warn.js'];
   const missing = [];
   for (const entry of entrypoints) {
     assert.ok(packed.has(entry), `entrypoint ${entry} is not in the tarball`);
@@ -59,6 +59,7 @@ test('every runtime require of an entrypoint is inside the published tarball', (
     }
   }
   assert.deepEqual(missing, [], `runtime files missing from package.json "files":\n${missing.join('\n')}`);
+  assert.ok(packed.has('commands/catchup.md'), 'commands/catchup.md is not in the tarball');
 });
 
 test('the test script only references paths the tarball carries', () => {

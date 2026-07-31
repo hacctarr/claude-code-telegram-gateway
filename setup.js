@@ -113,5 +113,11 @@ const expand = (p) => p.replace(/^~(?=\/|$)/, process.env.HOME);
   } else {
     console.log('\nStart it anytime:  npm start   (foreground)   ·   ./install-service.sh   (service)');
   }
+  if (yes(await ask('\nInstall the phone-branch warning hook? It adds a one-line notice in desk ' +
+      'sessions when phone turns are waiting (writes to ~/.claude/settings.json). [y/N] '))) {
+    const { installWarnHook } = require('./catchup-warn.js');
+    const f = installWarnHook(path.join(os.homedir(), '.claude', 'settings.json'), __dirname);
+    console.log(`   ✅ Hook registered in ${f} (UserPromptSubmit + SessionStart).`);
+  }
   rl.close();
 })().catch((e) => { console.error('setup error:', e.message); rl.close(); process.exit(1); });

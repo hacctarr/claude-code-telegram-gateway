@@ -1380,6 +1380,7 @@ async function driveTurn(chatId, threadId, prompt, resolveSession) {
         supersededAt[sessionId] = sizeCurrent(sessionId); persistSuperseded();
         delete linkBySession[sessionId];
         await upsertLink(forkId, chatId, threadId, prompt);          // overwrites thread→session mapping
+        linkBySession[forkId].forkedFrom = sessionId;                // /catchup descendant fast path
         try { linkBySession[forkId].offset = sizeCurrent(forkId); } catch (e) { /* */ }
         persistLinks();
         if (queues.has(sessionId)) { queues.set(forkId, queues.get(sessionId)); queues.delete(sessionId); }  // queued replies follow the fork
@@ -1891,6 +1892,127 @@ async function handleActionCallback(act, cb) {
 }
 
 // ---------------------------------------------------------------------------
+// Desk catch-up: consume /catchup request markers written by catchup.js.
+// ---------------------------------------------------------------------------
+const CATCHUP_FILE = path.join(STATE_DIR, 'catchup.json');
+// Stale requests come from a killed session: the digest never reached a live context, so
+// rebinding on it would follow a ghost. Dropped on read rather than on write, since the
+// writer may be long gone.
+const CATCHUP_STALE_MS = 10 * 60_000;
+
+function readCatchupRequests(file = CATCHUP_FILE, now = Date.now(), staleMs = CATCHUP_STALE_MS) {
+  let m;
+  try { m = JSON.parse(fs.readFileSync(file, 'utf8')); } catch (e) { return { fresh: {}, all: [] }; }
+  if (!m || typeof m !== 'object') return { fresh: {}, all: [] };
+  // `fresh` is the pending rebind requests; `all` is what the tick may clean up afterwards.
+  // A fresh declined entry is neither: it is the record of what a refused catch-up already
+  // showed, and it has to outlive this tick so the user's re-run can subtract it.
+  const fresh = {};
+  const all = [];
+  for (const [sid, e] of Object.entries(m)) {
+    const live = e && typeof e === 'object' && typeof e.forkId === 'string'
+      && Number.isFinite(e.ts) && now - e.ts <= staleMs;
+    if (live && e.declined) continue;
+    all.push(sid);
+    if (live) fresh[sid] = e;
+  }
+  return { fresh, all };
+}
+
+// A declined entry stays on disk as the record of what the desk already ingested, so the re-run
+// digests only the remainder. It is not a pending request: it must neither re-trigger a rebind
+// nor keep blocking the re-topic guard. The next run overwrites it; staleness drops it otherwise.
+function markDeclined(file, sid) {
+  let m;
+  try { m = JSON.parse(fs.readFileSync(file, 'utf8')); } catch (e) { return; }
+  if (!m || !m[sid]) return;
+  m[sid] = { ...m[sid], declined: true };
+  try { fs.writeFileSync(file, JSON.stringify(m, null, 2)); } catch (e) { /* next tick retries */ }
+}
+
+// Re-reads before rewriting so a marker written between our read and this cleanup survives.
+function removeCatchupEntries(file, sids) {
+  let m;
+  try { m = JSON.parse(fs.readFileSync(file, 'utf8')); } catch (e) { return; }
+  for (const sid of sids) delete m[sid];
+  try {
+    if (Object.keys(m).length) fs.writeFileSync(file, JSON.stringify(m, null, 2));
+    else fs.unlinkSync(file);
+  } catch (e) { /* next tick retries */ }
+}
+
+function hasPendingCatchup(sid, file = CATCHUP_FILE, now = Date.now()) {
+  return readCatchupRequests(file, now).fresh[sid] !== undefined;
+}
+
+// A fork that grew past the size the digest was cut at means a phone turn landed after the
+// catch-up: the digest already ingested is still valid, but the desk is missing the remainder,
+// so the rebind is declined and a re-run picks up the rest.
+function catchupDecision(entry, forkSizeNow) {
+  return forkSizeNow > entry.forkSize ? 'decline' : 'rebind';
+}
+
+// The atomic rebind, driveTurn's fork block inverted: desk becomes the live branch, the fork is
+// superseded at its final size (if anything ever writes to it again it re-topics on its own,
+// existing behavior, correct here too), the topic keeps its identity, queued replies and the
+// shell resume marker follow the desk. State collaborators are injected so the whole mutation
+// is unit-testable; consumeCatchupRequests binds the real ones.
+function executeCatchupRebind(deskSid, entry, ctx) {
+  const { forkId } = entry;
+  delete ctx.superseded[deskSid];
+  ctx.superseded[forkId] = ctx.sizeCurrent(forkId);
+  ctx.persistSuperseded();
+  const fl = ctx.links[forkId];
+  if (fl) {
+    delete ctx.links[forkId];
+    // forkedFrom names deskSid and must not ride along, or the desk link would resolve as its
+    // own descendant on the next catch-up. The mirror cursor indexes the old offset.
+    const { forkedFrom, mirrorCursor, ...carried } = fl;
+    ctx.links[deskSid] = { ...carried, closed: false, offset: ctx.sizeCurrent(deskSid) };
+    ctx.threadIndex.set(`${fl.chatId}_${fl.threadId}`, deskSid);
+    ctx.persistLinks();
+  }
+  if (ctx.queues.has(forkId)) { ctx.queues.set(deskSid, ctx.queues.get(forkId)); ctx.queues.delete(forkId); }
+  ctx.writeResumeMarker(entry.repoDir, deskSid);
+  return fl ? { rebound: true, chatId: fl.chatId, threadId: fl.threadId } : { rebound: false };
+}
+
+// Executed by the daemon because only the daemon can mutate links/superseded safely (it holds
+// both in memory and persists over external edits). Never throws into pollTick, same discipline
+// as renameTopicFromContent.
+async function consumeCatchupRequests(now = Date.now()) {
+  try {
+    const { fresh, all } = readCatchupRequests(CATCHUP_FILE, now);
+    if (!all.length) return;
+    const declined = [];
+    for (const [deskSid, entry] of Object.entries(fresh)) {
+      const fl = linkBySession[entry.forkId];
+      if (catchupDecision(entry, sizeCurrent(entry.forkId)) === 'decline') {
+        if (fl) await sendPlain(fl.chatId, fl.threadId,
+          '📱 A phone turn landed after catch-up. Run /catchup again to pull the rest.');
+        console.log(`[Catchup] declined ${deskSid.slice(0, 8)}: fork grew after the digest was cut`);
+        telemetry.count('gateway.catchup', { outcome: 'declined' });
+        declined.push(deskSid);
+        continue;
+      }
+      const r = executeCatchupRebind(deskSid, entry, {
+        links: linkBySession, superseded: supersededAt, queues, threadIndex: sessionByThread,
+        sizeCurrent, writeResumeMarker, persistLinks, persistSuperseded,
+      });
+      if (r.rebound) await sendPlain(r.chatId, r.threadId,
+        '🖥️ Desk caught up. This topic follows the desk session again.');
+      console.log(`[Catchup] rebound ${deskSid.slice(0, 8)} from fork ${entry.forkId.slice(0, 8)}`);
+      telemetry.count('gateway.catchup', { outcome: 'rebound' });
+    }
+    // Mark before cleanup: a declined entry is retained so the re-run knows what the desk already
+    // ingested, and marking it first takes it out of this tick's cleanup set. Everything else,
+    // rebound or stale, goes.
+    for (const sid of declined) markDeclined(CATCHUP_FILE, sid);
+    removeCatchupEntries(CATCHUP_FILE, all.filter((sid) => !declined.includes(sid)));
+  } catch (e) { console.error('[Catchup] consume error:', e.message); }
+}
+
+// ---------------------------------------------------------------------------
 // Poll loop: discover new sessions, mirror activity, prune, flush queues.
 // ---------------------------------------------------------------------------
 // Graceful self-restart: `touch restart.flag` (from anywhere — including a phone-driven turn) and
@@ -1939,6 +2061,7 @@ async function pollTick() {
   try {
     if (honorRestartIfReady()) return;
     const now = Date.now();
+    await consumeCatchupRequests(now);
     let topicsThisTick = 0;
     let prunesThisTick = 0;
     const files = allSessionFiles();
@@ -1956,7 +2079,12 @@ async function pollTick() {
       if (!link) {
         if (ignoredSessions.has(id)) continue;                       // /new-detached — permanent
         if (supersededAt[id] !== undefined) {                        // desk branch we forked away from
-          if (st.size > supersededAt[id]) { delete supersededAt[id]; persistSuperseded(); }  // desk kept working → re-topic
+          if (st.size > supersededAt[id]) {
+            // With a catch-up pending, this growth IS the digest ingest: consumption rebinds the
+            // EXISTING topic on the next tick, so re-topicing here would fork the topic identity.
+            if (hasPendingCatchup(id)) continue;
+            delete supersededAt[id]; persistSuperseded();            // desk kept working → re-topic
+          }
           else continue;                                             // still at the fork point → stay hidden
         }
         const grew = st.size > (sessionBaseline[id] || 0);           // grew past startup size (new files: baseline 0 → eligible)
@@ -2589,6 +2717,8 @@ module.exports = {
   sha256, appearanceHash, buildCommandList, resolveBotProfile, resolveChatAppearance, chatPhotoPath,
   configureGroup,
   restartReady,
+  readCatchupRequests, removeCatchupEntries, markDeclined, hasPendingCatchup, catchupDecision, executeCatchupRebind,
+  CATCHUP_FILE, CATCHUP_STALE_MS,
   repoOf, parseTurnUsage, recordTurnUsage,
   formatStats, humanizeMs,
   telemetry,   // exported so tests can assert that failures are actually counted, not just classifiable

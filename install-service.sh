@@ -77,6 +77,13 @@ HOOK
   echo "🔗 Added auto-resume hook to $RC (open a new terminal to use it)."
 fi
 
+# /catchup slash command: pulls phone-branch turns into an open desk session. The command file
+# needs the real install path baked in, since a global npm install and a checkout differ.
+CMD_DIR="$HOME/.claude/commands"
+mkdir -p "$CMD_DIR"
+sed "s|{{GATEWAY_DIR}}|$DIR|g" "$DIR/commands/catchup.md" > "$CMD_DIR/catchup.md"
+echo "🔗 Installed /catchup command to $CMD_DIR/catchup.md"
+
 echo "✅ Installed and started $LABEL."
 echo "   Logs:   tail -f \"$HOME/.claude-gateway/gateway.log\""
 echo "   Status: launchctl print gui/$(id -u)/$LABEL | grep -i state"

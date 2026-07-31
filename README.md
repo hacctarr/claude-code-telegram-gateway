@@ -181,6 +181,11 @@ From a source checkout: `git pull && npm test && touch ~/.claude-gateway/restart
     Mac via a `vscode://` deep link (configurable for Cursor/Windsurf via `DESK_URL_TEMPLATE`).
   - **Terminal:** just open one — an auto-resume hook (installed into `~/.zshrc`) drops you into that
     branch, multi-repo aware, then clears itself. `cr` remains as a manual resume.
+  - **Already-open session:** run `/catchup` inside it. It ingests the phone turns verbatim
+    (prompts, replies, one-line tool traces), the topic follows the desk session again, and the
+    phone branch is retired. If a phone turn lands mid-catch-up, the gateway asks you to run it
+    once more. Optional: `npm run setup` can install a hook that prints "📱 Phone branch is N
+    turns ahead" in a desk session that has fallen behind.
 
 ### Phone continuation — works whether or not the desk session is closed
 - **Desk session closed:** your phone reply continues the *same* session and is saved — seamless,
