@@ -189,3 +189,12 @@ test('buildModuleApi: injectTurn enqueues onto the gateway queue', () => {
   // injectTurn delegates to queueForSession; assert no throw and returns undefined.
   assert.doesNotThrow(() => api.injectTurn('sess-x', '/compact'));
 });
+
+// Without this accessor a module cannot tell that its injected turn will be forked away
+// from the session it was aimed at, which is how auto-compact spent 18 summarization
+// calls on branches while every desk it targeted stayed exactly as large as before.
+test('buildModuleApi: exposes isSessionHeld, and an unknown session is not held', () => {
+  const api = g.buildModuleApi();
+  assert.equal(typeof api.isSessionHeld, 'function');
+  assert.equal(api.isSessionHeld('00000000-0000-4000-8000-000000000000'), false);
+});

@@ -72,7 +72,23 @@ function factory(api) {
         if (!info) { delete store.data[sessionId]; changed = true; continue; }
         const tokens = api.getContextTokens(sessionId) || 0;
         const mtime = info.mtime || 0;
-        if (!decideCompaction(store.data[sessionId], cfg, now, mtime, tokens).fire) continue;
+        const state = store.data[sessionId];
+        if (!decideCompaction(state, cfg, now, mtime, tokens).fire) continue;
+        // A desk session holds its context in memory, so a /compact injected from here
+        // cannot shrink it: the gateway sees the session as held and forks, which hands
+        // the topic to a throwaway branch and leaves the desk the size it was. Skip, and
+        // do not consume the quiet period: an idle desk does not move mtime, so the same
+        // period is still here when it closes.
+        if (typeof api.isSessionHeld === 'function' && api.isSessionHeld(sessionId)) {
+          if (state.skippedAtMtime !== mtime) {
+            api.postToTopic(sessionId, `🗜️ Idle at ~${Math.round(tokens / 1000)}k tokens, but the ` +
+              `desk session is still open, so only the desk can compact it. Run /compact there, ` +
+              `or close it and this will handle it.`);
+            store.data[sessionId] = { ...state, skippedAtMtime: mtime };
+            changed = true;
+          }
+          continue;
+        }
         for (const p of prompts) api.injectTurn(sessionId, p);
         api.postToTopic(sessionId, `🗜️ Topic idle, compacting (~${Math.round(tokens / 1000)}k tokens).`);
         store.data[sessionId] = { firedAtMtime: mtime, firedAt: now };

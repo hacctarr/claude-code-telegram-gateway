@@ -87,6 +87,7 @@ function fakeApi(overrides = {}) {
       postToTopic: (sid, text) => calls.posted.push([sid, text]),
       getSessionInfo: overrides.getSessionInfo || (() => ({ cwd: '/repo', mtime: 0 })),
       getContextTokens: overrides.getContextTokens || (() => 0),
+      isSessionHeld: overrides.isSessionHeld || (() => false),
     },
   };
 }
@@ -169,6 +170,88 @@ test('module: config overrides the idle window and the floor', () => {
   assert.equal(calls.injected.length, 1);
 });
 
+// ---------------------------------------------------------------------------
+// An open desk session
+//
+// A desk TUI holds its context in memory. A /compact injected from outside cannot
+// shrink it: the gateway sees the session as held and forks, so the compaction lands
+// on a throwaway branch that also takes the topic with it, and the desk stays exactly
+// as large as it was. Twenty minutes later the same session is still idle and still
+// over the floor, so it happens again. Eighteen times in 35 hours on this machine
+// before the accessor existed to notice.
+// ---------------------------------------------------------------------------
+test('module: an idle over-floor session whose desk is still open is not compacted', () => {
+  const now = 10 * 60 * MIN;
+  const { api, calls } = fakeApi({
+    getSessionInfo: () => ({ cwd: '/repo', mtime: now - 50 * MIN }),
+    getContextTokens: () => 200000,
+    isSessionHeld: () => true,
+  });
+  const m = mod(api);
+  m.onTranscriptLine({ sessionId: 's1' }, { type: 'assistant' });
+  m.onTick(now);
+  assert.deepEqual(calls.injected, []);
+});
+
+// The quiet period has to survive the skip. A desk left open overnight does not move
+// mtime, so consuming the period on the skip would mean the session is never compacted
+// at all once it finally closes.
+test('module: a skipped session still compacts once the desk closes, same quiet period', () => {
+  const now = 10 * 60 * MIN;
+  const mtime = now - 50 * MIN;
+  let open = true;
+  const { api, calls } = fakeApi({
+    getSessionInfo: () => ({ cwd: '/repo', mtime }),
+    getContextTokens: () => 200000,
+    isSessionHeld: () => open,
+  });
+  const m = mod(api);
+  m.onTranscriptLine({ sessionId: 's1' }, { type: 'assistant' });
+  m.onTick(now);
+  assert.deepEqual(calls.injected, []);
+  open = false;
+  m.onTick(now + MIN);
+  assert.deepEqual(calls.injected, [['s1', '/compact ' +
+    'Preserve decisions, their rationale, open questions, and any identifiers ' +
+    '(paths, ticket ids, account or permit numbers). Drop file listings and tool output.']]);
+});
+
+// The machine runs many sessions at once and only some have a desk attached, so a
+// per-tick answer would suppress or fire the wrong ones.
+test('module: the held check is per session, so an open desk does not shield a closed one', () => {
+  const now = 10 * 60 * MIN;
+  const { api, calls } = fakeApi({
+    getSessionInfo: () => ({ cwd: '/repo', mtime: now - 50 * MIN }),
+    getContextTokens: () => 200000,
+    isSessionHeld: (sid) => sid === 'desk-open',
+  });
+  const m = mod(api);
+  m.onTranscriptLine({ sessionId: 'desk-open' }, { type: 'assistant' });
+  m.onTranscriptLine({ sessionId: 'desk-closed' }, { type: 'assistant' });
+  m.onTick(now);
+  assert.deepEqual(calls.injected.map((c) => c[0]), ['desk-closed']);
+});
+
+// Silence here is how the previous failure hid: the compaction the user was told to
+// expect simply never happened. One notice per quiet period says so without turning
+// into a message every tick for as long as the desk stays open.
+test('module: the desk-open notice posts once per quiet period, not every tick', () => {
+  const now = 10 * 60 * MIN;
+  const { api, calls } = fakeApi({
+    getSessionInfo: () => ({ cwd: '/repo', mtime: now - 50 * MIN }),
+    getContextTokens: () => 200000,
+    isSessionHeld: () => true,
+  });
+  const m = mod(api);
+  m.onTranscriptLine({ sessionId: 's1' }, { type: 'assistant' });
+  m.onTick(now);
+  m.onTick(now + MIN);
+  m.onTick(now + 2 * MIN);
+  assert.equal(calls.posted.length, 1);
+  assert.match(calls.posted[0][1], /desk/i);
+  assert.match(calls.posted[0][1], /200k/);
+});
+
 test('module: a gateway without getContextTokens stays inert rather than throwing', () => {
   const now = 10 * 60 * MIN;
   const { api, calls } = fakeApi({ getSessionInfo: () => ({ cwd: '/repo', mtime: now - 50 * MIN }) });
@@ -177,4 +260,20 @@ test('module: a gateway without getContextTokens stays inert rather than throwin
   m.onTranscriptLine({ sessionId: 's5' }, { type: 'assistant' });
   assert.doesNotThrow(() => m.onTick(now));
   assert.deepEqual(calls.injected, []);
+});
+
+// This module is built in, so it and the accessor ship as one unit and the absence can
+// only mean a copy running against a foreign api. Compacting is the behavior that was
+// asked for; going inert would disable the feature with nothing to say why.
+test('module: an api with no isSessionHeld still compacts rather than going inert', () => {
+  const now = 10 * 60 * MIN;
+  const { api, calls } = fakeApi({
+    getSessionInfo: () => ({ cwd: '/repo', mtime: now - 50 * MIN }),
+    getContextTokens: () => 200000,
+  });
+  delete api.isSessionHeld;
+  const m = mod(api);
+  m.onTranscriptLine({ sessionId: 's6' }, { type: 'assistant' });
+  m.onTick(now);
+  assert.equal(calls.injected.length, 1);
 });
