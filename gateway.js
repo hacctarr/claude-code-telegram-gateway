@@ -1614,6 +1614,10 @@ function buildModuleApi() {
       const file = sessionFileById(sessionId);
       return file ? contextTokens(file) : 0;
     },
+    // A turn aimed at the session itself, rather than at the user reading the topic, has
+    // to know this: when the desk is open the gateway forks, so the turn lands on a branch
+    // and the session it was meant for is untouched.
+    isSessionHeld(sessionId) { return isSessionHeld(sessionFileById(sessionId), sessionId); },
     state(name) {
       const file = statePath('module-' + name);
       let data = {};
