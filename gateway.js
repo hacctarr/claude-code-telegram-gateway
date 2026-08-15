@@ -68,6 +68,15 @@ function writeRunningMarker(stateDir = STATE_DIR) {
   return marker;
 }
 
+// running.json answers "what is live" only for someone with shell access to the state dir.
+// The person reporting a version back is usually reading gateway.log, so the banner carries
+// the same two facts. It takes the marker rather than package.json: a disk read here would
+// name the file's version, which is the number that goes stale the moment a pull lands.
+function startupLine(marker = {}) {
+  const short = marker.sha ? ` (${marker.sha.slice(0, 12)})` : '';
+  return `🚀 CLAUDE CODE MULTI-SESSION TELEGRAM GATEWAY v${marker.version}${short}`;
+}
+
 // Reads prefer STATE_DIR but fall back to a legacy in-package file when migration hasn't run
 // (e.g. this module imported by tests). New writes always land in STATE_DIR.
 function statePath(name) {
@@ -2717,7 +2726,7 @@ if (require.main === module) {
   process.on('SIGTERM', shutdown);
 
   acquireLock();
-  writeRunningMarker();   // stamp the version this process loaded, before anything can fail
+  const running = writeRunningMarker();   // stamp the version this process loaded, before anything can fail
   loadLinks();
   telemetry.start();   // load persisted counters BEFORE incrementing, so restart isn't overwritten
   telemetry.count('gateway.restart');
@@ -2730,7 +2739,7 @@ if (require.main === module) {
   if (moduleRegistry.names().length) console.log(`Modules: ${moduleRegistry.names().join(', ')}`);
   snapshotBaseline();   // record current sizes so a restart doesn't mass-create topics
   console.log("=============================================");
-  console.log("🚀 CLAUDE CODE MULTI-SESSION TELEGRAM GATEWAY");
+  console.log(startupLine(running));
   console.log("=============================================");
   console.log(`Allowed admins: ${ALLOWED_USER_IDS.length} · repos: ${Object.keys(REPO_MAPPINGS).length}`);
   console.log(`Permission mode: ${PERM_MODE}${AUTO_APPROVE ? ' · auto-approve: ON' : ''}${MODEL ? ` · model: ${MODEL}` : ''} · tools: ${SHOW_TOOLS ? 'on' : 'off'} (${Object.keys(toolPrefs.chats).length + Object.keys(toolPrefs.threads).length} /tools override(s))`);
@@ -2753,7 +2762,7 @@ module.exports = {
   lastExchange, contextTokens, sessionNameById, heldByOtherPids, updatePendingTools, dueStallNotices, createApprovalRegistry,
   titleArgs, PERM_MODE, createTopicCooldown, createInjectionSet, parseRetryAfter, updateSocketTimeoutMs, UPDATE_POLL_TIMEOUT_S,
   loadMcpServerPool, resolveChildMcp,
-  STATE_DIR, STATE_FILES, migrateStateFiles, statePath, writeRunningMarker,
+  STATE_DIR, STATE_FILES, migrateStateFiles, statePath, writeRunningMarker, startupLine,
   countUserTurns, dueForRename, RENAME_AFTER_TURNS,
   createModuleRegistry,
   resolveModulePath, loadModules,
