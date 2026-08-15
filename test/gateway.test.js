@@ -1662,3 +1662,32 @@ test('recordTurnUsage is a no-op when usage is absent', () => {
   g.recordTurnUsage(tel, 'documents', undefined);
   assert.strictEqual(tel.snapshot().counters.length, 0);
 });
+
+// --- Startup line: the version the process is running ----------------------
+// A version read off disk describes the file, not the process. gateway.js is loaded
+// once at boot and held in memory, so a pull or an npm update moves the file while
+// the live process keeps serving the old code, and every version anyone reports back
+// is the disk's. running.json already records what this process loaded; the startup
+// line is where a remote reporter, who has the log and not the state dir, can read it.
+test('the startup line names the version and the code the running process loaded', () => {
+  const line = g.startupLine({ version: '1.5.1', sha: 'ab'.repeat(32), pid: 1, dir: '/x' });
+  assert.match(line, /v1\.5\.1/, `must name the loaded version, got: ${line}`);
+  assert.match(line, /abababababab/, `must name the loaded code, got: ${line}`);
+});
+
+// writeRunningMarker leaves `sha` off when it cannot read its own source, and the
+// banner is the one line that must print on every boot including that one.
+test('the startup line still prints when the marker carries no hash', () => {
+  const line = g.startupLine({ version: '1.5.1' });
+  assert.match(line, /v1\.5\.1/);
+  assert.ok(!/undefined/.test(line), `no placeholder for the absent hash, got: ${line}`);
+});
+
+test('the entrypoint prints the marker it just wrote rather than re-reading package.json', () => {
+  const src = fs.readFileSync(require.resolve('../gateway.js'), 'utf8');
+  const entry = src.slice(src.indexOf('if (require.main === module)'));
+  assert.match(entry, /const running = writeRunningMarker\(\)/,
+    'the boot marker must be kept, not discarded');
+  assert.match(entry, /startupLine\(running\)/,
+    'the banner must come from the marker, or it becomes a disk read again');
+});
