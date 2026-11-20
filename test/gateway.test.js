@@ -2104,3 +2104,31 @@ test('the entrypoint prints the marker it just wrote rather than re-reading pack
   assert.match(entry, /startupLine\(running\)/,
     'the banner must come from the marker, or it becomes a disk read again');
 });
+
+// ---------------------------------------------------------------------------
+// Early-exit transcript readers must release their file descriptor
+// ---------------------------------------------------------------------------
+function bigTranscript() {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'gw-fd-'));
+  const file = path.join(dir, 'abcd1234.jsonl');
+  const head = JSON.stringify({ type: 'user', cwd: '/tmp/x', message: { content: 'hello there' } });
+  const pad = JSON.stringify({ type: 'assistant', pad: 'y'.repeat(1000) });
+  fs.writeFileSync(file, head + '\n' + Array(500).fill(pad).join('\n') + '\n');
+  return file;
+}
+const openFds = () => fs.readdirSync('/dev/fd').length;
+const settle = () => new Promise((r) => setTimeout(r, 50));
+
+test('readSessionInfo: closes the file after stopping early', async () => {
+  const file = bigTranscript();
+  const before = openFds();
+  for (let i = 0; i < 20; i++) await g.readSessionInfo(file);
+  await settle();
+  assert.equal(openFds() - before, 0);
+});
+test('getCwd: closes the file after finding the cwd', async () => {
+  const before = openFds();
+  for (let i = 0; i < 20; i++) assert.equal(await g.getCwd(bigTranscript()), '/tmp/x');
+  await settle();
+  assert.equal(openFds() - before, 0);
+});
