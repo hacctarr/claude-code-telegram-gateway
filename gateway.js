@@ -262,6 +262,12 @@ const RENAME_AFTER_TURNS = config.RENAME_AFTER_TURNS === 0 ? 0 : (config.RENAME_
 // the reply falls back to a resume. The write is local and tiny, so this only has to clear a
 // socket that exists but has no reader.
 const PEER_SEND_TIMEOUT_MS = (config.PEER_SEND_TIMEOUT_SECONDS || 5) * 1000;
+// A media upload carries the whole file, so it needs far longer than an ordinary API call: a video
+// at the Bot API's 50 MB ceiling on a slow uplink would time out at the usual socket window.
+const MEDIA_UPLOAD_TIMEOUT_MS = (config.MEDIA_UPLOAD_TIMEOUT_SECONDS || 120) * 1000;
+// Post files a session sends (SendUserFile) into the topic as photos, videos or documents. These
+// are content rather than tool noise, so they are independent of SHOW_TOOL_ACTIVITY.
+const MIRROR_FILE_SENDS = config.MIRROR_FILE_SENDS !== false;
 // The gateway owns one relay session and forwards every phone reply through it, because a reply
 // sent by the daemon itself is held for approval at the target whatever mode it attests, while one
 // sent by a session is identified and lands. false sends direct instead, which only works where
@@ -980,6 +986,176 @@ function createFeed(showTools = true) {
 }
 
 // A stored transcript record -> zero or more Telegram post strings.
+// A session surfacing a file to the user calls SendUserFile; `input.files` is always an array and
+// the tool_result carries nothing, so the call itself is the whole record. Deliberately not gated
+// on the tool-activity setting: a file the user is meant to look at is content, and with tool
+// lines off the send would otherwise never reach the topic in any form.
+function fileSendsFrom(o) {
+  if (!o || o.type !== 'assistant' || !o.message || !Array.isArray(o.message.content)) return [];
+  const out = [];
+  for (const b of o.message.content) {
+    if (b.type !== 'tool_use' || b.name !== 'SendUserFile' || !b.input) continue;
+    const files = Array.isArray(b.input.files) ? b.input.files.filter((f) => typeof f === 'string' && f) : [];
+    if (!files.length) continue;
+    out.push({ paths: files, caption: typeof b.input.caption === 'string' && b.input.caption ? b.input.caption : null });
+  }
+  return out;
+}
+
+const PHOTO_EXT = new Set(['.jpg', '.jpeg', '.png', '.gif', '.webp']);
+const VIDEO_EXT = new Set(['.mp4', '.mov', '.m4v', '.webm']);
+
+// Telegram shows a photo or a video inline. Everything else, an SVG and a PDF included, renders
+// only as a file card, so it goes as a document rather than being forced into a photo send that
+// the API would reject.
+function classifyMedia(p) {
+  const ext = path.extname(String(p)).toLowerCase();
+  if (PHOTO_EXT.has(ext)) return { method: 'sendPhoto', field: 'photo' };
+  if (VIDEO_EXT.has(ext)) return { method: 'sendVideo', field: 'video' };
+  return { method: 'sendDocument', field: 'document' };
+}
+
+const ALBUM_MAX = 10;        // sendMediaGroup's cap
+const CAPTION_MAX = 1024;    // media caption cap
+
+// Photos and videos group into an album, which is how a multi-page or multi-frame send should read
+// in a topic rather than as six consecutive messages. Documents go singly: a document album
+// carries its own mixing rules and one card per file is clearer anyway.
+function planFileSends(paths) {
+  const groupable = [];
+  const singles = [];
+  for (const p of paths) {
+    const c = classifyMedia(p);
+    (c.method === 'sendDocument' ? singles : groupable).push({ p, c });
+  }
+  const plan = [];
+  for (let i = 0; i < groupable.length; i += ALBUM_MAX) {
+    const chunk = groupable.slice(i, i + ALBUM_MAX);
+    if (chunk.length === 1) {
+      plan.push({ kind: 'single', method: chunk[0].c.method, field: chunk[0].c.field, paths: [chunk[0].p] });
+    } else {
+      plan.push({ kind: 'album', method: 'sendMediaGroup', paths: chunk.map((x) => x.p) });
+    }
+  }
+  for (const s of singles) plan.push({ kind: 'single', method: s.c.method, field: s.c.field, paths: [s.p] });
+  return plan;
+}
+
+function captionFor(t) { return typeof t === 'string' ? t.slice(0, CAPTION_MAX) : ''; }
+
+// Bot API upload ceilings: 10 MB for a photo, 50 MB for anything else.
+function tooLargeFor(method, bytes) {
+  return bytes > (method === 'sendPhoto' ? 10 * 1024 * 1024 : 50 * 1024 * 1024);
+}
+
+// Said in the topic instead of the file. A scratchpad path is the common case for a camera frame or
+// a rendered page, and that directory is cleared on reboot, so the mirror can reach a record whose
+// file has already gone; saying so beats a silent gap where a picture was meant to be.
+function describeUnsendable(p, reason) {
+  const name = path.basename(String(p));
+  return reason === 'missing'
+    ? `📎 ${name} was sent by the session but is no longer on disk (${p})`
+    : `📎 ${name} is too large for Telegram to accept (${p})`;
+}
+
+// Assembled in memory rather than streamed, which is bounded by the ceiling in tooLargeFor.
+function multipartBody(fields, files) {
+  const boundary = `----gwmedia${process.pid}${Date.now().toString(36)}`;
+  const parts = [];
+  for (const [name, value] of Object.entries(fields)) {
+    if (value === undefined || value === null || value === '') continue;
+    parts.push(Buffer.from(`--${boundary}\r\nContent-Disposition: form-data; name="${name}"\r\n\r\n${value}\r\n`));
+  }
+  for (const f of files) {
+    parts.push(Buffer.from(`--${boundary}\r\nContent-Disposition: form-data; name="${f.name}"; ` +
+      `filename="${f.filename}"\r\nContent-Type: application/octet-stream\r\n\r\n`));
+    parts.push(f.data);
+    parts.push(Buffer.from('\r\n'));
+  }
+  parts.push(Buffer.from(`--${boundary}--\r\n`));
+  return { boundary, body: Buffer.concat(parts) };
+}
+
+function telegramUpload(method, fields, files) {
+  return new Promise((resolve) => {
+    const { boundary, body } = multipartBody(fields, files);
+    const req = https.request({
+      hostname: 'api.telegram.org', port: 443, path: `/bot${BOT_TOKEN}/${method}`, method: 'POST',
+      headers: { 'Content-Type': `multipart/form-data; boundary=${boundary}`, 'Content-Length': body.length },
+    }, (res) => {
+      let b = ''; res.on('data', (c) => (b += c));
+      res.on('end', () => {
+        try {
+          const j = JSON.parse(b);
+          if (!j.ok) console.error(`[Media] ${method} failed: ${j.description}`);
+          resolve(!!j.ok);
+        } catch (e) { resolve(false); }
+      });
+    });
+    req.setTimeout(MEDIA_UPLOAD_TIMEOUT_MS, () => req.destroy(new Error('timeout')));
+    req.on('error', (e) => { console.error(`[Media] ${method} failed: ${e.message}`); resolve(false); });
+    req.write(body); req.end();
+  });
+}
+
+// Read a file for upload, or say why it cannot go. Both reasons are worth a line in the topic:
+// a silent gap where a picture should be reads as the gateway having lost it.
+function readForUpload(p, method) {
+  let st;
+  try { st = fs.statSync(p); } catch (e) { return { reason: 'missing' }; }
+  if (tooLargeFor(method, st.size)) return { reason: 'too-large' };
+  try { return { data: fs.readFileSync(p) }; } catch (e) { return { reason: 'missing' }; }
+}
+
+// Post one SendUserFile call into a topic as real media. Returns the lines that could not be sent
+// as files, for the caller to post as text alongside the rest of the batch.
+async function postFileSend(chatId, threadId, send) {
+  const notes = [];
+  const caption = captionFor(send.caption);
+  for (const op of planFileSends(send.paths)) {
+    if (op.kind === 'album') {
+      const loaded = [];
+      for (const p of op.paths) {
+        const r = readForUpload(p, classifyMedia(p).method);
+        if (r.reason) notes.push(describeUnsendable(p, r.reason));
+        else loaded.push({ p, data: r.data });
+      }
+      if (!loaded.length) continue;
+      // An album needs two items; one survivor is an ordinary send rather than a group of one.
+      if (loaded.length === 1) {
+        const c = classifyMedia(loaded[0].p);
+        await telegramUpload(c.method, {
+          chat_id: chatId, message_thread_id: threadId, caption,
+        }, [{ name: c.field, filename: path.basename(loaded[0].p), data: loaded[0].data }]);
+        continue;
+      }
+      const media = loaded.map((f, i) => ({
+        type: classifyMedia(f.p).field,
+        media: `attach://f${i}`,
+        ...(i === 0 && caption ? { caption } : {}),   // Telegram shows only the first item's caption
+      }));
+      const ok = await telegramUpload('sendMediaGroup', {
+        chat_id: chatId, message_thread_id: threadId, media: JSON.stringify(media),
+      }, loaded.map((f, i) => ({ name: `f${i}`, filename: path.basename(f.p), data: f.data })));
+      if (!ok) {
+        // A rejected group still has sendable files in it, so fall back rather than lose them.
+        for (const f of loaded) {
+          const c = classifyMedia(f.p);
+          await telegramUpload(c.method, { chat_id: chatId, message_thread_id: threadId, caption },
+            [{ name: c.field, filename: path.basename(f.p), data: f.data }]);
+        }
+      }
+      continue;
+    }
+    const p = op.paths[0];
+    const r = readForUpload(p, op.method);
+    if (r.reason) { notes.push(describeUnsendable(p, r.reason)); continue; }
+    await telegramUpload(op.method, { chat_id: chatId, message_thread_id: threadId, caption },
+      [{ name: op.field, filename: path.basename(p), data: r.data }]);
+  }
+  return notes;
+}
+
 function renderTranscriptLine(o, showTools = true) {
   if (!o || typeof o !== 'object') return [];
   if (o.type === 'assistant' && o.message && Array.isArray(o.message.content)) {
@@ -2419,6 +2595,9 @@ async function pollTick() {
         const posts = [];
         const showTools = showToolsIn(link.chatId, link.threadId);
         for (const o of lines) posts.push(...renderTranscriptLine(o, showTools));
+        // Files the session surfaced go up as real media. Collected here and uploaded after this
+        // batch's text, so a caption and its picture stay together in the topic.
+        const fileSends = MIRROR_FILE_SENDS ? lines.flatMap((o) => fileSendsFrom(o)) : [];
         // Track unresolved tool calls; announce completion of any we'd flagged as stalled.
         const pstate = (pendingTools[id] = pendingTools[id] || {});
         for (const r of updatePendingTools(pstate, lines, now)) {
@@ -2467,6 +2646,14 @@ async function pollTick() {
           delete link.mirrorCursor;
           mirrorRetryAt.delete(id);
           lastMirrorAt.set(id, now);
+        }
+        // Uploaded after the text has landed and deliberately NOT inside the retry cursor: a
+        // half-failed batch re-posts, and re-posting an upload duplicates the picture. A failed
+        // upload is logged and dropped instead, which is the cheaper of the two wrong answers.
+        for (const send of fileSends) {
+          const notes = await postFileSend(link.chatId, link.threadId, send);
+          telemetry.count('gateway.mirror.file_send', { ok: String(!notes.length) });
+          if (notes.length) await sendChunked(link.chatId, link.threadId, notes.join('\n'));
         }
         link.userTurns = (link.userTurns || 0) + countUserTurns(lines);
         link.offset = newOffset;
@@ -3005,6 +3192,8 @@ if (require.main === module) {
 
 module.exports = {
   LiveMessage, summarizeToolInput, createFeed, renderTranscriptLine, splitReadout, readNewLines,
+  fileSendsFrom, classifyMedia, planFileSends, captionFor, tooLargeFor, describeUnsendable,
+  multipartBody,
   listSessions, matchSessions, readSessionInfo, relTime, formatSessionList,
   isActive, shouldPrune, isDeskBusy, resolvePruneMs, formatPruneWindow, resolveShowTools,
   invertRepoMappings, splitThreadKey, buildThreadIndex,
