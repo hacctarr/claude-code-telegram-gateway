@@ -190,19 +190,22 @@ From a source checkout: `git pull && npm test && touch ~/.claude-gateway/restart
 ### Phone continuation — works whether or not the desk session is closed
 - **Desk session closed:** your phone reply continues the *same* session and is saved — seamless,
   and `cr` at the Mac picks it right up.
-- **Desk session left open:** the desk process owns the transcript, so a plain resume wouldn't
-  persist. With `AUTO_FORK` (default on) the gateway instead **forks a saved phone branch** and the
-  topic follows it — full context kept, one-line notice posted, desk copy untouched. If you later
-  keep working the desk copy, it earns its own topic automatically. Three safeguards make this
-  race-free (each was a real bug once):
-  - held-detection runs **before** the turn (`lsof`, excluding the gateway's own pid) — the prompt
-    and its tool side effects execute exactly once, and idle-but-open sessions aren't re-forked;
-  - the fork's session id is **pre-minted and reserved**, so the poller can never create a
-    duplicate topic for the branch mid-turn;
-  - a reply resolves its target session **when it runs**, so back-to-back messages follow the
-    first one's fork instead of forking the original twice.
-  Set `AUTO_FORK: false` to disable; held-session replies then run with full context but aren't
-  persisted (and say so).
+- **Desk session left open:** the reply is **delivered into that running session's own inbox**, so
+  the session itself runs the turn and writes its own transcript. Desk and phone stay one
+  conversation, and the mirror carries the answer back into the topic as it is written. Each live
+  session publishes its inbox socket in `~/.claude/sessions/<pid>.json`, with the token to
+  authenticate to it beside the entry; the gateway binds an inbox of its own in the same directory
+  and passes it as the reply address, which is where delivery receipts and the idle notice arrive.
+  Three things keep it honest:
+  - liveness and addressability are resolved **before** the turn, from the session registry rather
+    than from file-handle behaviour, and the gateway's own headless children never count;
+  - a live session that publishes no inbox (an older Claude Code) falls back to a resume, which is
+    reported as unsaved rather than silently lost;
+  - a reply resolves its target session **when it runs**, so back-to-back messages land in order.
+
+  Nothing is forked. Forking existed only because a resumed turn against a held session never
+  persisted, and delivering to the session removes that case. `/catchup` still rebinds branches
+  created by earlier versions.
 
 ### Other notes
 - Mirror latency ≈ `POLL_MS` (~2s); it posts completed turns, not token-by-token (phone-injected

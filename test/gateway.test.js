@@ -660,6 +660,167 @@ test('liveSessionHolders: a missing directory or unparseable entry is empty, nev
 });
 
 // ---------------------------------------------------------------------------
+// Delivering a phone reply into the LIVE session instead of forking it
+// ---------------------------------------------------------------------------
+// Forking existed only because resuming a desk-held session never persisted (see `persisted`).
+// A live session publishes its own message inbox in the registry, so the reply can be delivered
+// to that session, which then runs the turn itself. Nothing else touches the transcript, so the
+// fork has nothing left to protect. Fixtures mirror real registry entries and key files.
+const KEYHASH = 'a'.repeat(64);
+const INBOX = (over = {}) => REG({ messagingSocketPath: '/tmp/cc-socks/61721.sock', ...over });
+
+function mkInboxRegistry(entries, keys = {}) {
+  const dir = mkRegistry(entries);
+  for (const [pid, token] of Object.entries(keys)) {
+    fs.writeFileSync(path.join(dir, `${pid}.${KEYHASH}.key`), JSON.stringify({ peerToken: token }));
+  }
+  return dir;
+}
+const RESOLVE = (dir, over = {}) =>
+  ({ dir, isAlive: () => true, selfPid: 999, childPids: () => [], ...over });
+
+test('peerAddress: a live session resolves to its own inbox socket and published token', () => {
+  const dir = mkInboxRegistry([INBOX()], { 61721: 'tok-abc' });
+  assert.deepEqual(g.peerAddress('desk-sid', RESOLVE(dir)),
+    { pid: 61721, socketPath: '/tmp/cc-socks/61721.sock', token: 'tok-abc', name: 'documents-1d' });
+});
+
+test('peerAddress: no live holder means no peer address, so the turn resumes in place', () => {
+  // A dead session is nobody's to clobber, which is the other half of why the fork is redundant.
+  const dir = mkInboxRegistry([INBOX()], { 61721: 'tok-abc' });
+  assert.equal(g.peerAddress('desk-sid', RESOLVE(dir, { isAlive: () => false })), null);
+});
+
+test('peerAddress: a live session publishing no inbox is not addressable', () => {
+  // An older Claude Code binds no socket. Degrading to a resume is correct and must not throw.
+  const dir = mkInboxRegistry([REG()], { 61721: 'tok-abc' });
+  assert.equal(g.peerAddress('desk-sid', RESOLVE(dir)), null);
+});
+
+test('peerAddress: the daemon\'s own headless child is never the peer', () => {
+  // Same trap as liveSessionHolders: the daemon's own turn registers under the session id, and
+  // addressing it would make the gateway message itself.
+  const dir = mkInboxRegistry([INBOX({ pid: 73020, entrypoint: 'sdk-cli' })], { 73020: 'tok-child' });
+  assert.equal(
+    g.peerAddress('desk-sid', RESOLVE(dir, { selfPid: 53871, childPids: () => [73020] })), null);
+});
+
+test('peerAddress: an unreadable key file yields the address with a null token, never a throw', () => {
+  // Auth is optional on some platforms, so a missing key is a degraded send rather than a failure.
+  const dir = mkInboxRegistry([INBOX()]);
+  assert.deepEqual(g.peerAddress('desk-sid', RESOLVE(dir)),
+    { pid: 61721, socketPath: '/tmp/cc-socks/61721.sock', token: null, name: 'documents-1d' });
+});
+
+test('routeTurn: a live session takes the peer path, a dead one resumes, and nothing ever forks', () => {
+  assert.equal(g.routeTurn({ sessionId: null, peer: null }), 'new');
+  assert.equal(g.routeTurn({ sessionId: 'sid', peer: null }), 'resume');
+  assert.equal(g.routeTurn({ sessionId: 'sid', peer: { socketPath: '/s.sock' } }), 'peer');
+  // The behavioural statement of "no forking": no input produces a fork.
+  for (const sessionId of [null, 'sid']) {
+    for (const peer of [null, { socketPath: '/s.sock' }]) {
+      assert.notEqual(g.routeTurn({ sessionId, peer }), 'fork');
+    }
+  }
+});
+
+test('peerMode: attests one of the two values the recipient\'s enum accepts', () => {
+  // The recipient validates from_mode against ["bypass","prompting"]; anything else reads as no
+  // attestation at all and the message is held for approval.
+  assert.equal(g.peerMode('bypassPermissions'), 'bypass');
+  assert.equal(g.peerMode('default'), 'prompting');
+  assert.equal(g.peerMode('acceptEdits'), 'prompting');
+  assert.equal(g.peerMode('plan'), 'prompting');
+});
+
+test('peerFrames: an auth line first, then the user frame carrying from, mode and id', () => {
+  const wire = g.peerFrames('ship it', {
+    token: 'tok-abc', from: 'uds:/tmp/cc-socks/gw.sock', mode: 'bypass', msgId: 'm-1',
+  });
+  const lines = wire.trimEnd().split('\n').map((l) => JSON.parse(l));
+  assert.equal(lines.length, 2);
+  assert.deepEqual(lines[0], { type: 'auth', token: 'tok-abc' });
+  assert.equal(lines[1].type, 'user');
+  assert.deepEqual(lines[1].message, { role: 'user', content: 'ship it' });
+  assert.equal(lines[1].from, 'uds:/tmp/cc-socks/gw.sock');
+  assert.equal(lines[1].from_mode, 'bypass');
+  assert.equal(lines[1].msg_id, 'm-1');
+});
+
+test('peerFrames: a tokenless send omits the auth line rather than sending a null token', () => {
+  const wire = g.peerFrames('ship it', { token: null, from: 'uds:/s.sock', mode: 'bypass', msgId: 'm-2' });
+  const lines = wire.trimEnd().split('\n').map((l) => JSON.parse(l));
+  assert.equal(lines.length, 1);
+  assert.equal(lines[0].type, 'user');
+});
+
+test('classifyPeerReceipt: a status frame carries the disposition and the message it answers', () => {
+  assert.deepEqual(
+    g.classifyPeerReceipt({ action: 'peer_message_status', status: 'held', reason: 'parity', orig_msg_id: 'm-1' }),
+    { kind: 'status', status: 'held', reason: 'parity', msgId: 'm-1' });
+});
+
+test('classifyPeerReceipt: an idle notice is the turn-finished signal', () => {
+  assert.deepEqual(g.classifyPeerReceipt({ action: 'peer_idle_notice', from: 'uds:/a.sock' }),
+    { kind: 'idle', from: 'uds:/a.sock' });
+});
+
+test('classifyPeerReceipt: anything else is ignored rather than guessed at', () => {
+  assert.equal(g.classifyPeerReceipt({ action: 'something_new' }), null);
+  assert.equal(g.classifyPeerReceipt(null), null);
+  assert.equal(g.classifyPeerReceipt('status'), null);
+});
+
+test('sendPeerMessage: writes the auth line then the user frame to a real socket', async () => {
+  const net = require('net');
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'peer-'));
+  const sockPath = path.join(dir, 'recipient.sock');
+  const received = await new Promise((resolve) => {
+    let buf = '';
+    const srv = net.createServer({ allowHalfOpen: true }, (c) => {
+      c.on('data', (d) => { buf += d.toString(); });
+      c.on('end', () => { srv.close(); resolve(buf); });
+    });
+    srv.listen(sockPath, async () => {
+      const r = await g.sendPeerMessage({ socketPath: sockPath, token: 'tok-abc' }, 'ship it',
+        { from: 'uds:/gw.sock', mode: 'bypass', msgId: 'm-9' });
+      assert.equal(r.ok, true, r.error || '');
+    });
+  });
+  const lines = received.trimEnd().split('\n').map((l) => JSON.parse(l));
+  assert.deepEqual(lines[0], { type: 'auth', token: 'tok-abc' });
+  assert.equal(lines[1].from, 'uds:/gw.sock');
+  assert.equal(lines[1].from_mode, 'bypass');
+});
+
+test('sendPeerMessage: a socket with no listener fails rather than hanging the turn', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'peer-'));
+  const r = await g.sendPeerMessage({ socketPath: path.join(dir, 'absent.sock'), token: null }, 'x', {});
+  assert.equal(r.ok, false);
+  assert.ok(r.error, 'a failure has to say why, or the fallback to a resume is unexplained');
+});
+
+test('createPeerInbox: binds inside the peer namespace and hands each receipt to the handler', async () => {
+  const net = require('net');
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'peer-'));
+  const seen = [];
+  const inbox = g.createPeerInbox((r) => seen.push(r), { dir, pid: 4242 });
+  try {
+    assert.equal(inbox.address, `uds:${path.join(dir, 'gw-4242.sock')}`);
+    await new Promise((resolve, reject) => {
+      const c = net.connect({ path: path.join(dir, 'gw-4242.sock') }, () => {
+        c.end(`${JSON.stringify({ action: 'peer_message_status', status: 'delivered' })}\n` +
+              `${JSON.stringify({ action: 'peer_idle_notice' })}\n`,
+        () => setTimeout(() => { c.destroy(); resolve(); }, 60));
+      });
+      c.on('error', reject);
+    });
+    assert.deepEqual(seen.map((r) => r.kind), ['status', 'idle']);
+    assert.equal(seen[0].status, 'delivered');
+  } finally { inbox.close(); }
+});
+
+// ---------------------------------------------------------------------------
 // Stall/approval notices — updatePendingTools + dueStallNotices
 // ---------------------------------------------------------------------------
 test('updatePendingTools: tracks tool_use, clears on tool_result', () => {

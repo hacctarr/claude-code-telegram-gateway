@@ -3,6 +3,7 @@ const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
 const os = require('os');
+const net = require('net');
 const { spawn, execFileSync } = require('child_process');
 
 // ---------------------------------------------------------------------------
@@ -257,11 +258,10 @@ const TOPIC_RETRY_MAX_MS = config.TOPIC_RETRY_MAX_MS || 15 * 60_000;
 // Rename a topic once, after this many mirrored desk prompts, so its name reflects the work
 // rather than the opening message. 0 disables. Only does anything when TITLE_MODE=generated.
 const RENAME_AFTER_TURNS = config.RENAME_AFTER_TURNS === 0 ? 0 : (config.RENAME_AFTER_TURNS || 3);
-// Auto-fork a held-open desk session into a persistent phone branch (on by default). The fork id is
-// pre-minted and reserved before the turn spawns, the topic is atomically rebound to the branch, and
-// held-detection ignores the gateway's own pid — the three fixes that make this safe. Set
-// AUTO_FORK:false to disable; replies into a held session then run with full context but don't persist.
-const AUTO_FORK = config.AUTO_FORK !== false;
+// How long a delivery into a live session's inbox may take before it is treated as unreachable and
+// the reply falls back to a resume. The write is local and tiny, so this only has to clear a
+// socket that exists but has no reader.
+const PEER_SEND_TIMEOUT_MS = (config.PEER_SEND_TIMEOUT_SECONDS || 5) * 1000;
 // After this many seconds with a desk tool call still unresolved, post a one-time notice to the
 // topic (it may be a long-running tool OR a permission prompt sitting unanswered at the desk — the
 // transcript can't distinguish them, so the notice says both). 0 disables.
@@ -1164,7 +1164,7 @@ function readNewLines(filePath, offset) {
 // ---------------------------------------------------------------------------
 // Running a Claude turn (streaming headless) — used for phone injections.
 // ---------------------------------------------------------------------------
-function runClaudeTurn(prompt, cwd, sessionId, live, createId, forkId, onPermission) {
+function runClaudeTurn(prompt, cwd, sessionId, live, createId, onPermission) {
   return new Promise((resolve) => {
     const args = ['-p', '--output-format', 'stream-json', '--include-partial-messages', '--verbose',
                   '--permission-mode', PERM_MODE];
@@ -1172,12 +1172,10 @@ function runClaudeTurn(prompt, cwd, sessionId, live, createId, forkId, onPermiss
     // control_request/can_use_tool and pauses the tool until our control_response arrives).
     if (PHONE_APPROVALS) args.push('--permission-prompt-tool', 'stdio', '--input-format', 'stream-json');
     if (MODEL) args.push('--model', MODEL);
-    if (sessionId) {
-      args.push('--resume', sessionId);
-      // Fork with a PRE-MINTED id (verified supported) so the fork is reserved in `injecting`
-      // before it ever appears on disk — the poller can never race it into a duplicate topic.
-      if (forkId) args.push('--fork-session', '--session-id', forkId);
-    } else if (createId) args.push('--session-id', createId);  // deterministic id for a fresh session
+    // A session only reaches this path when nothing holds it open, so resuming writes to its own
+    // transcript and persists. A live session is delivered to through its inbox instead.
+    if (sessionId) args.push('--resume', sessionId);
+    else if (createId) args.push('--session-id', createId);     // deterministic id for a fresh session
     args.push(...CHILD_MCP.args);
     args.push(...EXTRA);
 
@@ -1198,9 +1196,8 @@ function runClaudeTurn(prompt, cwd, sessionId, live, createId, forkId, onPermiss
     };
 
     child.stdout.on('data', (d) => {
-      // Proof of life for the restart gate. Every id this turn reserved is bumped, since a resumed
-      // turn that forks streams under the fork's id while both remain reserved.
-      injecting.touch(sessionId, createId, forkId);
+      // Proof of life for the restart gate: bump every id this turn reserved.
+      injecting.touch(sessionId, createId);
       rem += d.toString();
       const lines = rem.split('\n');
       rem = lines.pop();
@@ -1340,7 +1337,7 @@ function daemonChildPids(selfPid = process.pid) {
   } catch (e) { return []; }      // pgrep exits non-zero when there are no children
 }
 
-function liveSessionHolders(sessionId, {
+function liveSessionEntries(sessionId, {
   dir = SESSIONS_DIR, isAlive = pidAlive, selfPid = process.pid, childPids = daemonChildPids,
 } = {}) {
   if (!sessionId) return [];
@@ -1354,9 +1351,158 @@ function liveSessionHolders(sessionId, {
     try { j = JSON.parse(fs.readFileSync(path.join(dir, f), 'utf8')); } catch (e) { continue; }
     if (!j || j.sessionId !== sessionId || !Number.isFinite(j.pid)) continue;
     if (mine.has(j.pid) || !isAlive(j.pid)) continue;
-    out.push(j.pid);
+    out.push(j);
   }
   return out;
+}
+
+function liveSessionHolders(sessionId, opts = {}) {
+  return liveSessionEntries(sessionId, opts).map((j) => j.pid);
+}
+
+// The inbox token a session publishes beside its registry entry so a peer can authenticate to it.
+// Auth is optional on some platforms, so an unreadable key degrades to a tokenless send rather
+// than failing the delivery.
+function peerTokenFor(pid, dir = SESSIONS_DIR) {
+  let files;
+  try { files = fs.readdirSync(dir); } catch (e) { return null; }
+  for (const f of files) {
+    if (!f.startsWith(`${pid}.`) || !f.endsWith('.key')) continue;
+    try {
+      const t = JSON.parse(fs.readFileSync(path.join(dir, f), 'utf8')).peerToken;
+      if (typeof t === 'string' && t) return t;
+    } catch (e) { /* unreadable key: keep looking, then send unauthenticated */ }
+  }
+  return null;
+}
+
+// Where a live session takes delivery of a reply. null means it is not addressable as a peer,
+// which routes the turn to a resume. An older Claude Code binds no inbox and lands here.
+function peerAddress(sessionId, opts = {}) {
+  const dir = opts.dir || SESSIONS_DIR;
+  const entry = liveSessionEntries(sessionId, opts)
+    .find((j) => typeof j.messagingSocketPath === 'string' && j.messagingSocketPath);
+  if (!entry) return null;
+  return {
+    pid: entry.pid,
+    socketPath: entry.messagingSocketPath,
+    token: peerTokenFor(entry.pid, dir),
+    name: typeof entry.name === 'string' ? entry.name : null,
+  };
+}
+
+// No fork, in any branch. A live session runs the turn itself, so nothing else writes its
+// transcript; a dead one has no desk holding it open, so resuming in place persists normally.
+// Forking only ever protected the first case, and delivering to the session removes that need.
+function routeTurn({ sessionId, peer }) {
+  if (!sessionId) return 'new';
+  return peer ? 'peer' : 'resume';
+}
+
+// The recipient validates this against ["bypass","prompting"]. A value outside that set reads as
+// no attestation at all, and the message is then held for the recipient user's approval.
+function peerMode(permMode) { return permMode === 'bypassPermissions' ? 'bypass' : 'prompting'; }
+
+// One delivery on the wire: newline-delimited JSON with the auth line first. `from` is the
+// gateway's own inbox, which is where the recipient sends delivery receipts and its idle notice,
+// so it must outlive the send.
+function peerFrames(prompt, { token, from, mode, msgId } = {}) {
+  const lines = [];
+  if (token) lines.push(JSON.stringify({ type: 'auth', token }));
+  lines.push(JSON.stringify({
+    type: 'user',
+    message: { role: 'user', content: prompt },
+    ...(from ? { from } : {}),
+    ...(mode ? { from_mode: mode } : {}),
+    ...(msgId ? { msg_id: msgId } : {}),
+  }));
+  return `${lines.join('\n')}\n`;
+}
+
+// What a recipient sends back to our `from` address: a per-message status, or a notice that the
+// session has gone idle. Pure, so the wire handling is testable without a socket.
+function classifyPeerReceipt(frame) {
+  if (!frame || typeof frame !== 'object') return null;
+  if (frame.action === 'peer_message_status') {
+    return { kind: 'status', status: frame.status || 'unknown', reason: frame.reason || null,
+             msgId: frame.orig_msg_id || null };
+  }
+  if (frame.action === 'peer_idle_notice') return { kind: 'idle', from: frame.from || null };
+  return null;
+}
+
+// Our own inbox, which has to outlive every send: receipts and idle notices are addressed to it,
+// so a sender whose socket dies with the send gets ENOENT on the recipient's reply and forfeits
+// both signals. A reply address is only accepted inside the namespace the sessions bind in, which
+// is why the directory comes from a live peer's own published socket path.
+function createPeerInbox(onReceipt, { dir, pid = process.pid } = {}) {
+  const sockPath = path.join(dir, `gw-${pid}.sock`);
+  try { fs.unlinkSync(sockPath); } catch (e) { /* nothing stale to clear */ }
+  const server = net.createServer({ allowHalfOpen: true }, (conn) => {
+    let buf = '';
+    conn.on('data', (d) => {
+      buf += d.toString();
+      const lines = buf.split('\n');
+      buf = lines.pop();
+      for (const line of lines) {
+        if (!line.trim()) continue;
+        let o; try { o = JSON.parse(line); } catch (e) { continue; }
+        const r = classifyPeerReceipt(o);
+        if (r) { try { onReceipt(r); } catch (e) { console.error('peer receipt handler:', e.message); } }
+      }
+    });
+    conn.on('error', () => { /* a peer hanging up mid-receipt is not worth raising */ });
+  });
+  server.on('error', (e) => console.error('[Peer] inbox error:', e.message));
+  try {
+    server.listen(sockPath, () => { try { fs.chmodSync(sockPath, 0o600); } catch (e) { /* */ } });
+  } catch (e) {
+    console.error('[Peer] could not bind an inbox; sends carry no reply address:', e.message);
+    return { address: null, close: () => {} };
+  }
+  server.unref();
+  return {
+    address: `uds:${sockPath}`,
+    close: () => { try { server.close(); fs.unlinkSync(sockPath); } catch (e) { /* */ } },
+  };
+}
+
+let peerInbox = null;
+function ensurePeerInbox(dir) {
+  if (!peerInbox) {
+    peerInbox = createPeerInbox((r) => {
+      if (r.kind === 'status') {
+        console.log(`[Peer] ${r.status}${r.msgId ? ' ' + r.msgId.slice(0, 8) : ''}${r.reason ? ': ' + r.reason : ''}`);
+        telemetry.count('gateway.peer.status', { status: r.status });
+      } else console.log('[Peer] recipient went idle');
+    }, { dir });
+  }
+  return peerInbox.address;
+}
+
+// Deliver one reply into a live session's inbox. The session's answer returns through the
+// transcript mirror rather than this socket, so a clean write is the whole success condition.
+function sendPeerMessage(peer, prompt, { from, mode, msgId, timeoutMs = PEER_SEND_TIMEOUT_MS } = {}) {
+  return new Promise((resolve) => {
+    let settled = false;
+    const sock = net.connect({ path: peer.socketPath });
+    // Only a failure destroys the socket. Tearing it down on the success path can cut the stream
+    // before the recipient observes its end, which is how a written frame goes undelivered.
+    const done = (ok, error) => {
+      if (settled) return;
+      settled = true;
+      if (!ok) { try { sock.destroy(); } catch (e) { /* */ } }
+      resolve({ ok, error: error || null });
+    };
+    sock.setTimeout(timeoutMs, () => done(false, `no reader on ${peer.socketPath} within ${timeoutMs}ms`));
+    sock.on('error', (e) => done(false, e.message));
+    sock.on('connect', () => {
+      // Unreferenced so a socket left open for the recipient's own close cannot hold the daemon's
+      // event loop, which is what a restart gate waits on.
+      sock.unref();
+      sock.end(peerFrames(prompt, { token: peer.token, from, mode, msgId }), () => done(true));
+    });
+  });
 }
 
 // Registry first, lsof as the fallback: an older Claude Code that keeps the transcript open but
@@ -1380,16 +1526,39 @@ async function driveTurn(chatId, threadId, prompt, resolveSession) {
   const sessionId = (typeof resolveSession === 'function' ? resolveSession() : resolveSession) || null;
 
   // Decide the mode ONCE, before spawning (single run — side effects never execute twice):
-  //   held by another process + AUTO_FORK → fork with a PRE-MINTED id (reserved below)
-  //   held, no AUTO_FORK                  → resume; reply has full context but won't persist
-  //   free existing session               → resume in place
-  //   no session                          → fresh session with a pre-minted id
+  //   live session, addressable → deliver into its own inbox; it runs the turn itself
+  //   live but not addressable  → resume, and say the reply may not persist
+  //   free existing session     → resume in place
+  //   no session                → fresh session with a pre-minted id
+  const peer = sessionId ? peerAddress(sessionId) : null;
+  const route = routeTurn({ sessionId, peer });
+  if (route === 'peer') {
+    const sent = await sendPeerMessage(peer, prompt, {
+      from: ensurePeerInbox(path.dirname(peer.socketPath)),
+      mode: peerMode(PERM_MODE),
+      msgId: crypto.randomUUID(),
+    });
+    clearInterval(typing);
+    if (sent.ok) {
+      // Deliberately not suppressed from the mirror: the session owns the turn, so its prompt and
+      // its answer both arrive through the transcript the poller is already following. Emitting
+      // `injectedTurn` here would double every module hook against that same text.
+      await live.finalize(`📨 Delivered to the live session${peer.name ? ` (${peer.name})` : ''}. ` +
+        `Its reply mirrors into this topic as it writes.`);
+      console.log(`[Drive → thread ${threadId}] peer-delivered to ${sessionId.slice(0, 8)} pid ${peer.pid}`);
+      telemetry.count('gateway.drive.peer', { repo: repoOf(REPO_MAPPINGS[chatId], REPO_MAPPINGS), ok: 'true' });
+      return;
+    }
+    console.log(`[Drive → thread ${threadId}] peer delivery failed (${sent.error}); resuming instead`);
+    telemetry.count('gateway.drive.peer', { repo: repoOf(REPO_MAPPINGS[chatId], REPO_MAPPINGS), ok: 'false' });
+  }
+  // A session still held open when the peer path is unavailable cannot persist a resumed turn, so
+  // the reply is honest about that rather than silently losing it.
   const held = !!(sessionId && isSessionHeld(sessionFileById(sessionId), sessionId));
-  const forkId = (AUTO_FORK && held) ? crypto.randomUUID() : null;
   const createId = sessionId ? null : crypto.randomUUID();
   const sizeBefore = sessionId ? sizeCurrent(sessionId) : 0;
   // Reserve every id this turn may touch BEFORE spawning, so the poller can't topic any of them.
-  const reserved = [sessionId, createId, forkId].filter(Boolean);
+  const reserved = [sessionId, createId].filter(Boolean);
   reserved.forEach((id) => injecting.add(id));
   // Non-bypass modes: tool-permission prompts become Allow/Deny buttons in this topic.
   const onPermission = PHONE_APPROVALS ? (async (req) => {
@@ -1412,10 +1581,10 @@ async function driveTurn(chatId, threadId, prompt, resolveSession) {
       : { behavior: 'deny', message: res.timedOut ? 'Approval timed out on Telegram' : 'Denied from Telegram' };
   }) : null;
   try {
-    const result = await runClaudeTurn(prompt, repoDir, sessionId, live, createId, forkId, onPermission);
+    const result = await runClaudeTurn(prompt, repoDir, sessionId, live, createId, onPermission);
     clearInterval(typing);
 
-    if (!result.ok && sessionId && !result.sawContent && !forkId) {
+    if (!result.ok && sessionId && !result.sawContent) {
       await live.finalize(`⚠️ Couldn't reach session ${sessionId.slice(0, 8)} — it may have been cleared. ` +
         `Send /sessions to pick another, or /new to start fresh here.`);
       return;
@@ -1424,34 +1593,7 @@ async function driveTurn(chatId, threadId, prompt, resolveSession) {
     const body = result.ok ? result.body
       : `${result.body && result.body !== '⚙️ Working…' ? result.body + '\n\n' : ''}⚠️ ${result.error}`;
 
-    if (forkId) {
-      const forked = result.ok && result.sessionId === forkId && fs.existsSync(sessionFileById(forkId) || '');
-      if (forked) {
-        // Atomic rebind: topic keeps its identity, now follows the phone branch. The desk copy is
-        // marked superseded at its current size — if the desk keeps working it re-topics on its own.
-        supersededAt[sessionId] = sizeCurrent(sessionId); persistSuperseded();
-        delete linkBySession[sessionId];
-        await upsertLink(forkId, chatId, threadId, prompt);          // overwrites thread→session mapping
-        linkBySession[forkId].forkedFrom = sessionId;                // /catchup descendant fast path
-        try { linkBySession[forkId].offset = sizeCurrent(forkId); } catch (e) { /* */ }
-        persistLinks();
-        if (queues.has(sessionId)) { queues.set(forkId, queues.get(sessionId)); queues.delete(sessionId); }  // queued replies follow the fork
-        writeResumeMarker(repoDir, forkId);
-        await live.finalize(`${body}\n\n↪️ Desk session was open, so this continued in a saved phone branch. ` +
-          `This topic now follows the branch; your desk copy is untouched (it gets its own topic if you keep working it there).`);
-        console.log(`[Drive → thread ${threadId}] forked ${sessionId.slice(0, 8)} → ${forkId.slice(0, 8)} (desk held open)`);
-        telemetry.count('gateway.session.forked', { ok: 'true' });
-      } else {
-        // Fork didn't take — DON'T touch the binding; the reply above still had full context.
-        await live.finalize(`${body}\n\n⚠️ The desk session is open and the branch didn't persist — ` +
-          `this reply used full context but wasn't saved. Close the desk session and resend to persist.`);
-        console.log(`[Drive → thread ${threadId}] fork failed for ${sessionId.slice(0, 8)}; binding unchanged`);
-        telemetry.count('gateway.session.forked', { ok: 'false' });
-      }
-      return;
-    }
-
-    // Held-open without AUTO_FORK: full context, but nothing was saved to the desk copy.
+    // Held open with no reachable inbox: the turn ran with full context but wrote nothing.
     const ephemeral = held && result.ok && !persisted(sizeBefore, sizeCurrent(sessionId));
     await live.finalize(ephemeral
       ? `${body}\n\n⚠️ The desk session is open, so this reply isn't saved to it (close the desk ` +
@@ -2773,7 +2915,9 @@ module.exports = {
   sha256, appearanceHash, buildCommandList, resolveBotProfile, resolveChatAppearance, chatPhotoPath,
   configureGroup,
   restartReady,
-  liveSessionHolders, pidAlive, daemonChildPids, SESSIONS_DIR,
+  liveSessionHolders, liveSessionEntries, pidAlive, daemonChildPids, SESSIONS_DIR,
+  peerTokenFor, peerAddress, routeTurn, peerMode, peerFrames,
+  classifyPeerReceipt, createPeerInbox, sendPeerMessage,
   readCatchupRequests, removeCatchupEntries, markDeclined, hasPendingCatchup, catchupDecision, executeCatchupRebind,
   CATCHUP_FILE, CATCHUP_STALE_MS,
   repoOf, parseTurnUsage, recordTurnUsage,
