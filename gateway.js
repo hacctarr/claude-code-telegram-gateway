@@ -262,11 +262,16 @@ const RENAME_AFTER_TURNS = config.RENAME_AFTER_TURNS === 0 ? 0 : (config.RENAME_
 // the reply falls back to a resume. The write is local and tiny, so this only has to clear a
 // socket that exists but has no reader.
 const PEER_SEND_TIMEOUT_MS = (config.PEER_SEND_TIMEOUT_SECONDS || 5) * 1000;
-// Name of the long-lived Claude session that relays replies into the other sessions on this
-// machine. It needs "crossSessionInbound":"accept" so the daemon can reach it, and that one
-// setting then covers every session, because the relay's own sends are identified. Unset means
-// the daemon sends direct, which only lands where the target itself accepts inbound.
-const PEER_RELAY_SESSION = config.PEER_RELAY_SESSION || '';
+// The gateway owns one relay session and forwards every phone reply through it, because a reply
+// sent by the daemon itself is held for approval at the target whatever mode it attests, while one
+// sent by a session is identified and lands. false sends direct instead, which only works where
+// each target sets "crossSessionInbound":"accept" for itself.
+const PEER_RELAY = config.PEER_RELAY !== false;
+// Forwarding is mechanical, so the relay does not need the session model.
+const PEER_RELAY_MODEL = config.PEER_RELAY_MODEL || 'haiku';
+// Forwards before the relay is recycled into a fresh session. Each one adds to a single transcript
+// that has no reason to remember anything, so the budget bounds it without a compaction pass.
+const PEER_RELAY_MAX_FORWARDS = config.PEER_RELAY_MAX_FORWARDS || 50;
 // After this many seconds with a desk tool call still unresolved, post a one-time notice to the
 // topic (it may be a long-running tool OR a permission prompt sitting unanswered at the desk — the
 // transcript can't distinguish them, so the notice says both). 0 disables.
@@ -1403,20 +1408,61 @@ function peerAddress(sessionId, opts = {}) {
   };
 }
 
-// The address of the relay session, found by the name it publishes in the registry. The relay is
-// an ordinary Claude session the operator keeps running, and its identity is what makes every
-// onward hop deliver: a session sending to a session is identified, where the daemon is not.
-function relayAddress(name, opts = {}) {
-  if (!name) return null;
-  const dir = opts.dir || SESSIONS_DIR;
-  const entry = liveRegistryEntries(
-    (j) => j.name === name && typeof j.messagingSocketPath === 'string' && j.messagingSocketPath, opts)[0];
-  if (!entry) return null;
+// A persistent headless session: stream-json on stdin keeps it alive across turns rather than
+// exiting after the first result, and it registers with an inbox like any other session.
+function buildRelayArgs({ sessionId, model, mode, mcp = CHILD_MCP.args }) {
+  const args = ['-p', '--output-format', 'stream-json', '--input-format', 'stream-json', '--verbose',
+                '--permission-mode', mode || PERM_MODE, '--session-id', sessionId];
+  if (model) args.push('--model', model);
+  args.push(...mcp);
+  return args;
+}
+
+// One relay session the gateway owns outright. Owning the process is the whole point: the hop into
+// it is a write to its stdin, so the daemon is never an unidentified sender and no session needs
+// an inbound-approval setting. Its own onward sends come from a session and are identified.
+// A forward budget bounds the transcript, since every forward adds to one conversation that has no
+// reason to remember anything.
+function createRelay({
+  cwd, spawnFn = spawn, bin = CLAUDE_BINARY, model = PEER_RELAY_MODEL, mode = PERM_MODE,
+  mcp = CHILD_MCP.args, maxForwards = PEER_RELAY_MAX_FORWARDS,
+} = {}) {
+  let child = null;
+  let forwards = 0;
+  let closed = false;
+
+  const stop = () => {
+    if (!child) return;
+    try { child.stdin.end(); } catch (e) { /* already gone */ }
+    child = null;
+  };
+  const start = () => {
+    const sessionId = crypto.randomUUID();
+    child = spawnFn(bin, buildRelayArgs({ sessionId, model, mode, mcp }),
+      { cwd, env: { ...process.env }, stdio: ['pipe', 'pipe', 'pipe'] });
+    forwards = 0;
+    child.stdout.on('data', () => {});          // drained so the pipe cannot fill and stall the child
+    child.stderr.on('data', (d) => console.error('[Relay]', String(d).slice(0, 200)));
+    child.on('error', (e) => { console.error('[Relay] spawn failed:', e.message); child = null; });
+    child.on('close', (code) => { console.log(`[Relay] session exited (${code})`); child = null; });
+    console.log(`[Relay] session ${sessionId.slice(0, 8)} up in ${cwd}`);
+    return child;
+  };
+
   return {
-    pid: entry.pid,
-    socketPath: entry.messagingSocketPath,
-    token: peerTokenFor(entry.pid, dir),
-    name: entry.name,
+    send(text) {
+      if (closed) return false;
+      if (child && forwards >= maxForwards) stop();
+      if (!child) start();
+      if (!child) return false;
+      try {
+        child.stdin.write(`${JSON.stringify({ type: 'user', message: { role: 'user', content: [{ type: 'text', text }] } })}\n`);
+        forwards += 1;
+        return true;
+      } catch (e) { console.error('[Relay] write failed:', e.message); child = null; return false; }
+    },
+    close() { closed = true; stop(); },
+    get live() { return !closed && !!child; },
   };
 }
 
@@ -1515,6 +1561,14 @@ function createPeerInbox(onReceipt, { dir, pid = process.pid } = {}) {
   };
 }
 
+// One relay for the daemon's lifetime, started on the first reply that needs it rather than at
+// boot, so a gateway that never gets a phone reply never spawns a model process.
+let relaySession = null;
+function ensureRelay(cwd) {
+  if (!relaySession) relaySession = createRelay({ cwd });
+  return relaySession;
+}
+
 let peerInbox = null;
 function ensurePeerInbox(dir) {
   if (!peerInbox) {
@@ -1579,26 +1633,26 @@ async function driveTurn(chatId, threadId, prompt, resolveSession) {
   //   free existing session     → resume in place
   //   no session                → fresh session with a pre-minted id
   const peer = sessionId ? peerAddress(sessionId) : null;
-  const relay = peer ? relayAddress(PEER_RELAY_SESSION) : null;
+  const relay = peer && PEER_RELAY ? ensureRelay(repoDir) : null;
   const route = routeTurn({ sessionId, peer, relay });
   if (route === 'relay' || route === 'peer') {
     // Through the relay the hop that reaches the session comes from another session, which is
-    // identified and so is not held. Sending direct makes the daemon the sender, which is held
-    // unless that target sets crossSessionInbound to accept, so it is the fallback.
-    const hop = route === 'relay' ? relay : peer;
-    const text = route === 'relay' ? relayInstruction(`uds:${peer.socketPath}`, prompt) : prompt;
-    const sent = await sendPeerMessage(hop, text, {
-      from: ensurePeerInbox(path.dirname(hop.socketPath)),
-      mode: peerMode(PERM_MODE),
-      msgId: crypto.randomUUID(),
-    });
+    // identified and so is not held. Sending direct makes the daemon the sender, which the target
+    // holds for approval whatever mode it attests, so that path is the fallback.
+    const sent = route === 'relay'
+      ? { ok: relay.send(relayInstruction(`uds:${peer.socketPath}`, prompt)), error: 'relay write failed' }
+      : await sendPeerMessage(peer, prompt, {
+        from: ensurePeerInbox(path.dirname(peer.socketPath)),
+        mode: peerMode(PERM_MODE),
+        msgId: crypto.randomUUID(),
+      });
     clearInterval(typing);
     if (sent.ok) {
       // Deliberately not suppressed from the mirror: the session owns the turn, so its prompt and
       // its answer both arrive through the transcript the poller is already following. Emitting
       // `injectedTurn` here would double every module hook against that same text.
       await live.finalize(`📨 Delivered to the live session${peer.name ? ` (${peer.name})` : ''}` +
-        `${route === 'relay' ? ` via ${relay.name}` : ''}. Its reply mirrors into this topic as it writes.`);
+        `${route === 'relay' ? ' via the relay' : ''}. Its reply mirrors into this topic as it writes.`);
       console.log(`[Drive → thread ${threadId}] ${route}-delivered to ${sessionId.slice(0, 8)} pid ${peer.pid}`);
       telemetry.count('gateway.drive.peer', { repo: repoOf(REPO_MAPPINGS[chatId], REPO_MAPPINGS), route, ok: 'true' });
       return;
@@ -2971,7 +3025,7 @@ module.exports = {
   restartReady,
   liveSessionHolders, liveSessionEntries, pidAlive, daemonChildPids, SESSIONS_DIR,
   peerTokenFor, peerAddress, routeTurn, peerMode, peerFrames,
-  liveRegistryEntries, relayAddress, relayInstruction,
+  liveRegistryEntries, relayInstruction, buildRelayArgs, createRelay,
   classifyPeerReceipt, createPeerInbox, sendPeerMessage,
   readCatchupRequests, removeCatchupEntries, markDeclined, hasPendingCatchup, catchupDecision, executeCatchupRebind,
   CATCHUP_FILE, CATCHUP_STALE_MS,

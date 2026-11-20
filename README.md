@@ -197,13 +197,18 @@ From a source checkout: `git pull && npm test && touch ~/.claude-gateway/restart
   authenticate to it beside the entry; the gateway binds an inbox of its own in the same directory
   and passes it as the reply address, which is where delivery receipts and the idle notice arrive.
 
-  **Set `PEER_RELAY_SESSION`.** A session's inbox holds a message from an unidentified sender for
-  the user's approval, and the daemon is unidentified whatever permission mode it attests, so a
-  direct send sits unapproved. Name one long-lived Claude session as the relay and start it with
-  `--settings '{"crossSessionInbound":"accept"}'`: the daemon reaches that one session, and the
-  relay's own onward sends come from a session, which is identified and lands. One setting on one
-  session covers every session on the machine. Left unset, the daemon sends direct, which only
-  lands where each target sets `crossSessionInbound` to `accept` itself.
+  **Delivery goes through a relay session the gateway owns, and that needs no setup.** A session's
+  inbox holds a message from an unidentified sender for the user's approval, and the daemon is
+  unidentified whatever permission mode it attests, so a reply the daemon sends itself would sit
+  unapproved. So the gateway runs one headless Claude session of its own and hands it each reply to
+  forward. Because it owns that process, the hop into it is a write to the child's stdin rather
+  than a socket send, which means **no session anywhere needs `crossSessionInbound` changed**: the
+  relay's own onward send comes from a session and is identified. The relay starts on the first
+  reply that needs it, runs on `PEER_RELAY_MODEL` (`haiku`, since forwarding is mechanical), and is
+  recycled into a fresh session every `PEER_RELAY_MAX_FORWARDS` (50) so one transcript cannot grow
+  without bound. The forwarded payload is fenced, so a reply that happens to read like an
+  instruction stays a message. `PEER_RELAY: false` sends direct instead, which only lands where
+  each target sets `crossSessionInbound` to `accept` itself.
 
   Three things keep it honest:
   - liveness and addressability are resolved **before** the turn, from the session registry rather

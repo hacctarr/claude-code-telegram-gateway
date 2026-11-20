@@ -732,25 +732,84 @@ test('routeTurn: a configured relay carries a live session, and nothing ever for
   }
 });
 
-test('relayAddress: resolves the relay by the name the registry publishes', () => {
-  const dir = mkInboxRegistry(
-    [INBOX({ pid: 5373, sessionId: 'relay-sid', name: 'gateway-relay' })], { 5373: 'tok-relay' });
-  assert.deepEqual(g.relayAddress('gateway-relay', RESOLVE(dir)),
-    { pid: 5373, socketPath: '/tmp/cc-socks/61721.sock', token: 'tok-relay', name: 'gateway-relay' });
+// ---------------------------------------------------------------------------
+// The gateway-owned relay child
+// ---------------------------------------------------------------------------
+// Held-open stdin keeps one headless session alive across turns, and it registers with an inbox
+// like any other session (verified). Owning the process is what makes the hop into it a stdin
+// write rather than a socket send, so no inbound-approval setting is involved anywhere.
+function fakeSpawn(log = []) {
+  const spawned = [];
+  const fn = (bin, args) => {
+    const child = {
+      bin, args, written: [], killed: false, handlers: {},
+      stdin: { write: (s) => { child.written.push(s); return true; }, end: () => { child.stdinEnded = true; } },
+      stdout: { on: () => {} }, stderr: { on: () => {} },
+      on: (ev, h) => { child.handlers[ev] = h; },
+      kill: () => { child.killed = true; },
+    };
+    spawned.push(child);
+    log.push(args);
+    return child;
+  };
+  fn.spawned = spawned;
+  return fn;
+}
+
+test('buildRelayArgs: a persistent headless session on a pre-minted id, fed over stream-json', () => {
+  const args = g.buildRelayArgs({ sessionId: 'relay-uuid', model: 'haiku', mode: 'bypassPermissions', mcp: [] });
+  assert.deepEqual(args, ['-p', '--output-format', 'stream-json', '--input-format', 'stream-json',
+    '--verbose', '--permission-mode', 'bypassPermissions', '--session-id', 'relay-uuid',
+    '--model', 'haiku']);
 });
 
-test('relayAddress: an unnamed or absent relay is null, never a wrong session', () => {
-  const dir = mkInboxRegistry([INBOX({ pid: 5373, name: 'something-else' })], { 5373: 'tok' });
-  assert.equal(g.relayAddress('gateway-relay', RESOLVE(dir)), null);
-  assert.equal(g.relayAddress('', RESOLVE(dir)), null);
-  assert.equal(g.relayAddress(null, RESOLVE(dir)), null);
+test('createRelay: spawns one child and feeds each forward to its stdin as a user frame', () => {
+  const spawnFn = fakeSpawn();
+  const relay = g.createRelay({ cwd: '/repo', spawnFn, model: 'haiku', mode: 'bypassPermissions', mcp: [] });
+  relay.send('forward this');
+  assert.equal(spawnFn.spawned.length, 1, 'one child, reused');
+  const frame = JSON.parse(spawnFn.spawned[0].written[0]);
+  assert.equal(frame.type, 'user');
+  assert.deepEqual(frame.message.content, [{ type: 'text', text: 'forward this' }]);
+  relay.send('and this');
+  assert.equal(spawnFn.spawned.length, 1);
+  assert.equal(spawnFn.spawned[0].written.length, 2);
+  relay.close();
 });
 
-test('relayAddress: a dead or own-child relay does not count', () => {
-  const dir = mkInboxRegistry([INBOX({ pid: 5373, name: 'gateway-relay' })], { 5373: 'tok' });
-  assert.equal(g.relayAddress('gateway-relay', RESOLVE(dir, { isAlive: () => false })), null);
-  assert.equal(
-    g.relayAddress('gateway-relay', RESOLVE(dir, { selfPid: 1, childPids: () => [5373] })), null);
+test('createRelay: recycles the child past the forward budget so one transcript cannot grow forever', () => {
+  const spawnFn = fakeSpawn();
+  const relay = g.createRelay({ cwd: '/repo', spawnFn, maxForwards: 2, mcp: [] });
+  relay.send('a'); relay.send('b');
+  assert.equal(spawnFn.spawned.length, 1);
+  relay.send('c');
+  assert.equal(spawnFn.spawned.length, 2, 'a third forward past a budget of two starts a fresh session');
+  assert.ok(spawnFn.spawned[0].stdinEnded, 'the retired child is closed, not leaked');
+  assert.notEqual(spawnFn.spawned[1].args[spawnFn.spawned[1].args.indexOf('--session-id') + 1],
+    spawnFn.spawned[0].args[spawnFn.spawned[0].args.indexOf('--session-id') + 1],
+    'a recycled relay is a new session, not a resume of the old one');
+  relay.close();
+});
+
+test('createRelay: an unexpected exit is replaced on the next forward, not left dead', () => {
+  const spawnFn = fakeSpawn();
+  const relay = g.createRelay({ cwd: '/repo', spawnFn, mcp: [] });
+  relay.send('a');
+  spawnFn.spawned[0].handlers.close(1);            // the child died on its own
+  relay.send('b');
+  assert.equal(spawnFn.spawned.length, 2);
+  assert.equal(spawnFn.spawned[1].written.length, 1, 'the forward lands on the replacement');
+  relay.close();
+});
+
+test('createRelay: close ends the child and stops it being respawned', () => {
+  const spawnFn = fakeSpawn();
+  const relay = g.createRelay({ cwd: '/repo', spawnFn, mcp: [] });
+  relay.send('a');
+  relay.close();
+  assert.ok(spawnFn.spawned[0].stdinEnded);
+  assert.equal(relay.send('b'), false, 'a closed relay refuses work rather than silently respawning');
+  assert.equal(spawnFn.spawned.length, 1);
 });
 
 test('relayInstruction: names the exact address, demands verbatim delivery, and forbids answering', () => {
