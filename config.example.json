@@ -54,6 +54,8 @@
   "UPDATE_POLL_TIMEOUT_S": 25,
   "_PEER_SEND_TIMEOUT_SECONDS": "how long a delivery into a live session's own inbox may take before the reply falls back to a resume. The write is local and tiny, so this only has to clear a socket that exists with no reader. Default 5.",
   "PEER_SEND_TIMEOUT_SECONDS": 5,
+  "_PEER_RELAY_SESSION": "name (as the session registry publishes it) of the long-lived Claude session that relays replies into the other sessions on this machine. Start that session with --settings '{\"crossSessionInbound\":\"accept\"}' so the daemon can reach it; its own onward sends are identified and need no such setting on the targets. Unset means the daemon sends direct, which a target holds for approval unless it accepts inbound itself.",
+  "PEER_RELAY_SESSION": "",
   "STALL_NOTICE_SECONDS": 60,
   "APPROVAL_TIMEOUT_SECONDS": 300,
   "_RESTART_STALE_TURN_SECONDS": "a queued restart.flag waits for injected turns to finish, but stops waiting on one that has produced no output for this long. The window must clear the longest silent stretch a healthy turn can have, which is one long tool call. Default 600.",

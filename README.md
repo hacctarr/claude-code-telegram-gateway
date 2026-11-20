@@ -196,6 +196,15 @@ From a source checkout: `git pull && npm test && touch ~/.claude-gateway/restart
   session publishes its inbox socket in `~/.claude/sessions/<pid>.json`, with the token to
   authenticate to it beside the entry; the gateway binds an inbox of its own in the same directory
   and passes it as the reply address, which is where delivery receipts and the idle notice arrive.
+
+  **Set `PEER_RELAY_SESSION`.** A session's inbox holds a message from an unidentified sender for
+  the user's approval, and the daemon is unidentified whatever permission mode it attests, so a
+  direct send sits unapproved. Name one long-lived Claude session as the relay and start it with
+  `--settings '{"crossSessionInbound":"accept"}'`: the daemon reaches that one session, and the
+  relay's own onward sends come from a session, which is identified and lands. One setting on one
+  session covers every session on the machine. Left unset, the daemon sends direct, which only
+  lands where each target sets `crossSessionInbound` to `accept` itself.
+
   Three things keep it honest:
   - liveness and addressability are resolved **before** the turn, from the session registry rather
     than from file-handle behaviour, and the gateway's own headless children never count;
