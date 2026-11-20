@@ -492,12 +492,14 @@ const cwdCache = new Map();  // filePath -> cwd (immutable per session)
 function getCwd(file) {
   if (cwdCache.has(file)) return Promise.resolve(cwdCache.get(file));
   return new Promise((resolve) => {
-    const rl = require('readline').createInterface({ input: fs.createReadStream(file) });
+    const input = fs.createReadStream(file);
+    const rl = require('readline').createInterface({ input });
     let found = false;
     rl.on('line', (line) => {
       if (found) return;
       let o; try { o = JSON.parse(line); } catch (e) { return; }
-      if (o.cwd) { found = true; cwdCache.set(file, o.cwd); rl.close(); resolve(o.cwd); }
+      // rl.close() only pauses the stream; destroy() is what releases the descriptor.
+      if (o.cwd) { found = true; cwdCache.set(file, o.cwd); rl.close(); input.destroy(); resolve(o.cwd); }
     });
     rl.on('close', () => { if (!found) resolve(null); });
     rl.on('error', () => resolve(null));
@@ -515,7 +517,8 @@ function readSessionInfo(file) {
   return new Promise((resolve) => {
     let cwd = null, label = null, size = 0, mtime = 0;
     try { const st = fs.statSync(file); size = st.size; mtime = st.mtimeMs; } catch (e) { /* */ }
-    const rl = require('readline').createInterface({ input: fs.createReadStream(file) });
+    const input = fs.createReadStream(file);
+    const rl = require('readline').createInterface({ input });
     rl.on('line', (line) => {
       if (!line.trim()) return;
       let o; try { o = JSON.parse(line); } catch (e) { return; }
@@ -525,7 +528,7 @@ function readSessionInfo(file) {
         let t = typeof c === 'string' ? c : (Array.isArray(c) ? (c.find((b) => b.type === 'text') || {}).text : null);
         if (t && !t.startsWith('<') && !o.isMeta) label = t.replace(/\s+/g, ' ').trim().slice(0, 80);
       }
-      if (cwd && label) rl.close();
+      if (cwd && label) { rl.close(); input.destroy(); }
     });
     rl.on('close', () => resolve({ id: path.basename(file, '.jsonl'), path: file, cwd, label, size, mtime }));
     rl.on('error', () => resolve({ id: path.basename(file, '.jsonl'), path: file, cwd, label, size, mtime }));
@@ -3207,7 +3210,7 @@ module.exports = {
   LiveMessage, summarizeToolInput, createFeed, renderTranscriptLine, splitReadout, readNewLines,
   fileSendsFrom, classifyMedia, planFileSends, captionFor, tooLargeFor, describeUnsendable,
   multipartBody,
-  listSessions, matchSessions, readSessionInfo, relTime, formatSessionList,
+  listSessions, matchSessions, readSessionInfo, getCwd, relTime, formatSessionList,
   isActive, shouldPrune, isDeskBusy, resolvePruneMs, formatPruneWindow, resolveShowTools,
   invertRepoMappings, splitThreadKey, buildThreadIndex,
   migrateLegacy, topicName, pickEmoji, pickIcon, openerText, shouldAutoCreate, loadIgnored, persistIgnored, persisted, deskUrl,
