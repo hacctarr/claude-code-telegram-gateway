@@ -874,6 +874,43 @@ test('buildRelayArgs: a persistent headless session on a pre-minted id, fed over
     '--model', 'haiku']);
 });
 
+test('createRelay: its session is marked gateway-owned, so the poller cannot topic it', () => {
+  // The relay writes a transcript like any session, and the poller topics any session that is
+  // active and growing. Without a marker it earns a Telegram topic of its own and mirrors the
+  // forwarding instructions into it, which also duplicates every payload.
+  const spawnFn = fakeSpawn();
+  const own = new Set();
+  const relay = g.createRelay({ cwd: '/repo', spawnFn, own, mcp: [] });
+  relay.send('a');
+  const id = spawnFn.spawned[0].args[spawnFn.spawned[0].args.indexOf('--session-id') + 1];
+  assert.deepEqual([...own], [id]);
+  relay.close();
+  assert.deepEqual([...own], [], 'a retired relay releases its id rather than leaking it');
+});
+
+test('createRelay: a recycled relay releases the old id and claims the new one', () => {
+  const spawnFn = fakeSpawn();
+  const own = new Set();
+  const relay = g.createRelay({ cwd: '/repo', spawnFn, own, maxForwards: 1, mcp: [] });
+  relay.send('a');
+  const first = spawnFn.spawned[0].args[spawnFn.spawned[0].args.indexOf('--session-id') + 1];
+  relay.send('b');
+  const second = spawnFn.spawned[1].args[spawnFn.spawned[1].args.indexOf('--session-id') + 1];
+  assert.deepEqual([...own], [second], 'exactly the live relay is owned, not every relay ever run');
+  assert.notEqual(first, second);
+  relay.close();
+});
+
+test('createRelay: a child that dies on its own releases its id', () => {
+  const spawnFn = fakeSpawn();
+  const own = new Set();
+  const relay = g.createRelay({ cwd: '/repo', spawnFn, own, mcp: [] });
+  relay.send('a');
+  spawnFn.spawned[0].handlers.close(1);
+  assert.deepEqual([...own], [], 'a dead relay must not keep its session marked owned forever');
+  relay.close();
+});
+
 test('createRelay: spawns one child and feeds each forward to its stdin as a user frame', () => {
   const spawnFn = fakeSpawn();
   const relay = g.createRelay({ cwd: '/repo', spawnFn, model: 'haiku', mode: 'bypassPermissions', mcp: [] });
