@@ -1584,6 +1584,12 @@ function peerAddress(sessionId, opts = {}) {
   };
 }
 
+// Sessions the gateway runs for its own plumbing. They are real sessions with real transcripts,
+// so without this the poller would topic them and the mirror would post their internals. Kept
+// separate from `injecting`, whose membership also gates the restart wait: a permanently reserved
+// id there would hold every queued restart for the whole RESTART_STALE_TURN_MS window.
+const gatewaySessions = new Set();
+
 // A persistent headless session: stream-json on stdin keeps it alive across turns rather than
 // exiting after the first result, and it registers with an inbox like any other session.
 function buildRelayArgs({ sessionId, model, mode, mcp = CHILD_MCP.args }) {
@@ -1601,26 +1607,33 @@ function buildRelayArgs({ sessionId, model, mode, mcp = CHILD_MCP.args }) {
 // reason to remember anything.
 function createRelay({
   cwd, spawnFn = spawn, bin = CLAUDE_BINARY, model = PEER_RELAY_MODEL, mode = PERM_MODE,
-  mcp = CHILD_MCP.args, maxForwards = PEER_RELAY_MAX_FORWARDS,
+  mcp = CHILD_MCP.args, maxForwards = PEER_RELAY_MAX_FORWARDS, own = gatewaySessions,
 } = {}) {
   let child = null;
+  let currentId = null;
   let forwards = 0;
   let closed = false;
 
+  const release = () => { if (currentId) own.delete(currentId); currentId = null; child = null; };
   const stop = () => {
     if (!child) return;
     try { child.stdin.end(); } catch (e) { /* already gone */ }
-    child = null;
+    release();
   };
   const start = () => {
     const sessionId = crypto.randomUUID();
+    currentId = sessionId;
+    // Marked before the spawn: the relay writes a transcript like any session, and the poller
+    // topics anything active and growing, so an unmarked relay earns its own Telegram topic and
+    // mirrors every forwarding instruction into it.
+    own.add(sessionId);
     child = spawnFn(bin, buildRelayArgs({ sessionId, model, mode, mcp }),
       { cwd, env: { ...process.env }, stdio: ['pipe', 'pipe', 'pipe'] });
     forwards = 0;
     child.stdout.on('data', () => {});          // drained so the pipe cannot fill and stall the child
     child.stderr.on('data', (d) => console.error('[Relay]', String(d).slice(0, 200)));
-    child.on('error', (e) => { console.error('[Relay] spawn failed:', e.message); child = null; });
-    child.on('close', (code) => { console.log(`[Relay] session exited (${code})`); child = null; });
+    child.on('error', (e) => { console.error('[Relay] spawn failed:', e.message); release(); });
+    child.on('close', (code) => { console.log(`[Relay] session exited (${code})`); release(); });
     console.log(`[Relay] session ${sessionId.slice(0, 8)} up in ${cwd}`);
     return child;
   };
@@ -2572,7 +2585,7 @@ async function pollTick() {
         const grew = st.size > (sessionBaseline[id] || 0);           // grew past startup size (new files: baseline 0 → eligible)
         // Discover: real, active, progressing sessions. At most ONE creation per tick so a burst of
         // active sessions can never hammer Telegram's rate limit again.
-        if (MIRROR && AUTO_CREATE_TOPICS && !injecting.has(id) && grew && isActive(st.mtimeMs, now) && topicsThisTick < 1) {
+        if (MIRROR && AUTO_CREATE_TOPICS && !injecting.has(id) && !gatewaySessions.has(id) && grew && isActive(st.mtimeMs, now) && topicsThisTick < 1) {
           if (await ensureTopicForSession(await readSessionInfo(file))) topicsThisTick++;
         }
         continue;
@@ -2584,7 +2597,7 @@ async function pollTick() {
       if (link.closed) { if (isActive(st.mtimeMs, now)) await reviveTopic(id); else continue; }
 
       // Mirror new lines, throttled per topic so a busy desk session can't exceed Telegram limits.
-      if (MIRROR && !injecting.has(id) && st.size > link.offset) {
+      if (MIRROR && !injecting.has(id) && !gatewaySessions.has(id) && st.size > link.offset) {
         if (now < (mirrorRetryAt.get(id) || 0)) continue;                   // backing off a rate-limited batch
         if (now - (lastMirrorAt.get(id) || 0) < MIRROR_FLUSH_MS) continue;  // retry next poll; offset unchanged
         const { lines, newOffset } = readNewLines(file, link.offset);
