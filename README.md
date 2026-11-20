@@ -222,6 +222,18 @@ From a source checkout: `git pull && npm test && touch ~/.claude-gateway/restart
   created by earlier versions.
 
 ### Other notes
+- **Files a session sends arrive as real media.** When a session calls `SendUserFile` to surface
+  something to you, the mirror uploads it into the topic: images as photos, videos as videos,
+  everything else (PDFs, markdown, source) as documents, with the call's caption attached. Several
+  images or videos in one call post as a single album, chunked at Telegram's limit of ten, so a
+  six-page render reads as one group rather than six messages; documents go one card each. This is
+  independent of `SHOW_TOOL_ACTIVITY`, because a file you are meant to look at is content rather
+  than tool noise, and with tool lines off the send would otherwise never appear at all. A file
+  that has gone (a scratchpad path is cleared on reboot) or that exceeds the Bot API's upload
+  ceiling (10 MB for a photo, 50 MB otherwise) gets a line naming it and why, instead of a silent
+  gap. Uploads sit outside the mirror's retry cursor: a failed upload is logged and dropped rather
+  than retried, since re-running a batch would duplicate the picture. `MIRROR_FILE_SENDS: false`
+  turns it off; `MEDIA_UPLOAD_TIMEOUT_SECONDS` (120) bounds a large upload.
 - Mirror latency ≈ `POLL_MS` (~2s); it posts completed turns, not token-by-token (phone-injected
   turns *do* stream token-by-token via the live-edited message). Failing desk tool calls are
   surfaced as `⚠️ tool error`; successful tool output is kept quiet.

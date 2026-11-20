@@ -266,6 +266,117 @@ test('renderTranscriptLine: skips thinking / meta / command-caveats / tool_resul
   assert.deepEqual(g.renderTranscriptLine({ type: 'user', message: { content: [{ type: 'tool_result', content: 'out' }] } }), []);
   assert.deepEqual(g.renderTranscriptLine({ type: 'system' }), []);
 });
+// ---------------------------------------------------------------------------
+// File sends: SendUserFile in the transcript -> real media in the topic
+// ---------------------------------------------------------------------------
+// A session surfacing a file to the user calls SendUserFile with input.files (always an array) and
+// an optional caption; the tool_result carries nothing. Shape read off stored transcripts. These
+// are content rather than tool noise, so they are extracted independently of showTools: with
+// SHOW_TOOL_ACTIVITY off, the 🔧 line is suppressed and the file would otherwise vanish entirely.
+const SUF = (input) => ({ type: 'assistant', message: { content: [{ type: 'tool_use', name: 'SendUserFile', input }] } });
+
+test('fileSendsFrom: pulls the paths and caption out of a SendUserFile call', () => {
+  assert.deepEqual(g.fileSendsFrom(SUF({ files: ['/a/shot.jpg'], caption: 'first frame', status: 'normal' })),
+    [{ paths: ['/a/shot.jpg'], caption: 'first frame' }]);
+});
+
+test('fileSendsFrom: finds sends whether or not tool activity is shown', () => {
+  const rec = SUF({ files: ['/a/shot.jpg'], status: 'normal' });
+  assert.equal(g.fileSendsFrom(rec, true).length, 1);
+  assert.equal(g.fileSendsFrom(rec, false).length, 1, 'a file send is content, not a tool line');
+  assert.deepEqual(g.renderTranscriptLine(rec, false), [], 'and the 🔧 line stays suppressed');
+});
+
+test('fileSendsFrom: a missing caption is null rather than absent, and other tools are ignored', () => {
+  assert.deepEqual(g.fileSendsFrom(SUF({ files: ['/a/x.pdf'], status: 'normal' })),
+    [{ paths: ['/a/x.pdf'], caption: null }]);
+  const bash = { type: 'assistant', message: { content: [{ type: 'tool_use', name: 'Bash', input: { command: 'ls' } }] } };
+  assert.deepEqual(g.fileSendsFrom(bash), []);
+  assert.deepEqual(g.fileSendsFrom(null), []);
+  assert.deepEqual(g.fileSendsFrom(SUF({ status: 'normal' })), [], 'no files array is not a send');
+});
+
+test('classifyMedia: images and videos get their own Telegram method, everything else is a document', () => {
+  assert.deepEqual(g.classifyMedia('/a/shot.JPG'), { method: 'sendPhoto', field: 'photo' });
+  assert.deepEqual(g.classifyMedia('/a/x.png'), { method: 'sendPhoto', field: 'photo' });
+  assert.deepEqual(g.classifyMedia('/a/clip.mp4'), { method: 'sendVideo', field: 'video' });
+  assert.deepEqual(g.classifyMedia('/a/clip.mov'), { method: 'sendVideo', field: 'video' });
+  assert.deepEqual(g.classifyMedia('/a/report.pdf'), { method: 'sendDocument', field: 'document' });
+  assert.deepEqual(g.classifyMedia('/a/notes.md'), { method: 'sendDocument', field: 'document' });
+  // An SVG renders as a picture nowhere in Telegram, so it is a document despite being an image.
+  assert.deepEqual(g.classifyMedia('/a/diagram.svg'), { method: 'sendDocument', field: 'document' });
+});
+
+test('planFileSends: several photos become one album, which is how a multi-page send should read', () => {
+  const plan = g.planFileSends(['/a/1.png', '/a/2.png', '/a/3.png']);
+  assert.equal(plan.length, 1);
+  assert.equal(plan[0].kind, 'album');
+  assert.deepEqual(plan[0].paths, ['/a/1.png', '/a/2.png', '/a/3.png']);
+});
+
+test('planFileSends: an album is capped at ten, the Telegram limit, and the rest follow', () => {
+  const paths = Array.from({ length: 23 }, (_, i) => `/a/${i}.png`);
+  const plan = g.planFileSends(paths);
+  assert.deepEqual(plan.map((p) => p.paths.length), [10, 10, 3]);
+  assert.ok(plan.every((p) => p.kind === 'album'));
+});
+
+test('planFileSends: one photo is a plain send, not a one-item album', () => {
+  const plan = g.planFileSends(['/a/1.png']);
+  assert.deepEqual(plan, [{ kind: 'single', method: 'sendPhoto', field: 'photo', paths: ['/a/1.png'] }]);
+});
+
+test('planFileSends: documents are sent singly and never swept into a photo album', () => {
+  const plan = g.planFileSends(['/a/1.png', '/a/report.pdf', '/a/2.png']);
+  const albums = plan.filter((p) => p.kind === 'album');
+  const singles = plan.filter((p) => p.kind === 'single');
+  assert.equal(albums.length, 1);
+  assert.deepEqual(albums[0].paths, ['/a/1.png', '/a/2.png']);
+  assert.equal(singles.length, 1);
+  assert.equal(singles[0].method, 'sendDocument');
+});
+
+test('captionFor: truncated to what Telegram accepts rather than rejected whole', () => {
+  assert.equal(g.captionFor(null), '');
+  assert.equal(g.captionFor('short'), 'short');
+  const long = 'x'.repeat(1200);
+  assert.equal(g.captionFor(long).length, 1024);
+});
+
+test('tooLargeFor: the photo ceiling is lower than the document one, so a big image degrades', () => {
+  assert.equal(g.tooLargeFor('sendPhoto', 9 * 1024 * 1024), false);
+  assert.equal(g.tooLargeFor('sendPhoto', 11 * 1024 * 1024), true);
+  assert.equal(g.tooLargeFor('sendDocument', 11 * 1024 * 1024), false);
+  assert.equal(g.tooLargeFor('sendDocument', 60 * 1024 * 1024), true);
+  assert.equal(g.tooLargeFor('sendVideo', 60 * 1024 * 1024), true);
+});
+
+test('describeUnsendable: says why, and names the path, when the bytes cannot go', () => {
+  // Scratchpad files are the common case for a camera frame or a rendered page, and that directory
+  // is cleared on reboot, so the mirror can reach a record whose file is already gone.
+  assert.match(g.describeUnsendable('/tmp/s/shot.jpg', 'missing'), /shot\.jpg/);
+  assert.match(g.describeUnsendable('/tmp/s/shot.jpg', 'missing'), /no longer on disk/i);
+  assert.match(g.describeUnsendable('/a/big.mp4', 'too-large'), /big\.mp4/);
+  assert.match(g.describeUnsendable('/a/big.mp4', 'too-large'), /too large/i);
+});
+
+test('multipartBody: fields and files are framed so Telegram can parse the upload', () => {
+  // A malformed boundary fails at the API with a generic error rather than anywhere local, so the
+  // framing is worth asserting rather than eyeballing.
+  const { boundary, body } = g.multipartBody(
+    { chat_id: '-100123', message_thread_id: 7, caption: 'look', empty: '' },
+    [{ name: 'photo', filename: 'shot.jpg', data: Buffer.from('BYTES') }]);
+  const s = body.toString();
+  assert.ok(s.startsWith(`--${boundary}\r\n`));
+  assert.ok(s.endsWith(`--${boundary}--\r\n`));
+  assert.ok(s.includes('name="chat_id"\r\n\r\n-100123\r\n'));
+  assert.ok(s.includes('name="message_thread_id"\r\n\r\n7\r\n'));
+  assert.ok(s.includes('name="caption"\r\n\r\nlook\r\n'));
+  assert.ok(!s.includes('name="empty"'), 'an empty field is omitted, not sent blank');
+  assert.ok(s.includes('name="photo"; filename="shot.jpg"'));
+  assert.ok(s.includes('BYTES'));
+});
+
 test('renderTranscriptLine: mixed text + tool blocks preserve order', () => {
   const o = { type: 'assistant', message: { content: [
     { type: 'text', text: 'Running now' },
